@@ -110,6 +110,23 @@ See [Motion & Detection](/motion/) for the mechanism this configures.
 
 See [Timeline scrubbing](/playback/scrubbing) for what these do. All optional; the defaults work.
 
+:::tip The one scrubbing knob
+`THUMB_PREGEN_ENABLED` (or **Server settings → Scrub previews** in the admin
+console) is the setting that decides how scrubbing feels. Off (the default),
+the first drag over a spot builds its preview on the spot (about 0.1-0.3 s per
+picture on a 4K camera) and later drags are instant. On, previews for new
+footage are built in the background, so the first drag is instant too, and the
+desktop and Android apps get a new preview every second instead of every four.
+
+What "on" costs, per camera, measured on real 1080p-4K footage: roughly 7-20 %
+of one CPU core while recording (one 4 s piece of footage costs about 0.3-0.8 s
+of CPU for its previews) and about 1 GB a day of preview images, kept within the
+cache budget below (20 GB by default, the oldest go first). The background work
+runs one picture at a time, so it never uses more than about one core however
+many cameras you have; on a system with more than about 5 to 7 4K cameras it simply
+keeps up with the most recent two hours rather than all of it.
+:::
+
 Five of these are also editable live from the admin console (**Server →
 Scrub previews**): the env value below is only the *default* until an
 operator sets it in the console, at which point the console value wins (no
@@ -135,7 +152,7 @@ Setting them in `.env` does nothing, so they don't get rows here.
 
 | Key | Default | Console-editable? | Notes |
 |---|---|---|---|
-| `THUMB_PREGEN_ENABLED` | `false` | yes | build scrub previews in the background so the *first* drag is instant too; costs some ongoing CPU + disk |
+| `THUMB_PREGEN_ENABLED` | `false` | yes | **the scrubbing knob** (see the tip above): build scrub previews and the 1-second preview strips in the background so the *first* drag is instant too; costs about 7-20 % of a core and ~1 GB/day of cache per camera |
 | `THUMB_PREGEN_LOOKBACK_HOURS` | `2` | yes | how far back to build previews when the worker starts (console clamps 0-168h) |
 | `THUMB_PREGEN_SCAN_SECS` | `60` | yes | how often to build previews for newly-recorded footage (console clamps 5-3600s) |
 | `THUMB_PREGEN_WIDTH` | `480` | **no, env-only** | preview width in pixels; must equal the playback clients' scrub-still width or pre-generated previews go unused (silently wasted CPU/storage), which is why this one stays a deployment-time setting, not a console toggle |

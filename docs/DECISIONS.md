@@ -8,6 +8,58 @@ revisit.
 
 ---
 
+## 2026-10-29, Scrub pre-generation stays OFF by default; documented as the scrubbing knob, with a catch-up cap
+
+**Context.** #657 made a grid frame a single keyframe decode and the scrub
+sprites (entry below) made pre-generation worth more, so the audit asked
+whether `THUMB_PREGEN_ENABLED` (one switch for grid frames AND sprites) should
+now default to on.
+
+**Measured** (9 real 4 s fixture segments, 1080p to 4K, H.264/HEVC,
+single-threaded ffmpeg 7.1): grid frame 0.08-0.28 s CPU and 25-44 KB; sprite
+0.15-0.55 s CPU and 12-20 KB. Per camera that is one of each per 4 s of
+footage: about 0.28 s (1080p) to 0.8 s (4K) of CPU per 4 s, i.e. **7-20 % of
+one core per camera** (1080p about 7 %, 4K 13-22 %, fixture mean about 14 %), and
+**~1.0 GB/day of cache per camera** (21 600 segments x ~48 KB). The worker is
+serial (one ffmpeg in flight), so its total is capped near one core: it keeps
+up with about 5-7 4K or 14 1080p cameras. The default cache budget (20 GB)
+holds about 20 camera-days.
+
+**Decision.** Keep the default OFF, and make the knob prominent instead:
+the environment reference, the scrubbing page, `.env.example`, the admin
+console hint and `docs/AI-INSTALL.md` now say what it does and what it costs,
+in numbers. One switch keeps covering both grid frames and sprites.
+
+Also: the worker's per-camera start point is now capped
+(`thumb_pregen::pass_start_ms`). A camera whose watermark is older than the
+lookback window (at least 2 h) skips ahead instead of chasing an ever-growing
+backlog, so a box with more cameras than one serial worker can serve still
+gets previews for the most recent footage. Skipped footage keeps the
+on-demand path.
+
+**Why not default on.** An always-on cost of 7-20 % of a core and 1 GB/day of
+writes per camera is paid by every install, including small boxes where the
+recorder (the component that must never fall behind) shares those cores, and
+it is paid whether or not anyone ever scrubs. The on-demand path after #657 is
+already 0.1-0.3 s for a cold 4K cell and instant on revisit, and the clients
+prefetch around the cursor, so the default experience is good without it.
+
+**Rejected.**
+
+- *Default on with a lower concurrency limit:* the worker is already serial;
+  a lower limit can't go below one ffmpeg, and the per-camera cost is the
+  problem, not a burst.
+- *Default on for sprites only:* the sprites are the larger CPU share and the
+  smaller user-visible change; splitting the switch would add a second knob
+  for operators to reason about.
+- *Auto-enable based on core count:* hidden behaviour that changes with
+  hardware is harder to support than one documented switch.
+
+**Revisit triggers.** Hardware decode available to the api container (would
+cut the per-picture CPU several-fold); a cheaper source of preview frames
+(recorded sub stream, see the 2026-07-07 entry); field reports that first-drag
+latency is the main complaint on default installs.
+
 ## 2026-10-29, Scrub sprites: one keyframe-only sprite strip per segment, made only by the API pre-generation worker
 
 **Context.** The scrub overlay's frames come from `GET /filmstrip/{cam}/frame`,

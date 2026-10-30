@@ -7773,7 +7773,7 @@ async function renderServerSettings() {
     </div>
     <div class="policy-section">
       <div class="policy-section-title">Scrub previews (thumbnail pre-generation)</div>
-      <div class="card-hint" style="margin-bottom:10px">Pre-generates timeline scrub-preview thumbnails ahead of time so the FIRST scrub touch is instant, not just on revisit. Trades continuous decode CPU + cache storage for that instant first touch. Off by default. Changes here take effect within one scan interval, no restart needed.</div>
+      <div class="card-hint" style="margin-bottom:10px">Pre-generates timeline scrub-preview thumbnails (and the 1-second preview strips the desktop and Android apps use) ahead of time so the FIRST scrub touch is instant, not just on revisit. Costs roughly 7-20% of one CPU core and about 1 GB/day of cache per camera (one preview at a time, so never more than about one core in total). Off by default. Changes here take effect within one scan interval, no restart needed.</div>
       <label class="chk" id="srv-pregen-wrap" style="cursor:default;opacity:.7">
         <input type="checkbox" id="srv-pregen-enabled" onchange="saveScrubPregenEnabled(this.checked)" />
         <span>Pre-generate scrub previews</span>
