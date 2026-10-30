@@ -38,12 +38,14 @@ void main() {
       String? error,
       DateTime? oldestFootage,
       String? mode,
+      bool motionNow = false,
     }) => noFootageMessage(
       playhead: playhead ?? inRange,
       now: now,
       error: error,
       oldestFootage: oldestFootage,
       recordingMode: mode,
+      motionNow: motionNow,
     );
 
     test('a load error wins over everything and carries the error', () {
@@ -59,6 +61,25 @@ void main() {
       expect(m.shortLabel, 'error');
     });
 
+    test('an idle motion camera at the live edge has no motion, not a delay', () {
+      for (final p in [now.subtract(const Duration(seconds: 5)), now]) {
+        final m = pick(playhead: p, oldestFootage: oldest, mode: 'motion');
+        expect(m.reason, NoFootageReason.noMotion, reason: '$p');
+        expect(m.title, 'No motion right now');
+        expect(m.shortLabel, 'no motion');
+      }
+    });
+
+    test('a motion camera that is moving right now is at the live edge', () {
+      final m = pick(
+        playhead: now,
+        oldestFootage: oldest,
+        mode: 'motion',
+        motionNow: true,
+      );
+      expect(m.reason, NoFootageReason.liveEdge);
+    });
+
     test('within 10 s of now, or later, is the live edge', () {
       for (final p in [
         now.subtract(const Duration(seconds: 9)),
@@ -66,7 +87,7 @@ void main() {
         now,
         now.add(const Duration(minutes: 5)),
       ]) {
-        final m = pick(playhead: p, oldestFootage: oldest, mode: 'motion');
+        final m = pick(playhead: p, oldestFootage: oldest, mode: 'continuous');
         expect(m.reason, NoFootageReason.liveEdge, reason: '$p');
         expect(m.title, 'Live edge');
         expect(m.subtitle, 'Recordings appear a few seconds behind live');

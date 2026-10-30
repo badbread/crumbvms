@@ -14,8 +14,10 @@ enum NoFootageReason {
   /// Resolving the segment, the media token or the network failed.
   loadError,
 
-  /// The playhead is at or past the live edge. Segments are indexed only once
-  /// they close, so the newest few seconds never have footage yet.
+  /// The playhead is at or past the live edge and the camera is recording
+  /// right now. Segments are indexed only once they close, so the newest few
+  /// seconds never have footage yet. A motion camera with no motion right now
+  /// is [noMotion] instead: nothing is being recorded, so nothing will appear.
   liveEdge,
 
   /// The playhead is earlier than the camera's oldest remaining recording:
@@ -38,6 +40,11 @@ enum NoFootageReason {
 
 /// How close to "now" the playhead must be to count as the live edge.
 const Duration kLiveEdgeWindow = Duration(seconds: 10);
+
+/// How recent a motion camera's last motion must be for it to count as still
+/// recording at the live edge (a segment is a few seconds long, plus the
+/// motion post-roll keeps recording after motion stops).
+const Duration kRecentMotionWindow = Duration(seconds: 30);
 
 class NoFootageMessage {
   const NoFootageMessage(
@@ -65,13 +72,16 @@ class NoFootageMessage {
 /// [error] is the pane's load error, if any. [now] is the wall clock (UTC).
 /// [oldestFootage] is the camera's oldest remaining recording and
 /// [recordingMode] its effective policy mode (`"continuous"` / `"motion"`);
-/// both are null against a server that predates them.
+/// both are null against a server that predates them. [motionNow] is whether
+/// a motion camera has had motion in the last few seconds (so it is recording
+/// and its footage is just not indexed yet).
 NoFootageMessage noFootageMessage({
   required DateTime playhead,
   required DateTime now,
   String? error,
   DateTime? oldestFootage,
   String? recordingMode,
+  bool motionNow = false,
 }) {
   if (error != null) {
     return NoFootageMessage(
@@ -82,6 +92,16 @@ NoFootageMessage noFootageMessage({
     );
   }
   if (!playhead.isBefore(now.subtract(kLiveEdgeWindow))) {
+    if (recordingMode == 'motion' && !motionNow) {
+      // An idle motion camera is not "a few seconds behind": it is not
+      // recording at all.
+      return const NoFootageMessage(
+        NoFootageReason.noMotion,
+        'No motion right now',
+        'no motion',
+        'This camera records only when it detects motion',
+      );
+    }
     return const NoFootageMessage(
       NoFootageReason.liveEdge,
       'Live edge',

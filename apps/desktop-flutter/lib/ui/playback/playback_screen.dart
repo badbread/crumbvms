@@ -351,6 +351,22 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     );
   }
 
+  /// Whether [cameraId] had motion in the last [kRecentMotionWindow], from the
+  /// motion strip's loaded intensity buckets. False when the strip has no data
+  /// reaching "now" for it.
+  bool _hadRecentMotion(String cameraId) {
+    final b = _motion.intensityByCam[cameraId];
+    if (b == null || b.buckets.isEmpty) return false;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final step = math.max(1000, b.bucketMs);
+    for (var t = now - kRecentMotionWindow.inMilliseconds; t <= now; t += step) {
+      final i = b.indexAt(t);
+      if (i != null && b.buckets[i] >= kMotionAbsFloor) return true;
+    }
+    final last = b.indexAt(now);
+    return last != null && b.buckets[last] >= kMotionAbsFloor;
+  }
+
   /// Seek the playhead to `ms` epoch (from a motion-strip click / prev-next).
   Future<void> _seekToMs(int ms) async {
     final t = DateTime.fromMillisecondsSinceEpoch(ms, isUtc: true);
@@ -1307,6 +1323,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
         maximized: true,
         oldestFootage: _oldestFootage[maxCam.id],
         recordingMode: _recordingMode[maxCam.id],
+        motionNow: () => _hadRecentMotion(maxCam.id),
         playhead: () => _timeline.playhead,
         onRetry: _retryResolve,
         onSelect: () => _selectCamera(maxCam.id),
@@ -1358,6 +1375,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
                       maximized: false,
                       oldestFootage: _oldestFootage[cam.id],
                       recordingMode: _recordingMode[cam.id],
+                      motionNow: () => _hadRecentMotion(cam.id),
                       playhead: () => _timeline.playhead,
                       onRetry: _retryResolve,
                       onSelect: () => _selectCamera(cam.id),
@@ -2015,6 +2033,7 @@ class _PbTile extends StatefulWidget {
     required this.onMaximizeToggle,
     this.oldestFootage,
     this.recordingMode,
+    this.motionNow,
     this.playhead,
     this.onRetry,
     this.scrubFrame,
@@ -2034,6 +2053,11 @@ class _PbTile extends StatefulWidget {
   /// Effective recording mode (`"continuous"` / `"motion"`), or null when the
   /// server predates the field.
   final String? recordingMode;
+
+  /// Whether the camera had motion in the last few seconds, read with the
+  /// playhead. Tells a motion camera that is recording (footage not indexed
+  /// yet: "Live edge") from one that is idle ("No motion right now").
+  final bool Function()? motionNow;
 
   /// Current playhead, read when the no-footage overlay is built.
   final DateTime Function()? playhead;
@@ -2123,6 +2147,7 @@ class _PbTileState extends State<_PbTile> {
       error: error == null ? null : _shortError(error),
       oldestFootage: playhead == null ? null : widget.oldestFootage,
       recordingMode: playhead == null ? null : widget.recordingMode,
+      motionNow: widget.motionNow?.call() ?? false,
     );
   }
 
