@@ -8,6 +8,66 @@ revisit.
 
 ---
 
+## 2026-10-29, LPR page redesign ("plate desk"): two server aggregates, history buckets in the server time zone, hints computed on the client
+
+**Context.** The desktop Plates page listed reads with no sense of history: an
+operator could not tell a neighbour from a first-time visitor without searching
+each plate, and the three display menus (Show / Crop size / Crop corner) barely
+changed anything. The owner approved one combined design from six concepts:
+a "plate desk" header (today's reads, unique plates, new plates, watchlist hits,
+and a regulars / returning / first-time split), ledger rows with a history cell
+and a 30-day sparkline, group-by-plate, one Density control, a contact-sheet
+grid, and a per-plate profile.
+
+**Decision.**
+
+- Two new `view_plates`-gated, camera-scoped endpoints in `plates.rs`:
+  `GET /lpr/overview?day=&camera_ids=` (the header) and
+  `POST /lpr/plates/stats {plates}` (history for up to 200 plates: total, 7/30-day
+  counts, first / last / previous sighting, per-camera counts, 24 hour-of-day
+  buckets, 30 daily buckets). Only reads from cameras the caller may see are
+  counted, including the history that decides "new" and "regular", so a viewer
+  can never learn about a camera they were not granted through a count.
+- "Regular" = at least 5 reads in the 30 local days ending with the day
+  (`db::LPR_REGULAR_MIN_READS_30D`, echoed to clients as
+  `regular_min_reads_30d`). The split is exhaustive: first-time (first seen on
+  the day), regulars, and returning (everything else seen before the day).
+- Days and hours are the server's local time (`ApiConfig::server_tz`), bucketed
+  in SQL with `AT TIME ZONE`, because "today" and "usually at 5 PM" only mean
+  something in the site's wall-clock time, and DST makes a fixed offset wrong.
+- New index `plate_reads (plate, ts)` (migration 0083). Every stats query is
+  driven by `plate = ANY($1)`, so its cost is bounded by the requested plates'
+  history, never the table; it also speeds up exact plate search.
+- Derived hints (NEW, UNUSUAL HOUR, "Nx TODAY"), visit collapsing (reads within
+  5 minutes on the same camera) and the plain-English profile summary are pure
+  client functions over the stats and the reads the client already holds. They
+  are presentation rules that will be tuned, and keeping them out of the API
+  avoids freezing them into a wire contract.
+- Clients degrade against an older server: a 404 on either endpoint hides the
+  header and renders history cells as "-".
+
+**Rejected.**
+
+- *A materialized per-plate summary table* updated on ingest: faster reads, but
+  a second source of truth that must stay consistent with retention pruning and
+  per-camera grants (a viewer's counts differ from an admin's). The on-demand
+  aggregate over an index is cheap enough for the 200 plates on screen.
+- *Computing history on the client from `GET /plates`*: it would mean paging
+  every read of every plate on screen (thousands of rows for a regular).
+- *UTC buckets*: an evening regular would show up split across two "days".
+
+**Trade-offs accepted.** Stats are recomputed per request (the desktop caches
+them for 60 s). The watchlist-hit tile counts exact plate matches against watch
+entries; fuzzy watchlist matching still drives alerts but not the tile. A
+server `TZ` that Postgres does not recognise makes both endpoints fail, and the
+page then hides the header as it does for an older server.
+
+**Revisit if.** Stats requests show up as slow in production (move to a
+summary table), operators want the regular threshold configurable, or
+Android/iOS adopt the plate desk and need the hint rules shared server-side.
+
+---
+
 ## 2026-10-29, Scrub pre-generation stays OFF by default; documented as the scrubbing knob, with a catch-up cap
 
 **Context.** #657 made a grid frame a single keyframe decode and the scrub

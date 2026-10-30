@@ -10048,6 +10048,243 @@ pub async fn list_plate_reads(pool: &Pool, q: &PlateReadQuery) -> Result<(Vec<Pl
     Ok((rows.iter().map(plate_read_from_row).collect(), total))
 }
 
+// ─── LPR plate desk: overview + per-plate history stats (migration 0083) ────
+
+/// A plate counts as a "regular" once it has at least this many reads in the
+/// 30 local days ending with the day being summarized. One constant for the
+/// overview split and every client that labels plates REGULAR.
+pub const LPR_REGULAR_MIN_READS_30D: i64 = 5;
+
+/// Length of the per-plate daily activity window (`days30`), in local days.
+pub const LPR_STATS_DAYS: usize = 30;
+
+/// Today's totals for the LPR header (`GET /lpr/overview`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LprOverviewCounts {
+    /// Plate reads inside the day.
+    pub reads: i64,
+    /// Distinct plates read inside the day.
+    pub unique: i64,
+    /// Plates whose first ever (visible) read falls inside the day.
+    pub new_plates: i64,
+    /// Reads inside the day of plates on the watchlist (`kind = 'watch'`).
+    pub watchlist_hits: i64,
+    /// Plates seen before the day with >= [`LPR_REGULAR_MIN_READS_30D`] reads
+    /// in the 30-day window.
+    pub regulars: i64,
+    /// Plates seen before the day that are not regulars.
+    pub returning: i64,
+}
+
+/// Summarize one local day of plate reads: totals, new plates, watchlist hits
+/// and the regulars / returning / first-time split.
+///
+/// `day_start..day_end` is the local day in UTC; `window_start` is the start
+/// of the 30-day window (local day `day - 29`). `camera_ids = None` means no
+/// camera filter (an admin asking for every camera); `Some(&[])` yields zeros.
+/// Every count is limited to `ts < day_end`, so summarizing a past day ignores
+/// what happened after it.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn lpr_overview(
+    pool: &Pool,
+    camera_ids: Option<&[Uuid]>,
+    day_start: DateTime<Utc>,
+    day_end: DateTime<Utc>,
+    window_start: DateTime<Utc>,
+) -> Result<LprOverviewCounts> {
+    if camera_ids.is_some_and(<[Uuid]>::is_empty) {
+        return Ok(LprOverviewCounts::default());
+    }
+    let cams: Option<Vec<Uuid>> = camera_ids.map(<[Uuid]>::to_vec);
+    let client = get_conn(pool).await?;
+    // `today` is bounded by the ts index; `hist` only looks at the plates read
+    // today, through the (plate, ts) index from migration 0083.
+    let row = client
+        .query_one(
+            "WITH today AS ( \
+               SELECT plate, count(*)::bigint AS n FROM plate_reads \
+               WHERE ts >= $1 AND ts < $2 AND ($3::uuid[] IS NULL OR camera_id = ANY($3)) \
+               GROUP BY plate \
+             ), hist AS ( \
+               SELECT r.plate, \
+                      count(*) FILTER (WHERE r.ts >= $4)::bigint AS n30, \
+                      min(r.ts) AS first_seen \
+               FROM plate_reads r \
+               WHERE r.plate IN (SELECT plate FROM today) AND r.ts < $2 \
+                 AND ($3::uuid[] IS NULL OR r.camera_id = ANY($3)) \
+               GROUP BY r.plate \
+             ) \
+             SELECT \
+               COALESCE((SELECT sum(n) FROM today), 0)::bigint AS reads, \
+               count(*)::bigint AS uniq, \
+               count(*) FILTER (WHERE h.first_seen >= $1)::bigint AS new_plates, \
+               count(*) FILTER (WHERE h.first_seen < $1 AND h.n30 >= $5)::bigint AS regulars, \
+               count(*) FILTER (WHERE h.first_seen < $1 AND h.n30 < $5)::bigint AS returning, \
+               COALESCE((SELECT sum(t.n) FROM today t \
+                         JOIN lpr_watchlist w ON w.plate = t.plate AND w.kind = 'watch'), 0)::bigint \
+                 AS watchlist_hits \
+             FROM hist h",
+            &[
+                &day_start,
+                &day_end,
+                &cams,
+                &window_start,
+                &LPR_REGULAR_MIN_READS_30D,
+            ],
+        )
+        .await
+        .context("lpr_overview")?;
+    Ok(LprOverviewCounts {
+        reads: row.get("reads"),
+        unique: row.get("uniq"),
+        new_plates: row.get("new_plates"),
+        watchlist_hits: row.get("watchlist_hits"),
+        regulars: row.get("regulars"),
+        returning: row.get("returning"),
+    })
+}
+
+/// One plate's history, as returned by [`lpr_plate_stats`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlateHistoryStats {
+    pub plate: String,
+    pub total: i64,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    /// Latest read before `today_start` (the "prev 2 d ago" cell), if any.
+    pub prev_seen: Option<DateTime<Utc>>,
+    /// `(camera_id, reads)`, most reads first.
+    pub cameras: Vec<(Uuid, i64)>,
+    /// Reads per local hour of day (index 0 = midnight), whole history.
+    pub hours: [i64; 24],
+    /// Reads per local day, oldest first; the last entry is today.
+    pub days: [i64; LPR_STATS_DAYS],
+}
+
+/// Per-plate history for a bounded set of (already normalized) plates.
+///
+/// Counts only reads on `camera_ids` (`None` = every camera, for admins;
+/// `Some(&[])` = nothing). `tz` is the IANA zone the hour and day buckets are
+/// computed in; `window_start` is the UTC start of local day `today - 29` and
+/// `today_start` the UTC start of the local today. Plates with no visible
+/// reads are omitted from the result. Every query is driven by
+/// `plate = ANY($1)` through the (plate, ts) index, so the cost is bounded by
+/// the requested plates' history, never the table.
+///
+/// # Errors
+///
+/// Returns an error if a query fails (including an unknown `tz` name).
+pub async fn lpr_plate_stats(
+    pool: &Pool,
+    plates: &[String],
+    camera_ids: Option<&[Uuid]>,
+    tz: &str,
+    window_start: DateTime<Utc>,
+    today_start: DateTime<Utc>,
+) -> Result<Vec<PlateHistoryStats>> {
+    if plates.is_empty() || camera_ids.is_some_and(<[Uuid]>::is_empty) {
+        return Ok(vec![]);
+    }
+    let plates: Vec<String> = plates.to_vec();
+    let cams: Option<Vec<Uuid>> = camera_ids.map(<[Uuid]>::to_vec);
+    let client = get_conn(pool).await?;
+
+    let base = client
+        .query(
+            "SELECT plate, count(*)::bigint AS total, min(ts) AS first_seen, \
+                    max(ts) AS last_seen, max(ts) FILTER (WHERE ts < $3) AS prev_seen \
+             FROM plate_reads \
+             WHERE plate = ANY($1) AND ($2::uuid[] IS NULL OR camera_id = ANY($2)) \
+             GROUP BY plate ORDER BY plate",
+            &[&plates, &cams, &today_start],
+        )
+        .await
+        .context("lpr_plate_stats: totals")?;
+    let mut out: Vec<PlateHistoryStats> = base
+        .iter()
+        .map(|r| PlateHistoryStats {
+            plate: r.get("plate"),
+            total: r.get("total"),
+            first_seen: r.get("first_seen"),
+            last_seen: r.get("last_seen"),
+            prev_seen: r.get("prev_seen"),
+            cameras: vec![],
+            hours: [0; 24],
+            days: [0; LPR_STATS_DAYS],
+        })
+        .collect();
+    if out.is_empty() {
+        return Ok(out);
+    }
+    let idx: std::collections::HashMap<String, usize> = out
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.plate.clone(), i))
+        .collect();
+
+    let cams_rows = client
+        .query(
+            "SELECT plate, camera_id, count(*)::bigint AS n FROM plate_reads \
+             WHERE plate = ANY($1) AND ($2::uuid[] IS NULL OR camera_id = ANY($2)) \
+             GROUP BY plate, camera_id ORDER BY plate, n DESC, camera_id",
+            &[&plates, &cams],
+        )
+        .await
+        .context("lpr_plate_stats: cameras")?;
+    for r in &cams_rows {
+        let plate: String = r.get("plate");
+        if let Some(&i) = idx.get(&plate) {
+            out[i].cameras.push((r.get("camera_id"), r.get("n")));
+        }
+    }
+
+    let hour_rows = client
+        .query(
+            "SELECT plate, extract(hour FROM ts AT TIME ZONE $3)::int AS h, count(*)::bigint AS n \
+             FROM plate_reads \
+             WHERE plate = ANY($1) AND ($2::uuid[] IS NULL OR camera_id = ANY($2)) \
+             GROUP BY 1, 2",
+            &[&plates, &cams, &tz],
+        )
+        .await
+        .context("lpr_plate_stats: hours")?;
+    for r in &hour_rows {
+        let plate: String = r.get("plate");
+        let h: i32 = r.get("h");
+        if let (Some(&i), Ok(h)) = (idx.get(&plate), usize::try_from(h)) {
+            if h < 24 {
+                out[i].hours[h] += r.get::<_, i64>("n");
+            }
+        }
+    }
+
+    let day_rows = client
+        .query(
+            "SELECT plate, \
+                    ((ts AT TIME ZONE $3)::date - ($4::timestamptz AT TIME ZONE $3)::date)::int AS d, \
+                    count(*)::bigint AS n \
+             FROM plate_reads \
+             WHERE plate = ANY($1) AND ($2::uuid[] IS NULL OR camera_id = ANY($2)) AND ts >= $4 \
+             GROUP BY 1, 2",
+            &[&plates, &cams, &tz, &window_start],
+        )
+        .await
+        .context("lpr_plate_stats: days")?;
+    for r in &day_rows {
+        let plate: String = r.get("plate");
+        let d: i32 = r.get("d");
+        if let (Some(&i), Ok(d)) = (idx.get(&plate), usize::try_from(d)) {
+            if d < LPR_STATS_DAYS {
+                out[i].days[d] += r.get::<_, i64>("n");
+            }
+        }
+    }
+    Ok(out)
+}
+
 // ─── LPR A/B benchmark (lpr_pass_truth, migration 0070) ─────────────────────
 
 /// Cameras configured for dual-engine LPR (`lpr_engine = 'both'`) — the only
@@ -11493,6 +11730,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
     (
         "0082_events_ts_index.sql",
         include_str!("../../../db/migrations/0082_events_ts_index.sql"),
+    ),
+    (
+        "0083_plate_reads_plate_ts_index.sql",
+        include_str!("../../../db/migrations/0083_plate_reads_plate_ts_index.sql"),
     ),
 ];
 

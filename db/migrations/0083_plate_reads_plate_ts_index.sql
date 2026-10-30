@@ -1,0 +1,11 @@
+-- Index on plate_reads(plate, ts) for per-plate history lookups.
+--
+-- The redesigned LPR page asks "how often have we seen this plate, when, and
+-- on which cameras" for every plate on screen (`POST /lpr/plates/stats`), and
+-- the plate profile lists one plate's recent reads (`GET /plates?match=exact`).
+-- The existing indexes lead with camera_id or ts (or are a trigram GIN that
+-- does not serve equality well), so each of those lookups had to scan the
+-- whole table. A btree on (plate, ts) turns them into bounded index range
+-- scans, and also serves the overview's "first seen / reads in the last 30
+-- days" lookup for the plates read today.
+CREATE INDEX IF NOT EXISTS plate_reads_plate_ts ON plate_reads (plate, ts);
