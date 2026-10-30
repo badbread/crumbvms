@@ -70,6 +70,16 @@ void main() {
       }
     });
 
+    test('unknown mode with no recent motion claims nothing at the live edge', () {
+      final m = pick(playhead: now, oldestFootage: oldest);
+      expect(m.reason, NoFootageReason.unknown);
+      expect(m.title, 'Nothing recorded yet');
+      expect(
+        pick(playhead: now, oldestFootage: oldest, motionNow: true).reason,
+        NoFootageReason.liveEdge,
+      );
+    });
+
     test('a motion camera that is moving right now is at the live edge', () {
       final m = pick(
         playhead: now,
