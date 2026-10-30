@@ -74,6 +74,11 @@ class _PlateProfileState extends State<_PlateProfile> {
   bool _loading = true;
   String? _error;
 
+  /// The read whose clip the hero player shows: starts as the read the profile
+  /// was opened from, then follows the visit row the operator clicks.
+  late PlateRead _selected = widget.focus;
+  final ScrollController _scroll = ScrollController();
+
   String get _plate => widget.focus.plate;
 
   @override
@@ -85,7 +90,28 @@ class _PlateProfileState extends State<_PlateProfile> {
   @override
   void didUpdateWidget(_PlateProfile old) {
     super.didUpdateWidget(old);
-    if (old.focus.plate != widget.focus.plate) _loadVisits();
+    if (old.focus.plate != widget.focus.plate) {
+      _selected = widget.focus;
+      _loadVisits();
+    }
+  }
+
+  @override
+  void dispose() {
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  /// A visit row was clicked: play that visit's best read in the hero player.
+  void _selectRead(PlateRead r) {
+    setState(() => _selected = r);
+    if (_scroll.hasClients) {
+      _scroll.animateTo(
+        0,
+        duration: const Duration(milliseconds: 250),
+        curve: Curves.easeOut,
+      );
+    }
   }
 
   Future<void> _loadVisits() async {
@@ -399,14 +425,14 @@ class _PlateProfileState extends State<_PlateProfile> {
               if (read.eventId != null && read.eventId!.isNotEmpty)
                 _ProfileButton(
                   icon: Icons.play_arrow,
-                  label: 'Play clip',
+                  label: 'Full-screen clip',
                   primary: true,
-                  onTap: () => widget.onPlay(read),
+                  onTap: () => widget.onPlay(_selected),
                 ),
               _ProfileButton(
                 icon: Icons.timeline,
                 label: 'View on timeline',
-                onTap: () => widget.onTimeline(read),
+                onTap: () => widget.onTimeline(_selected),
               ),
               if (plateCopyText(read).isNotEmpty)
                 _ProfileButton(
@@ -443,12 +469,14 @@ class _PlateProfileState extends State<_PlateProfile> {
         ];
         final clock = _card('Hour of day', _clock(s));
         return ListView(
+          controller: _scroll,
           padding: const EdgeInsets.fromLTRB(22, 18, 22, 22),
           children: [
+            _hero(c.maxWidth - 44),
             if (summary != null && summary.isNotEmpty)
               Container(
-                margin: const EdgeInsets.only(bottom: 14),
-                padding: const EdgeInsets.fromLTRB(14, 10, 14, 10),
+                margin: const EdgeInsets.only(bottom: 12),
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
                 decoration: BoxDecoration(
                   color: _kPink.withValues(alpha: 0.12),
                   border: const Border(
@@ -461,7 +489,7 @@ class _PlateProfileState extends State<_PlateProfile> {
                 ),
                 child: Text(
                   summary,
-                  style: const TextStyle(color: Colors.white, fontSize: 13.5),
+                  style: const TextStyle(color: Colors.white, fontSize: 12.5),
                 ),
               ),
             if (s == null && widget.statsUnsupported)
@@ -486,10 +514,69 @@ class _PlateProfileState extends State<_PlateProfile> {
               ...left,
               clock,
             ],
-            _card('Recent visits', _visitsList(s)),
+            _card('Recent visits (click one to play it above)', _visitsList(s)),
           ],
         );
       },
+    );
+  }
+
+  /// The hero: the selected read's clip, large, at the top of the column.
+  Widget _hero(double width) {
+    final r = _selected;
+    final hasClip = r.eventId != null && r.eventId!.isNotEmpty;
+    final h = (width * 9 / 16).clamp(180.0, 480.0);
+    final now = DateTime.now();
+    return Container(
+      margin: const EdgeInsets.only(bottom: 14),
+      decoration: BoxDecoration(
+        color: Colors.black,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: _kSurface2),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          SizedBox(
+            height: h,
+            child: hasClip
+                ? _InlineClip(
+                    key: ValueKey('inline:${r.id}'),
+                    api: widget.api,
+                    session: widget.session,
+                    read: r,
+                  )
+                : Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Text(
+                          'No clip for this read.',
+                          style: TextStyle(color: Colors.white54),
+                        ),
+                        const SizedBox(height: 8),
+                        _ProfileButton(
+                          icon: Icons.timeline,
+                          label: 'View on timeline',
+                          onTap: () => widget.onTimeline(r),
+                        ),
+                      ],
+                    ),
+                  ),
+          ),
+          Container(
+            color: _kSurface1,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            child: Text(
+              '${widget.camName(r.cameraId)}  ·  ${_fmtWhen(r.ts, now)}',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: Colors.white70, fontSize: 12),
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -690,12 +777,20 @@ class _PlateProfileState extends State<_PlateProfile> {
         ? ''
         : ', ${(v.bestConfidence! * 100).round()}%';
     final hasClip = best.eventId != null && best.eventId!.isNotEmpty;
+    final playing = v.reads.any((r) => r.id == _selected.id);
     return InkWell(
-      onTap: () => hasClip ? widget.onPlay(best) : widget.onTimeline(best),
+      onTap: () => hasClip ? _selectRead(best) : widget.onTimeline(best),
       child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 6),
-        decoration: const BoxDecoration(
-          border: Border(top: BorderSide(color: _kSurface2)),
+        padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 6),
+        decoration: BoxDecoration(
+          color: playing ? _kPink.withValues(alpha: 0.14) : null,
+          border: Border(
+            top: const BorderSide(color: _kSurface2),
+            left: BorderSide(
+              color: playing ? _kPink : Colors.transparent,
+              width: 3,
+            ),
+          ),
         ),
         child: Row(
           children: [
@@ -723,11 +818,13 @@ class _PlateProfileState extends State<_PlateProfile> {
               ]),
             ),
             Tooltip(
-              message: hasClip ? 'Play clip' : 'View on timeline',
+              message: hasClip ? 'Play above' : 'View on timeline',
               child: Icon(
-                hasClip ? Icons.play_circle_outline : Icons.timeline,
+                hasClip
+                    ? (playing ? Icons.play_circle : Icons.play_circle_outline)
+                    : Icons.timeline,
                 size: 18,
-                color: Colors.white38,
+                color: playing ? _kPink : Colors.white38,
               ),
             ),
           ],
@@ -933,4 +1030,100 @@ Widget debugPlateProfile({
     onUnwatch: () {},
     onReport: (_) {},
   );
+}
+
+/// The profile's hero player: plays [read]'s detection clip inline (muted,
+/// autoplay, with media_kit's standard transport controls). Resolves the clip
+/// like the pop-up [_PlateClipPlayer]: `/clip/d:<event>/clip.mp4` on a scoped
+/// media `?token=`. Key it by the read so switching reads builds a fresh Video
+/// (media_kit binds the controller only in initState). Any failure to resolve
+/// or open (offline, tests) degrades to a text placeholder.
+class _InlineClip extends StatefulWidget {
+  const _InlineClip({
+    super.key,
+    required this.api,
+    required this.session,
+    required this.read,
+  });
+
+  final CrumbApi api;
+  final Session session;
+  final PlateRead read;
+
+  @override
+  State<_InlineClip> createState() => _InlineClipState();
+}
+
+class _InlineClipState extends State<_InlineClip> {
+  Player? _player;
+  VideoController? _controller;
+  String? _error;
+  bool _disposed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_open());
+  }
+
+  Future<void> _open() async {
+    try {
+      final id = Uri.encodeComponent('d:${widget.read.eventId}');
+      final url = await widget.api.mediaUrlForCamera(
+        widget.session,
+        widget.read.cameraId,
+        '/clip/$id/clip.mp4?q=preview',
+      );
+      if (_disposed || !mounted) return;
+      if (url == null) {
+        setState(() => _error = 'Could not authorize this clip.');
+        return;
+      }
+      final player = Player();
+      final controller = VideoController(player);
+      setState(() {
+        _player = player;
+        _controller = controller;
+      });
+      await player.setVolume(0);
+      await player.open(Media(url));
+      await player.play();
+    } catch (_) {
+      if (mounted && !_disposed) {
+        setState(() => _error = 'Clip unavailable.');
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    final p = _player;
+    if (p != null) {
+      // Dispose after the frame so the Video widget has let go of the
+      // controller first.
+      WidgetsBinding.instance.addPostFrameCallback((_) => p.dispose());
+    }
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_error != null) {
+      return Center(
+        child: Text(_error!, style: const TextStyle(color: Colors.white54)),
+      );
+    }
+    final c = _controller;
+    if (c == null) {
+      return const Center(
+        child: SizedBox(
+          width: 22,
+          height: 22,
+          child: CircularProgressIndicator(strokeWidth: 2),
+        ),
+      );
+    }
+    return Video(controller: c, fit: BoxFit.contain);
+  }
 }
