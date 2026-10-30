@@ -98,6 +98,8 @@ pub mod rate_limit;
 pub mod roles;
 #[path = "../../src/scrub_settings.rs"]
 pub mod scrub_settings;
+#[path = "../../src/scrub_sprite.rs"]
+pub mod scrub_sprite;
 #[path = "../../src/segment_low.rs"]
 pub mod segment_low;
 #[path = "../../src/state.rs"]
@@ -392,6 +394,7 @@ pub fn test_router() -> Router<AppState> {
         .merge(segment_low::routes())
         .merge(export::routes())
         .merge(filmstrip::routes())
+        .merge(scrub_sprite::routes())
         .merge(events::json_routes())
         .merge(events::media_routes())
         .merge(plates::json_routes())

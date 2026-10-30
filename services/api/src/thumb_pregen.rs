@@ -5,7 +5,10 @@
 //! Off by default (`THUMB_PREGEN_ENABLED`, or the admin-console "Scrub
 //! previews" toggle). When on, it rolls forward over each enabled camera's
 //! recently-recorded footage, extracting a thumbnail per grid slot so timeline
-//! scrubbing is fast on the FIRST touch, not just on revisit.
+//! scrubbing is fast on the FIRST touch, not just on revisit, and rendering one
+//! scrub sprite strip per completed segment (1 s granularity, see
+//! [`crate::scrub_sprite`]). The sprites have no on-demand path: this worker is
+//! the only thing that makes them.
 //!
 //! It shares the grid interval, the cache path, the singleflight lock, and the
 //! extraction semaphore with the on-demand request path
@@ -49,7 +52,7 @@ use uuid::Uuid;
 
 use crumb_common::db;
 
-use crate::{filmstrip, scrub_settings::ScrubSettings, state::AppState};
+use crate::{filmstrip, scrub_settings::ScrubSettings, scrub_sprite, state::AppState};
 
 /// Run the live-reloading pre-generation loop. Never returns; always safe to
 /// spawn unconditionally (an idle/disabled tick costs one settings SELECT).
@@ -234,8 +237,73 @@ async fn run_backfill_cycle(
                 return;
             }
         }
+
+        // Scrub sprite strips (1 s granularity), one per completed main-stream
+        // segment in the same window. Same toggle, same kill switch.
+        if !generate_sprites(state, cam.id, since, until).await {
+            return;
+        }
         watermark.insert(cam.id, now_ms);
     }
+}
+
+/// How far before the camera's watermark the sprite pass re-lists segments.
+/// A segment is only rendered once it is [`SPRITE_SETTLE_SECS`] old, so one
+/// that was too fresh last cycle must still be inside this cycle's window.
+/// Re-listing an already-rendered segment costs one `stat`.
+const SPRITE_OVERLAP_SECS: i64 = 120;
+
+/// A segment younger than this (by `end_ts`) is left for the next cycle, as a
+/// margin against rendering a file the recorder has only just closed.
+const SPRITE_SETTLE_SECS: i64 = 10;
+
+/// Render the missing sprite strips for `camera_id`'s main-stream segments in
+/// `[since - overlap, until)`. Returns `false` if pre-generation was disabled
+/// mid-pass (the caller abandons the cycle), `true` otherwise.
+async fn generate_sprites(
+    state: &AppState,
+    camera_id: Uuid,
+    since: chrono::DateTime<Utc>,
+    until: chrono::DateTime<Utc>,
+) -> bool {
+    let segments = match db::list_segments_for_range(
+        state.pool(),
+        camera_id,
+        "main",
+        since - Duration::seconds(SPRITE_OVERLAP_SECS),
+        until,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                camera_id = %camera_id,
+                error = %e,
+                "thumb pre-gen: listing segments for sprites failed"
+            );
+            return true;
+        }
+    };
+    let settled_before = until - Duration::seconds(SPRITE_SETTLE_SECS);
+    let mut steps: u64 = 0;
+    for seg in segments.iter().filter(|s| s.end_ts <= settled_before) {
+        if let Err(e) = scrub_sprite::ensure_sprite(state, seg).await {
+            tracing::debug!(segment_id = %seg.id, error = %e, "thumb pre-gen: sprite render failed");
+        }
+        steps += 1;
+        if steps.is_multiple_of(64) {
+            tokio::task::yield_now().await;
+        }
+        if steps.is_multiple_of(256) && !recheck_enabled(state).await {
+            tracing::info!(
+                camera_id = %camera_id,
+                "thumb pre-generation: disabled mid-backfill; abandoning this camera's sprite pass"
+            );
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
