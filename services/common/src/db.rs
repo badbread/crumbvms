@@ -5071,13 +5071,196 @@ pub async fn timeline_spans(
               AND start_ts >= $4
               AND start_ts < $3
               AND end_ts   > $2
-            ORDER BY camera_id, start_ts
+            ORDER BY camera_id, start_ts, id
             ",
             &[&camera_ids, &start, &end, &lower_bound],
         )
         .await
         .context("timeline_spans")?;
     rows.iter().map(segment_from_row).collect()
+}
+
+/// Maximum gap between the end of one segment and the start of the next that
+/// `/timeline` still treats as contiguous, in milliseconds. 1 s covers ffmpeg
+/// segment-boundary rounding without hiding genuine gaps.
+pub const TIMELINE_GAP_TOLERANCE_MS: i64 = 1_000;
+
+/// One merged run of contiguous recording for a camera, as returned by
+/// [`timeline_merged_spans`] (and by the reference [`merge_segments_into_spans`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimelineSpan {
+    pub camera_id: Uuid,
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    /// `true` when ANY segment in the span has motion.
+    pub has_motion: bool,
+    /// Stage of the FIRST segment of the span (first-wins).
+    pub stage: SegmentStage,
+}
+
+/// Reference (in-memory) span merge over rows ordered by
+/// `(camera_id, start_ts, id)`, exactly the order [`timeline_spans`] returns.
+///
+/// A segment extends the current span of the same camera when
+/// `seg.start_ts <= span.end + gap_tolerance_ms`, where `span.end` is the
+/// running maximum `end_ts` of the span. `has_motion` is OR-ed, `stage` is the
+/// first segment's.
+///
+/// `/timeline` no longer calls this in production ([`timeline_merged_spans`]
+/// does the same merge in SQL), but it stays as the executable specification
+/// the SQL is tested against (see the `timeline_sql_merge_*` tests).
+#[must_use]
+pub fn merge_segments_into_spans(
+    segments: Vec<Segment>,
+    gap_tolerance_ms: i64,
+) -> Vec<TimelineSpan> {
+    let tolerance = chrono::Duration::milliseconds(gap_tolerance_ms);
+    let mut spans: Vec<TimelineSpan> = Vec::new();
+    for seg in segments {
+        if let Some(last) = spans.last_mut() {
+            if last.camera_id == seg.camera_id && seg.start_ts <= last.end + tolerance {
+                if seg.end_ts > last.end {
+                    last.end = seg.end_ts;
+                }
+                last.has_motion |= seg.has_motion;
+                continue;
+            }
+        }
+        spans.push(TimelineSpan {
+            camera_id: seg.camera_id,
+            start: seg.start_ts,
+            end: seg.end_ts,
+            has_motion: seg.has_motion,
+            stage: seg.stage,
+        });
+    }
+    spans
+}
+
+/// Merged recorded spans for `camera_ids` overlapping `[start, end)`, computed
+/// in Postgres with a gaps-and-islands query, plus the TOTAL span count before
+/// pagination.
+///
+/// Same spans, same order and same merge semantics as running
+/// [`merge_segments_into_spans`] over [`timeline_spans`] (tested for
+/// equivalence), but only the merged spans cross the wire: a continuously
+/// recording camera over 30 days is ~650k segment rows and a handful of spans.
+///
+/// * A row opens a new island when it is the camera's first row in the window
+///   or its `start_ts` is more than `gap_tolerance_ms` after the running
+///   maximum `end_ts` of every earlier row of that camera (which, because an
+///   island only closes when that condition fails, is the running end of the
+///   current span, identical to the reference merge).
+/// * Ordering ties on `start_ts` are broken by `id` (the reference merge sees
+///   the same order), so the first-wins `stage` is deterministic.
+/// * `limit` / `offset` page over the merged spans ordered by
+///   `(camera_id, start)`.
+pub async fn timeline_merged_spans(
+    pool: &Pool,
+    camera_ids: &[Uuid],
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    gap_tolerance_ms: i64,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<TimelineSpan>, usize)> {
+    if camera_ids.is_empty() {
+        return Ok((vec![], 0));
+    }
+    let client = get_conn(pool).await?;
+    // Same sargable lower bound as `timeline_spans` (audit P2 #11).
+    let lower_bound = start - MAX_SEGMENT_LEN;
+
+    let rows = client
+        .query(
+            r"
+            WITH seg AS (
+                -- is_start = 1 when this row opens a new span: the camera's
+                -- first row (NULL running max -> CASE falls to ELSE) or a gap
+                -- past the tolerance after the running max end of every
+                -- earlier row of the camera.
+                SELECT id, camera_id, start_ts, end_ts, has_motion, stage,
+                       CASE WHEN start_ts <= max(end_ts) OVER (
+                                     PARTITION BY camera_id ORDER BY start_ts, id
+                                     ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                                 ) + $5::bigint * interval '1 millisecond'
+                            THEN 0 ELSE 1 END AS is_start
+                FROM segments
+                WHERE camera_id = ANY($1)
+                  AND start_ts >= $4
+                  AND start_ts < $3
+                  AND end_ts   > $2
+            ),
+            islands AS (
+                -- Only the opening row carries its stage, so `max()` below
+                -- picks the FIRST segment's stage without an ordered
+                -- aggregate (which would force a full re-sort of the rows).
+                SELECT camera_id, start_ts, end_ts, has_motion,
+                       CASE WHEN is_start = 1 THEN stage END AS first_stage,
+                       sum(is_start) OVER (
+                           PARTITION BY camera_id ORDER BY start_ts, id
+                           ROWS UNBOUNDED PRECEDING
+                       ) AS island
+                FROM seg
+            )
+            SELECT camera_id,
+                   min(start_ts)       AS span_start,
+                   max(end_ts)         AS span_end,
+                   bool_or(has_motion) AS has_motion,
+                   max(first_stage)    AS stage,
+                   count(*) OVER ()    AS total
+            FROM islands
+            GROUP BY camera_id, island
+            ORDER BY camera_id, span_start
+            LIMIT $6 OFFSET $7
+            ",
+            &[
+                &camera_ids,
+                &start,
+                &end,
+                &lower_bound,
+                &gap_tolerance_ms,
+                &limit,
+                &offset,
+            ],
+        )
+        .await
+        .context("timeline_merged_spans")?;
+
+    let mut total: Option<i64> = rows.first().map(|r| r.get("total"));
+    let spans = rows
+        .iter()
+        .map(|row| {
+            let stage_str: String = row.get("stage");
+            let stage = SegmentStage::from_str(&stage_str)
+                .with_context(|| format!("unknown segment stage '{stage_str}'"))?;
+            Ok(TimelineSpan {
+                camera_id: row.get("camera_id"),
+                start: row.get("span_start"),
+                end: row.get("span_end"),
+                has_motion: row.get("has_motion"),
+                stage,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // A page past the end returns no rows, so the window count is unavailable;
+    // read it with a first-page probe (only reached for an out-of-range offset).
+    if total.is_none() && offset > 0 {
+        let (_, t) = Box::pin(timeline_merged_spans(
+            pool,
+            camera_ids,
+            start,
+            end,
+            gap_tolerance_ms,
+            1,
+            0,
+        ))
+        .await?;
+        total = Some(i64::try_from(t).unwrap_or(i64::MAX));
+    }
+    let total = usize::try_from(total.unwrap_or(0)).unwrap_or(usize::MAX);
+    Ok((spans, total))
 }
 
 /// Resolve the segment(s) covering a specific timestamp for one camera and stream.
@@ -16149,5 +16332,247 @@ mod tests {
             read_one_display_name(&pool, cam, &plate).await.as_deref(),
             Some("Watchlist label")
         );
+    }
+
+    // ── timeline_merged_spans (SQL gaps-and-islands) vs the reference merge ──
+    //
+    // Opt-in on `TEST_DATABASE_URL` like the tests above. Every case seeds its
+    // own cameras, so the shared public schema never cross-contaminates.
+
+    /// One fixture row: (camera index, start ms, end ms, has_motion, stage).
+    type SegSpec = (usize, i64, i64, bool, &'static str);
+
+    /// Seed `n_cameras` fresh cameras + one storage, insert `specs` (offsets in
+    /// ms from a fixed base, `main` stream), and return the camera ids + base.
+    async fn seed_timeline_fixture(
+        pool: &Pool,
+        n_cameras: usize,
+        specs: &[SegSpec],
+    ) -> (Vec<Uuid>, DateTime<Utc>) {
+        let policy_id = insert_nondefault_policy(pool).await;
+        let mut cams = Vec::with_capacity(n_cameras);
+        for _ in 0..n_cameras {
+            cams.push(seed_camera_for_test(pool, policy_id).await);
+        }
+        let storage_name = format!("test-storage-{}", Uuid::new_v4().simple());
+        let storage_id = create_storage(pool, &storage_name, "/does/not/matter", None, None)
+            .await
+            .expect("create_storage")
+            .id;
+        let base = Utc
+            .timestamp_millis_opt(1_700_000_000_000)
+            .single()
+            .unwrap();
+        let client = get_conn(pool).await.expect("get_conn (timeline fixture)");
+        let stmt = client
+            .prepare(
+                r"
+                INSERT INTO segments
+                    (camera_id, storage_id, stage, path, stream, start_ts, end_ts,
+                     duration_ms, has_motion, size_bytes)
+                VALUES ($1, $2, $3, 'seg.mp4', 'main', $4, $5, $6, $7, 64)
+                ",
+            )
+            .await
+            .expect("prepare segment insert");
+        for &(cam, s, e, motion, stage) in specs {
+            let start_ts = base + chrono::Duration::milliseconds(s);
+            let end_ts = base + chrono::Duration::milliseconds(e);
+            let dur = i32::try_from(e - s).unwrap_or(0);
+            client
+                .execute(
+                    &stmt,
+                    &[
+                        &cams[cam],
+                        &storage_id,
+                        &stage,
+                        &start_ts,
+                        &end_ts,
+                        &dur,
+                        &motion,
+                    ],
+                )
+                .await
+                .expect("insert timeline fixture segment");
+        }
+        (cams, base)
+    }
+
+    /// Assert the SQL merge equals the reference merge over the same window,
+    /// unpaginated AND for a spread of `limit`/`offset` pages (including pages
+    /// past the end, which must still report the true total).
+    async fn assert_sql_merge_matches_reference(
+        pool: &Pool,
+        cams: &[Uuid],
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Vec<TimelineSpan> {
+        let rows = timeline_spans(pool, cams, start, end)
+            .await
+            .expect("timeline_spans");
+        let reference = merge_segments_into_spans(rows, TIMELINE_GAP_TOLERANCE_MS);
+
+        let (all, total) = timeline_merged_spans(
+            pool,
+            cams,
+            start,
+            end,
+            TIMELINE_GAP_TOLERANCE_MS,
+            1_000_000,
+            0,
+        )
+        .await
+        .expect("timeline_merged_spans");
+        assert_eq!(all, reference, "SQL merge must equal the reference merge");
+        assert_eq!(
+            total,
+            reference.len(),
+            "total must be the unpaginated span count"
+        );
+
+        let n = reference.len();
+        let offsets = [0, 1, 2, 5, n.saturating_sub(1), n, n + 5];
+        for limit in [1usize, 2, 3, 7, 10_000] {
+            for &offset in &offsets {
+                let (page, page_total) = timeline_merged_spans(
+                    pool,
+                    cams,
+                    start,
+                    end,
+                    TIMELINE_GAP_TOLERANCE_MS,
+                    i64::try_from(limit).unwrap(),
+                    i64::try_from(offset).unwrap(),
+                )
+                .await
+                .expect("timeline_merged_spans (page)");
+                let expected: Vec<TimelineSpan> =
+                    reference.iter().skip(offset).take(limit).cloned().collect();
+                assert_eq!(page, expected, "page limit={limit} offset={offset}");
+                assert_eq!(page_total, n, "total for limit={limit} offset={offset}");
+            }
+        }
+        reference
+    }
+
+    /// Hand-built edge cases: touching segments, gaps just inside / exactly at
+    /// / just past the 1 s tolerance, a segment contained in a longer one
+    /// (running-max end), mixed stages (first wins), motion only mid-span, a
+    /// segment straddling the window start, one past the window end, and two
+    /// cameras with interleaved times.
+    #[tokio::test]
+    async fn timeline_sql_merge_edge_cases_match_reference() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let pool = migrated_public_pool(&url).await;
+        let specs: Vec<SegSpec> = vec![
+            // cam 0
+            (0, -2_000, 2_000, false, "live"), // straddles the window start
+            (0, 2_000, 6_000, false, "live"),  // touching
+            (0, 6_999, 10_000, true, "live"),  // 999 ms gap: merges
+            (0, 11_000, 15_000, false, "archive"), // exactly 1 000 ms: merges (<=)
+            (0, 16_001, 20_000, false, "archive"), // 1 001 ms: new span, archive first
+            (0, 20_000, 40_000, false, "live"), // long one
+            (0, 22_000, 24_000, false, "archive"), // contained: running max stays 40 s
+            (0, 40_500, 44_000, false, "live"), // merges against the 40 s running max
+            (0, 50_000, 54_000, true, "live"), // isolated
+            (0, 120_000, 124_000, false, "live"), // past the window end: excluded
+            // cam 1 (interleaved times)
+            (1, 1_000, 5_000, false, "archive"),
+            (1, 5_000, 9_000, false, "live"),
+            (1, 30_000, 34_000, false, "live"),
+            (1, 34_500, 38_000, true, "archive"),
+        ];
+        let (cams, base) = seed_timeline_fixture(&pool, 2, &specs).await;
+        let start = base;
+        let end = base + chrono::Duration::seconds(100);
+        let spans = assert_sql_merge_matches_reference(&pool, &cams, start, end).await;
+
+        // Spot-check the semantics directly, not only reference equality.
+        let ms = |n: i64| base + chrono::Duration::milliseconds(n);
+        let cam0: Vec<&TimelineSpan> = spans.iter().filter(|s| s.camera_id == cams[0]).collect();
+        assert_eq!(cam0.len(), 3, "cam0 spans: {cam0:?}");
+        assert_eq!((cam0[0].start, cam0[0].end), (ms(-2_000), ms(15_000)));
+        assert!(cam0[0].has_motion);
+        assert_eq!(cam0[0].stage, SegmentStage::Live);
+        assert_eq!((cam0[1].start, cam0[1].end), (ms(16_001), ms(44_000)));
+        assert_eq!(cam0[1].stage, SegmentStage::Archive);
+        assert!(!cam0[1].has_motion);
+        assert_eq!((cam0[2].start, cam0[2].end), (ms(50_000), ms(54_000)));
+        let cam1: Vec<&TimelineSpan> = spans.iter().filter(|s| s.camera_id == cams[1]).collect();
+        assert_eq!(cam1.len(), 2, "cam1 spans: {cam1:?}");
+        assert_eq!(cam1[0].stage, SegmentStage::Archive);
+        assert!(cam1[1].has_motion);
+
+        // An empty camera list and a window with no footage are both empty.
+        let (none, t) =
+            timeline_merged_spans(&pool, &[], start, end, TIMELINE_GAP_TOLERANCE_MS, 10, 0)
+                .await
+                .unwrap();
+        assert!(none.is_empty() && t == 0);
+        let later = base + chrono::Duration::days(3);
+        let (none, t) = timeline_merged_spans(
+            &pool,
+            &cams,
+            later,
+            later + chrono::Duration::hours(1),
+            TIMELINE_GAP_TOLERANCE_MS,
+            10,
+            3,
+        )
+        .await
+        .unwrap();
+        assert!(none.is_empty() && t == 0);
+    }
+
+    /// Pseudo-random fixtures (deterministic LCG, several seeds): 3 cameras,
+    /// mixed gaps (overlap, touching, sub-tolerance, exactly-tolerance,
+    /// just-over, long), random durations, stages and motion, checked over the
+    /// full range and several sub-windows that cut spans at both edges.
+    #[tokio::test]
+    async fn timeline_sql_merge_random_fixtures_match_reference() {
+        let Some(url) = test_db_url() else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let pool = migrated_public_pool(&url).await;
+        for seed in [1u64, 7, 42, 2026] {
+            let mut state = seed;
+            let mut next = move || {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                state >> 33
+            };
+            let gaps: [i64; 7] = [-500, 0, 0, 300, 1_000, 1_001, 7_000];
+            let mut specs: Vec<SegSpec> = Vec::new();
+            for cam in 0..3 {
+                let mut t: i64 = 0;
+                for _ in 0..400 {
+                    let gap = gaps[usize::try_from(next() % 7).unwrap()];
+                    let dur = 500 + i64::try_from(next() % 5_500).unwrap();
+                    let s = t + gap;
+                    let motion = next() % 5 == 0;
+                    let stage = if next() % 3 == 0 { "archive" } else { "live" };
+                    specs.push((cam, s, s + dur, motion, stage));
+                    t = s + dur;
+                }
+            }
+            let (cams, base) = seed_timeline_fixture(&pool, 3, &specs).await;
+            let full_end = base + chrono::Duration::hours(2);
+            assert_sql_merge_matches_reference(&pool, &cams, base, full_end).await;
+            for (a, b) in [(60, 300), (333, 334), (1_000, 1_900)] {
+                assert_sql_merge_matches_reference(
+                    &pool,
+                    &cams,
+                    base + chrono::Duration::seconds(a),
+                    base + chrono::Duration::seconds(b),
+                )
+                .await;
+            }
+            // A camera subset must merge identically too.
+            assert_sql_merge_matches_reference(&pool, &cams[1..2], base, full_end).await;
+        }
     }
 }

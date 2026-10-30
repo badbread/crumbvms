@@ -15,14 +15,19 @@
 //! 2. Filter the parsed IDs through `user.filter_camera_ids` to enforce viewer
 //!    camera scoping (admins pass through unchanged).
 //! 3. Validate `start < end`; reject with 400 if not.
-//! 4. Call `crumb_common::db::timeline_spans`, which returns rows ordered by
-//!    `(camera_id, start_ts)` from the `(camera_id, start_ts)` index.
-//! 5. Merge contiguous segments per camera into [`RecordedSpan`]s:
-//!    - Two segments are contiguous when `seg[i].end_ts + GAP_TOLERANCE >= seg[i+1].start_ts`.
+//! 4. Call `crumb_common::db::timeline_merged_spans`, which merges contiguous
+//!    segments per camera into spans IN POSTGRES (gaps-and-islands window
+//!    query over `(camera_id, start_ts, id)`) and pages over them, so only the
+//!    merged spans leave the database:
+//!    - Two segments are contiguous when `seg.start_ts <= span.end + GAP_TOLERANCE`
+//!      (1 s, `db::TIMELINE_GAP_TOLERANCE_MS`; `span.end` is the running max end).
 //!    - `has_motion` is `true` if **any** segment in the span has `has_motion`.
 //!    - `stage` is taken from the **first** segment of the span (live beats archive
 //!      for display; mixed-stage spans are labelled "live" by the first-wins rule).
-//! 6. Return all spans in a single [`TimelineResponse`].
+//!
+//!    `db::merge_segments_into_spans` is the in-memory reference implementation
+//!    the SQL is tested against.
+//! 5. Return the requested page of spans plus the total in a [`TimelineResponse`].
 //!
 //! # Performance target
 //!
@@ -33,7 +38,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -46,16 +51,6 @@ use crate::{
     state::AppState,
 };
 
-/// Maximum gap between the end of one segment and the start of the next that is
-/// still treated as contiguous, in milliseconds.
-///
-/// 1 000 ms (1 s) covers typical ffmpeg segment-boundary rounding without
-/// hiding genuine gaps.
-///
-/// `chrono::Duration::milliseconds` is not `const`, so we store the raw value
-/// and call `Duration::milliseconds(GAP_TOLERANCE_MS)` at the use site.
-const GAP_TOLERANCE_MS: i64 = 1_000;
-
 /// Default page size when the client omits `limit`. Merged spans are coarse
 /// (contiguous recording = one span) so this is generous for normal use while
 /// still bounding pathological windows.
@@ -64,17 +59,6 @@ const DEFAULT_SPAN_LIMIT: usize = 2_000;
 /// Hard ceiling on `limit` regardless of what the client requests — bounds the
 /// response payload deterministically (audit Risk #4).
 const MAX_SPAN_LIMIT: usize = 10_000;
-
-/// If the `/timeline` SPAN-MERGE query scans more than this many raw segments,
-/// log a WARN — that path still fetches every segment in the window to merge
-/// contiguous runs into spans, so it is O(rows) in the window.
-///
-/// The `/timeline/intensity[/batch]` endpoints no longer need this: SQL-side
-/// bucketing (`db::motion_intensity_buckets[_multi]`) now aggregates the window
-/// down to <= N rows in Postgres, so a wide (e.g. 30-day) intensity request is
-/// handled efficiently server-side instead of shipping hundreds of thousands of
-/// rows to Rust (the ribbon-population slowness this replaced).
-const SCAN_WARN_SEGMENTS: usize = 100_000;
 
 /// Max cameras accepted by `GET /timeline/intensity/batch`. A wall is a handful
 /// of cameras; this just bounds a pathological request.
@@ -294,33 +278,26 @@ async fn get_timeline(
         ));
     }
 
-    // ── 4. fetch segments from the index ──────────────────────────────────────
-    let segments = db::timeline_spans(state.pool(), &camera_ids, q.start, q.end)
-        .await
-        .map_err(ApiError::Internal)?;
-
-    if segments.len() > SCAN_WARN_SEGMENTS {
-        tracing::warn!(
-            scanned = segments.len(),
-            cameras = camera_ids.len(),
-            window_hours = (q.end - q.start).num_hours(),
-            "large /timeline span-merge scan (audit Risk #4) — this is the \
-             contiguous-span endpoint, which is inherently O(rows); the intensity \
-             ribbon is SQL-bucketed and unaffected"
-        );
-    }
-
-    // ── 5. merge contiguous segments per camera ───────────────────────────────
-    let all_spans = merge_segments_into_spans(segments);
-    let total = all_spans.len();
-
-    // ── 6. paginate the merged spans (bounds the response payload) ─────────────
+    // ── 4-6. merge contiguous segments per camera AND paginate, in SQL ────────
+    // Gaps-and-islands in Postgres: only the merged spans (plus the total
+    // count) leave the database, instead of every segment row in the window.
     let offset = q.offset.unwrap_or(0);
     let limit = q
         .limit
         .unwrap_or(DEFAULT_SPAN_LIMIT)
         .clamp(1, MAX_SPAN_LIMIT);
-    let spans: Vec<RecordedSpan> = all_spans.into_iter().skip(offset).take(limit).collect();
+    let (merged, total) = db::timeline_merged_spans(
+        state.pool(),
+        &camera_ids,
+        q.start,
+        q.end,
+        db::TIMELINE_GAP_TOLERANCE_MS,
+        i64::try_from(limit).unwrap_or(i64::MAX),
+        i64::try_from(offset).unwrap_or(i64::MAX),
+    )
+    .await
+    .map_err(ApiError::Internal)?;
+    let spans: Vec<RecordedSpan> = merged.iter().map(recorded_span).collect();
     let has_more = offset.saturating_add(spans.len()) < total;
 
     Ok(Json(TimelineResponse {
@@ -332,45 +309,29 @@ async fn get_timeline(
 
 // ─── span merging ─────────────────────────────────────────────────────────────
 
-/// Merge a list of [`crumb_common::Segment`] rows (pre-sorted by
-/// `(camera_id, start_ts)`) into [`RecordedSpan`]s.
+/// Map a merged [`db::TimelineSpan`] to the wire DTO.
 ///
-/// Two segments belong to the same span when they are contiguous (gap ≤
-/// [`GAP_TOLERANCE`]).  A span's `has_motion` is the logical OR of all its
-/// segments' `has_motion` flags.  The `stage` is taken from the first segment
-/// in the span.
-fn merge_segments_into_spans(segments: Vec<crumb_common::Segment>) -> Vec<RecordedSpan> {
-    let mut spans: Vec<RecordedSpan> = Vec::with_capacity(segments.len());
-
-    for seg in segments {
-        // Try to extend the most-recent span for the same camera.
-        if let Some(last) = spans.last_mut() {
-            if last.camera_id == seg.camera_id {
-                // Contiguous check: last span's end + tolerance >= this seg's start.
-                let gap_threshold = last.end + Duration::milliseconds(GAP_TOLERANCE_MS);
-                if seg.start_ts <= gap_threshold {
-                    // Extend the span.
-                    if seg.end_ts > last.end {
-                        last.end = seg.end_ts;
-                    }
-                    last.has_motion |= seg.has_motion;
-                    // stage stays as the first segment's stage.
-                    continue;
-                }
-            }
-        }
-
-        // Start a new span.
-        spans.push(RecordedSpan {
-            camera_id: seg.camera_id,
-            start: seg.start_ts,
-            end: seg.end_ts,
-            has_motion: seg.has_motion,
-            stage: seg.stage.as_str().to_owned(),
-        });
+/// The merge itself (contiguous = gap ≤ [`db::TIMELINE_GAP_TOLERANCE_MS`],
+/// `has_motion` OR-ed, `stage` from the first segment) happens in SQL in
+/// [`db::timeline_merged_spans`]; [`db::merge_segments_into_spans`] is the
+/// in-memory reference it is tested against.
+fn recorded_span(span: &db::TimelineSpan) -> RecordedSpan {
+    RecordedSpan {
+        camera_id: span.camera_id,
+        start: span.start,
+        end: span.end,
+        has_motion: span.has_motion,
+        stage: span.stage.as_str().to_owned(),
     }
+}
 
-    spans
+/// Reference merge mapped to the wire DTO (unit tests only).
+#[cfg(test)]
+fn merge_segments_into_spans(segments: Vec<crumb_common::Segment>) -> Vec<RecordedSpan> {
+    db::merge_segments_into_spans(segments, db::TIMELINE_GAP_TOLERANCE_MS)
+        .iter()
+        .map(recorded_span)
+        .collect()
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────────

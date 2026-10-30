@@ -112,6 +112,7 @@ a "new camera capability" is usually also a "new/changed API endpoint" and a
 | Android | `apps/android/.../data/CrumbApi.kt` + `CrumbRepository.kt` + `Models.kt` (and `MediaUrls.kt`/`MediaTokenCache.kt` for media) | Retrofit interface + repository + DTO mirrors |
 | iOS/macOS | `apps/ios/Crumb/Networking/` + `Models/` | Swift mirrors of the DTOs |
 | Tests | same-crate `#[cfg(test)]` or integration tests | Changed behavior gets tests (CONTRIBUTING) |
+| Query rewrite, response shape unchanged | keep the old algorithm as an in-memory oracle in `services/common/src/db.rs` (e.g. `merge_segments_into_spans` for `/timeline`, the intensity reference for `/timeline/intensity`) and an equivalence test against the new SQL, including pagination | No client surface changes, so the oracle test is the only thing proving the clients still see identical data |
 | API reference | ROADMAP initiative 4 plans a generated OpenAPI spec from `dto.rs`; until it exists, the doc-comment tables in `config_routes.rs` are the reference and must be updated | Prevents a hand-written reference from drifting |
 
 ### B. New server setting, env var, or config key
