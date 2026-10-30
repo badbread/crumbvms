@@ -2890,16 +2890,123 @@ fn segment_from_row(row: &tokio_postgres::Row) -> Result<Segment> {
 
 // ─── cameras — additional API queries ────────────────────────────────────────
 
-/// Return all cameras (enabled and disabled), each with its fully-joined policy.
+/// Return all cameras (enabled and disabled), each with its fully-joined policy,
+/// in natural name order (see [`camera_name_order`]).
 ///
-/// Used by the config CRUD routes which must list every camera, not just active ones.
+/// Used by the config CRUD routes which must list every camera, not just active ones,
+/// and by `GET /cameras`, whose order every client shows as-is (camera pickers, the
+/// auto-built "All Cameras" grid). It had no ORDER BY, so cameras came back in heap
+/// order: roughly creation order, reshuffled by later edits.
 pub async fn list_cameras_all(pool: &Pool) -> Result<Vec<Camera>> {
     let client = get_conn(pool).await?;
     let rows = client
         .query(CAMERA_SELECT_SQL, &[])
         .await
         .context("list_cameras_all")?;
-    rows.iter().map(camera_from_row).collect()
+    let mut cameras = rows
+        .iter()
+        .map(camera_from_row)
+        .collect::<Result<Vec<_>>>()?;
+    cameras.sort_by(|a, b| camera_name_order(&a.name, &b.name).then(a.id.cmp(&b.id)));
+    Ok(cameras)
+}
+
+/// Natural, case-insensitive order for camera names: runs of digits compare by
+/// value, so ".2 Gate" sorts before ".10 Garage" and "Cam 9" before "Cam 10";
+/// everything else compares by lowercase character. Done in Rust rather than SQL
+/// because Postgres has no natural collation without ICU.
+#[must_use]
+pub fn camera_name_order(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let mut x = a.chars().peekable();
+    let mut y = b.chars().peekable();
+    loop {
+        match (x.peek().copied(), y.peek().copied()) {
+            (None, None) => return a.cmp(b),
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(cx), Some(cy)) if cx.is_ascii_digit() && cy.is_ascii_digit() => {
+                let mut nx = String::new();
+                while let Some(c) = x.peek().copied().filter(char::is_ascii_digit) {
+                    nx.push(c);
+                    x.next();
+                }
+                let mut ny = String::new();
+                while let Some(c) = y.peek().copied().filter(char::is_ascii_digit) {
+                    ny.push(c);
+                    y.next();
+                }
+                // Compare by value without overflow: strip leading zeros, then
+                // a longer digit run is larger, else compare digit by digit.
+                let tx = nx.trim_start_matches('0');
+                let ty = ny.trim_start_matches('0');
+                let ord = tx.len().cmp(&ty.len()).then_with(|| tx.cmp(ty));
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            (Some(cx), Some(cy)) => {
+                let ord = cx.to_lowercase().cmp(cy.to_lowercase());
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+                x.next();
+                y.next();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod camera_name_order_tests {
+    use super::camera_name_order;
+
+    fn sorted(names: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = names.iter().map(|s| (*s).to_owned()).collect();
+        v.sort_by(|a, b| camera_name_order(a, b));
+        v
+    }
+
+    #[test]
+    fn numbers_compare_by_value() {
+        assert_eq!(
+            sorted(&[
+                ".10 Front Room",
+                ".2 Backyard",
+                ".05 Driveway",
+                ".13 Front Door"
+            ]),
+            vec![
+                ".2 Backyard",
+                ".05 Driveway",
+                ".10 Front Room",
+                ".13 Front Door"
+            ]
+        );
+        assert_eq!(
+            sorted(&["Cam 10", "Cam 9", "Cam 1"]),
+            vec!["Cam 1", "Cam 9", "Cam 10"]
+        );
+    }
+
+    #[test]
+    fn case_insensitive_then_stable() {
+        assert_eq!(
+            sorted(&["garage", "Front Yard", "driveway"]),
+            vec!["driveway", "Front Yard", "garage"]
+        );
+        // Equal ignoring case: falls back to the exact string, never "equal".
+        assert_ne!(camera_name_order("Gate", "gate"), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn prefix_sorts_first_and_huge_numbers_do_not_overflow() {
+        assert_eq!(sorted(&["Gate 2", "Gate"]), vec!["Gate", "Gate 2"]);
+        assert_eq!(
+            sorted(&["x99999999999999999999999", "x100000000000000000000000"]),
+            vec!["x99999999999999999999999", "x100000000000000000000000"]
+        );
+    }
 }
 
 /// A cheap fingerprint (md5 hex) of all camera + recording-policy config a CLIENT
