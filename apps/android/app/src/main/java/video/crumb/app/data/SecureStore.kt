@@ -10,6 +10,7 @@ import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import video.crumb.app.BuildConfig
+import video.crumb.app.feature.playback.PlaybackControlsPolicy
 
 /**
  * Encrypted persistent storage for the auth token, server URL, and basic
@@ -351,6 +352,38 @@ class SecureStore(context: Context) {
         get() = safeRead(false) { it.getBoolean(KEY_LOW_BW_AUTOFIX, false) }
         set(value) = safeWrite { it.putBoolean(KEY_LOW_BW_AUTOFIX, value) }
 
+    /**
+     * Whether single-camera Playback shows the full ("Advanced") control set. Off =
+     * Simple (calm bar plus a More sheet). Device-local UI preference like
+     * [snapshotCapturesView]; NOT cleared on logout. New installs default to false;
+     * [applyPlaybackControlsMigration] turns it on once for existing installs.
+     */
+    var advancedPlaybackControls: Boolean
+        get() = safeRead(false) { it.getBoolean(KEY_ADVANCED_PLAYBACK, false) }
+        set(value) = safeWrite { it.putBoolean(KEY_ADVANCED_PLAYBACK, value) }
+
+    /** One-time flag: the Simple/Advanced default migration has run. */
+    var playbackControlsMigrated: Boolean
+        get() = safeRead(false) { it.getBoolean(KEY_PLAYBACK_CTRL_MIGRATED, false) }
+        set(value) = safeWrite { it.putBoolean(KEY_PLAYBACK_CTRL_MIGRATED, value) }
+
+    /**
+     * Run once at app start (before any UI reads [advancedPlaybackControls]). An
+     * install that already has a session or any saved prefs keeps today's full
+     * controls (Advanced); a fresh install gets Simple. See
+     * [PlaybackControlsPolicy.advancedAfterMigration].
+     */
+    fun applyPlaybackControlsMigration() {
+        if (playbackControlsMigrated) return
+        val hasPrior = isLoggedIn || safeRead(false) { it.all.isNotEmpty() }
+        advancedPlaybackControls = PlaybackControlsPolicy.advancedAfterMigration(
+            alreadyApplied = false,
+            hasPriorState = hasPrior,
+            current = advancedPlaybackControls,
+        )
+        playbackControlsMigrated = true
+    }
+
     /** The Clips tab's camera filter (a camera id), or null for all cameras. */
     var clipsCameraId: String?
         get() = safeRead(null) { it.getString(KEY_CLIPS_CAMERA, null) }
@@ -493,6 +526,8 @@ class SecureStore(context: Context) {
         private const val KEY_PLATES_VIEW_MODE = "plates_view_mode"
         private const val KEY_LPR_IMAGE_MODE = "lpr_image_mode"
         private const val KEY_SNAPSHOT_VIEW = "snapshot_captures_view"
+        private const val KEY_ADVANCED_PLAYBACK = "advanced_playback_controls"
+        private const val KEY_PLAYBACK_CTRL_MIGRATED = "playback_controls_migrated"
         private const val KEY_VIEWS = "camera_views_json"
         private const val KEY_ACTIVE_VIEW = "active_view_id"
         private const val KEY_LOW_BW_MODE = "low_bandwidth_mode"
