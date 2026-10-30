@@ -196,7 +196,7 @@ class _PlateProfileState extends State<_PlateProfile> {
       padding: const EdgeInsets.symmetric(horizontal: 12),
       decoration: const BoxDecoration(
         color: Color(0xFF262A33),
-        border: Border(bottom: BorderSide(color: _kPink, width: 2)),
+        border: Border(bottom: BorderSide(color: _kLprAccent, width: 2)),
       ),
       child: Row(
         children: [
@@ -205,8 +205,8 @@ class _PlateProfileState extends State<_PlateProfile> {
             icon: const Icon(Icons.arrow_back, size: 18),
             label: const Text('Back to plates'),
             style: FilledButton.styleFrom(
-              backgroundColor: _kPink,
-              foregroundColor: Colors.white,
+              backgroundColor: _kLprAccent,
+              foregroundColor: _kLprInk,
               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
             ),
           ),
@@ -411,9 +411,9 @@ class _PlateProfileState extends State<_PlateProfile> {
                 runSpacing: 4,
                 children: [
                   if (hints.isNew) _tag('NEW', _kGreen),
-                  if (watched) _tag('WATCHLIST', _kPink),
+                  if (watched) _tag('WATCHLIST', _kAmber),
                   if (hints.showToday)
-                    _tag('${hints.todayCount}x TODAY', _kPink),
+                    _tag('${hints.todayCount}x TODAY', _kLprAccent),
                   if (hints.unusualHour) _tag('UNUSUAL HOUR', _kAmber),
                 ],
               ),
@@ -490,9 +490,9 @@ class _PlateProfileState extends State<_PlateProfile> {
                 margin: const EdgeInsets.only(bottom: 12),
                 padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
                 decoration: BoxDecoration(
-                  color: _kPink.withValues(alpha: 0.12),
+                  color: _kLprAccent.withValues(alpha: 0.12),
                   border: const Border(
-                    left: BorderSide(color: _kPink, width: 3),
+                    left: BorderSide(color: _kLprAccent, width: 3),
                   ),
                   borderRadius: const BorderRadius.only(
                     topRight: Radius.circular(8),
@@ -699,7 +699,7 @@ class _PlateProfileState extends State<_PlateProfile> {
     if (s == null) return _empty(widget.statsUnsupported ? '-' : 'Loading...');
     if (s.cameras.isEmpty) return _empty('No reads.');
     final maxN = s.cameras.first.n.clamp(1, 1 << 30);
-    const colors = [_kGreen, _kPink, _kAmber, _kSlate];
+    const colors = [_kLprAccent, _kGreen, _kSlate, _kLprHot];
     return Column(
       children: [
         for (var i = 0; i < s.cameras.length; i++)
@@ -818,11 +818,11 @@ class _PlateProfileState extends State<_PlateProfile> {
       child: Container(
         padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 6),
         decoration: BoxDecoration(
-          color: playing ? _kPink.withValues(alpha: 0.14) : null,
+          color: playing ? _kLprAccent.withValues(alpha: 0.14) : null,
           border: Border(
             top: const BorderSide(color: _kSurface2),
             left: BorderSide(
-              color: playing ? _kPink : Colors.transparent,
+              color: playing ? _kLprAccent : Colors.transparent,
               width: 3,
             ),
           ),
@@ -859,7 +859,7 @@ class _PlateProfileState extends State<_PlateProfile> {
                     ? (playing ? Icons.play_circle : Icons.play_circle_outline)
                     : Icons.timeline,
                 size: 18,
-                color: playing ? _kPink : Colors.white38,
+                color: playing ? _kLprAccent : Colors.white38,
               ),
             ),
           ],
@@ -900,7 +900,7 @@ class _ProfileButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Material(
-      color: primary ? _kPink : _kSurface2,
+      color: primary ? _kLprAccent : _kSurface2,
       borderRadius: BorderRadius.circular(6),
       child: InkWell(
         onTap: onTap,
@@ -910,11 +910,15 @@ class _ProfileButton extends StatelessWidget {
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(icon, size: 15, color: Colors.white),
+              Icon(icon, size: 15, color: primary ? _kLprInk : Colors.white),
               const SizedBox(width: 6),
               Text(
                 label,
-                style: const TextStyle(color: Colors.white, fontSize: 12),
+                style: TextStyle(
+                  color: primary ? _kLprInk : Colors.white,
+                  fontSize: 12,
+                  fontWeight: primary ? FontWeight.w600 : FontWeight.w400,
+                ),
               ),
             ],
           ),

@@ -16,9 +16,20 @@ const double _kCardFrameHeight = 140;
 const double _kCardFooter = 70;
 const double _kCardHistogram = 50;
 
-/// Includes the 10 px the stacked-card shadow needs.
-double _cardExtent(bool tall) =>
-    _kCardFrameHeight + _kCardFooter + (tall ? _kCardHistogram : 0) + 10;
+/// The dedicated line a known plate name takes under the plate (2 px gap +
+/// 16 px line). Only named cards use it; the grid reserves it in every slot
+/// of a sheet that has at least one named card ([_cardExtent]'s `named`), and
+/// unnamed cards keep their own, shorter height inside the slot.
+const double _kCardNameLine = 18;
+
+/// Includes the 10 px the stacked-card shadow needs. [named] adds the name
+/// line (see [_kCardNameLine]).
+double _cardExtent(bool tall, {bool named = false}) =>
+    _kCardFrameHeight +
+    _kCardFooter +
+    (tall ? _kCardHistogram : 0) +
+    (named ? _kCardNameLine : 0) +
+    10;
 
 /// Largest inset width as a fraction of the card width, per size.
 double _insetFraction(PlateCropSize s) => switch (s) {
@@ -208,20 +219,15 @@ class _Seg<T> extends StatelessWidget {
           mainAxisSize: MainAxisSize.min,
           children: [
             for (final (v, text) in options)
-              InkWell(
+              _FbSegCell(
+                on: v == value,
                 onTap: enabled ? () => onChanged(v) : null,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 9,
-                    vertical: 4,
-                  ),
-                  color: v == value ? _kPink : _kSurface2,
-                  child: Text(
-                    text,
-                    style: TextStyle(
-                      color: v == value ? Colors.white : Colors.white70,
-                      fontSize: 12,
-                    ),
+                child: Text(
+                  text,
+                  style: TextStyle(
+                    color: v == value ? _kLprInk : Colors.white70,
+                    fontSize: 12,
+                    fontWeight: v == value ? FontWeight.w600 : FontWeight.w400,
                   ),
                 ),
               ),
@@ -245,6 +251,7 @@ class _SheetCard extends StatefulWidget {
     required this.showInset,
     required this.loupe,
     required this.tall,
+    this.slotHasNameLine = false,
     required this.session,
     required this.gate,
     required this.canManage,
@@ -265,6 +272,10 @@ class _SheetCard extends StatefulWidget {
   final bool showInset;
   final int loupe;
   final bool tall;
+
+  /// The grid slot is [_kCardNameLine] taller because some card in the sheet
+  /// is named. An unnamed card then keeps its normal height (top-aligned).
+  final bool slotHasNameLine;
   final Session session;
   final _ConcurrencyGate gate;
   final bool canManage;
@@ -340,13 +351,15 @@ class _SheetCardState extends State<_SheetCard> {
     final stacked = bundle != null && bundle.passCount > 1;
     final hints = plateHints(s, read.ts);
     final rail = _railColor(plateRail(watched: widget.watched, stats: s));
+    final named = (read.displayName?.trim() ?? '').isNotEmpty;
     final card = Container(
+      key: const ValueKey('sheet-card-body'),
       decoration: BoxDecoration(
         color: _kSurface1,
         borderRadius: BorderRadius.circular(10),
         border: Border.all(
           color: widget.selected || _hover
-              ? _kPink
+              ? _kLprAccent
               : (rail ?? _kSurface2).withValues(alpha: rail == null ? 1 : 0.7),
         ),
         boxShadow: stacked
@@ -382,7 +395,16 @@ class _SheetCardState extends State<_SheetCard> {
         child: Padding(
           // Room for the stacked shadow.
           padding: const EdgeInsets.only(right: 10, bottom: 10),
-          child: card,
+          child: widget.slotHasNameLine && !named
+              ? Align(
+                  alignment: Alignment.topCenter,
+                  child: SizedBox(
+                    width: double.infinity,
+                    height: _cardExtent(widget.tall) - 10,
+                    child: card,
+                  ),
+                )
+              : card,
         ),
       ),
     );
@@ -428,7 +450,7 @@ class _SheetCardState extends State<_SheetCard> {
       decoration: BoxDecoration(
         color: Colors.black,
         borderRadius: BorderRadius.circular(5),
-        border: Border.all(color: _kPink, width: 2),
+        border: Border.all(color: _kLprAccent, width: 2),
         boxShadow: const [BoxShadow(color: Colors.black87, blurRadius: 8)],
       ),
       clipBehavior: Clip.antiAlias,
@@ -508,7 +530,7 @@ class _SheetCardState extends State<_SheetCard> {
                   height: loupeD,
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
-                    border: Border.all(color: _kPink, width: 2),
+                    border: Border.all(color: _kLprAccent, width: 2),
                     boxShadow: const [
                       BoxShadow(color: Colors.black, blurRadius: 12),
                     ],
@@ -549,13 +571,13 @@ class _SheetCardState extends State<_SheetCard> {
   Widget _badge(String text) => Container(
     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
     decoration: BoxDecoration(
-      color: _kPink,
+      color: _kLprAccent,
       borderRadius: BorderRadius.circular(10),
     ),
     child: Text(
       text,
       style: const TextStyle(
-        color: Colors.white,
+        color: _kLprInk,
         fontSize: 11,
         fontWeight: FontWeight.w700,
       ),
@@ -611,6 +633,31 @@ class _SheetCardState extends State<_SheetCard> {
     );
   }
 
+  /// The known name on its own line under the plate: an accent tag icon and
+  /// the name, which scrolls (and only it) when it does not fit.
+  Widget _nameLine(String name) => Padding(
+    padding: const EdgeInsets.only(top: 2),
+    child: SizedBox(
+      height: _kCardNameLine - 2,
+      child: Row(
+        children: [
+          const Icon(Icons.sell_outlined, size: 12, color: _kLprAccent),
+          const SizedBox(width: 6),
+          Expanded(
+            child: MarqueeText(
+              name,
+              style: const TextStyle(
+                color: Colors.white70,
+                fontSize: 12,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
+
   Widget _footer(PlateRead read, PlateStats? s, PlateHints hints) {
     final name = read.displayName?.trim() ?? '';
     Widget chip(String text, {Color? c}) => Container(
@@ -653,15 +700,15 @@ class _SheetCardState extends State<_SheetCard> {
               ),
             ],
           ),
+          if (name.isNotEmpty) _nameLine(name),
           const SizedBox(height: 5),
           _clipRow([
             if (s != null) chip('seen ${s.total}x'),
             if (s?.prevSeen != null) chip('last ${fmtAgo(s!.prevSeen!, now)}'),
             if (hints.isNew) chip('NEW', c: _kGreen),
-            if (widget.watched) chip('Watchlist', c: _kPink),
-            if (s != null && s.isRegular) chip('Regular', c: _kAmber),
+            if (widget.watched) chip('Watchlist', c: _kAmber),
+            if (s != null && s.isRegular) chip('Regular', c: _kLprAccent),
             if (hints.unusualHour) chip('Unusual hour', c: _kAmber),
-            if (name.isNotEmpty) chip(name, c: _kGreen),
           ]),
           if (widget.tall) ...[
             const SizedBox(height: 8),
@@ -718,7 +765,10 @@ class _HourBarsPainter extends CustomPainter {
       final bh = v == 0 ? 1.5 : 2 + (size.height - 2) * v / maxV;
       canvas.drawRect(
         Rect.fromLTWH(h * slot + 0.5, size.height - bh, slot - 1, bh),
-        Paint()..color = h == now ? _kGreen : _kGreen.withValues(alpha: 0.35),
+        Paint()
+          ..color = h == now
+              ? _kLprAccent
+              : _kLprAccent.withValues(alpha: 0.35),
       );
     }
   }
@@ -737,10 +787,14 @@ Widget debugSheetCard({
   bool tall = false,
   PlateCropSize size = PlateCropSize.large,
   PlateCropCorner corner = PlateCropCorner.bottomLeft,
+  bool? reserveNameLine,
 }) {
+  final named =
+      (entry.group.representative.displayName?.trim() ?? '').isNotEmpty;
+  final reserve = reserveNameLine ?? named;
   return SizedBox(
     width: width,
-    height: _cardExtent(tall),
+    height: _cardExtent(tall, named: reserve),
     child: _SheetCard(
       entry: entry,
       stats: stats,
@@ -752,6 +806,7 @@ Widget debugSheetCard({
       showInset: true,
       loupe: 2,
       tall: tall,
+      slotHasNameLine: reserve,
       session: Session(base: 'http://127.0.0.1:9', token: ''),
       gate: _ConcurrencyGate(1),
       canManage: true,
