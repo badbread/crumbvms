@@ -30,6 +30,7 @@ import 'dart:convert';
 import 'crumb_api.dart';
 import 'http_client.dart';
 import 'models.dart';
+import 'play_resolve_cache.dart';
 
 /// A merged recorded span for one camera (`GET /timeline` -> `spans[]`).
 /// Contiguous segments (gap < ~1s) are already merged server-side.
@@ -111,6 +112,9 @@ extension PlaybackApi on CrumbApi {
   static final Map<String, _CachedMediaToken> _tokenCache = {};
   static final Map<String, Future<String?>> _tokenInflight = {};
 
+  /// Recent `/play/{camera_id}` answers (see play_resolve_cache.dart).
+  static final PlayResolveCache playResolveCache = PlayResolveCache();
+
   /// Drop every cached (and in-flight) media token. Called from session
   /// teardown (`main.dart`) so a signed-out principal's still-valid scoped
   /// tokens can never be reused by whoever signs in next on a shared
@@ -120,7 +124,13 @@ extension PlaybackApi on CrumbApi {
   static void clearTokenCache() {
     _tokenCache.clear();
     _tokenInflight.clear();
+    playResolveCache.invalidate();
   }
+
+  /// Forget cached segment resolves (all, or only [cameraId]'s), so the next
+  /// [resolveSegment] asks the server again.
+  static void invalidateResolveCache({String? cameraId}) =>
+      playResolveCache.invalidate(cameraId: cameraId);
 
   Map<String, String> _authHeaders(Session s) => {
     'authorization': 'Bearer ${s.token}',
@@ -168,21 +178,38 @@ extension PlaybackApi on CrumbApi {
   /// GET /play/{camera_id}?ts=<iso>&stream=<main|sub> — resolve the segment
   /// covering `ts`. Returns `null` on 404 ("no footage at this time" — a
   /// normal outcome, not an error) or on network failure.
+  ///
+  /// A segment resolved within the last minute that covers `ts` is answered
+  /// from [playResolveCache] without a round trip (scrub release, frame-step
+  /// and adjacent-segment probes mostly land in one). Pass `bypassCache` to
+  /// always ask the server; its answer still refreshes the cache.
   Future<ResolvedSegment?> resolveSegment(
     Session s,
     String cameraId,
     DateTime ts, {
     String stream = 'main',
+    bool bypassCache = false,
   }) async {
+    final scope = '${s.base}|${s.token}';
+    if (!bypassCache) {
+      final hit = playResolveCache.lookup(scope, cameraId, stream, ts);
+      if (hit != null) return hit;
+    }
     final uri = Uri.parse('${s.base}/play/$cameraId').replace(
       queryParameters: {'ts': ts.toUtc().toIso8601String(), 'stream': stream},
     );
     try {
       final resp = await sharedHttpClient.get(uri, headers: _authHeaders(s));
       if (resp.statusCode != 200) return null;
-      return ResolvedSegment.fromJson(
+      final seg = ResolvedSegment.fromJson(
         jsonDecode(resp.body) as Map<String, dynamic>,
       );
+      // Only a segment that really covers `ts` and belongs to the asked
+      // camera is reusable for later lookups.
+      if (seg.cameraId == cameraId && seg.covers(ts)) {
+        playResolveCache.put(scope, stream, seg);
+      }
+      return seg;
     } catch (_) {
       return null;
     }
