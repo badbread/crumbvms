@@ -6536,6 +6536,13 @@ macro_rules! bookmark_footage_expired_sql {
                    AND s.start_ts <= b.ts
                    AND s.end_ts > b.ts)
              THEN false
+             WHEN b.protect_until > now()
+                  AND EXISTS (
+                 SELECT 1 FROM segments sp
+                 WHERE sp.camera_id = b.camera_id
+                   AND b.protect_start_ts <= sp.end_ts
+                   AND b.protect_end_ts   >= sp.start_ts)
+             THEN false
              ELSE COALESCE(
                  b.ts < (SELECT s2.start_ts FROM segments s2
                          WHERE s2.camera_id = b.camera_id

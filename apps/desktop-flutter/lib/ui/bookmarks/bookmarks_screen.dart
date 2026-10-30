@@ -448,8 +448,13 @@ class _ExpiredBadge extends StatelessWidget {
 
 /// Bookmarks whose footage retention has already deleted (server-computed
 /// `footage_expired`; always empty against a server that predates it).
-List<Bookmark> expiredBookmarks(Iterable<Bookmark> all) =>
-    all.where((b) => b.footageExpired).toList(growable: false);
+///
+/// Protected bookmarks are never included: deleting one lifts its
+/// protection, so "Remove expired" must not touch them even if the server
+/// flags them (defense in depth; remove those one at a time instead).
+List<Bookmark> expiredBookmarks(Iterable<Bookmark> all) => all
+    .where((b) => b.footageExpired && !b.isProtected)
+    .toList(growable: false);
 
 /// SnackBar text after deleting [n] bookmarks.
 String bookmarksDeletedMessage(int n) =>
