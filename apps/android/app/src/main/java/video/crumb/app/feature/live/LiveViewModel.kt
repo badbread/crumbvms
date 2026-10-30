@@ -114,6 +114,15 @@ class LiveViewModel(
      */
     private var lastManualRestoreMs = 0L
 
+    // Per-camera stream re-resolution state. viewModelScope runs on the main
+    // dispatcher, so these are only ever touched from the main thread. Declared
+    // above the init block below: refresh() touches streamRetryJobs, and Kotlin
+    // runs initializers in declaration order, so declaring them later makes the
+    // first refresh() see null and crash the app on launch.
+    private val streamRetryJobs = mutableMapOf<String, Job>()
+    private val streamRefreshInFlight = mutableSetOf<String>()
+    private val lastStreamRefreshMs = mutableMapOf<String, Long>()
+
     init {
         refresh()
     }
@@ -293,12 +302,6 @@ class LiveViewModel(
             _uiState.update { it.copy(lowBandwidthMode = true, autoFallbackActive = true) }
         }
     }
-
-    // Per-camera stream re-resolution state. viewModelScope runs on the main
-    // dispatcher, so these are only ever touched from the main thread.
-    private val streamRetryJobs = mutableMapOf<String, Job>()
-    private val streamRefreshInFlight = mutableSetOf<String>()
-    private val lastStreamRefreshMs = mutableMapOf<String, Long>()
 
     /**
      * Re-fetch one camera's `/streams` and swap it into the state when it changed
