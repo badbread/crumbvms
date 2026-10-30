@@ -174,6 +174,7 @@ class _PlatesScreenState extends State<PlatesScreen> {
   // group-by-plate folds every pass of a plate into one expandable row.
   PlateDensity _density = PlateDensity.standard;
   bool _groupByPlate = false;
+  bool _hideRegulars = false;
   final Set<String> _expanded = {};
   DeskFilter _deskFilter = DeskFilter.all;
   LprOverview? _overview; // null = not loaded, or an older server
@@ -251,6 +252,7 @@ class _PlatesScreenState extends State<PlatesScreen> {
     final showWatchlist = await PlatesPrefs.getShowWatchlist();
     final density = await PlatesPrefs.getDensity();
     final groupByPlate = await PlatesPrefs.getGroupByPlate();
+    final hideRegulars = await PlatesPrefs.getHideRegulars();
     final gridLoupe = await PlatesPrefs.getGridLoupe();
     final gridTall = await PlatesPrefs.getGridTall();
     if (!mounted) return;
@@ -259,6 +261,7 @@ class _PlatesScreenState extends State<PlatesScreen> {
       _gridTall = gridTall;
       _density = density;
       _groupByPlate = groupByPlate;
+      _hideRegulars = hideRegulars;
       _viewMode = mode;
       _imageDisplay = display;
       _cropCorner = corner;
@@ -286,6 +289,62 @@ class _PlatesScreenState extends State<PlatesScreen> {
       _selected = -1;
     });
     PlatesPrefs.setGroupByPlate(on);
+  }
+
+  void _setHideRegulars(bool on) {
+    if (on == _hideRegulars) return;
+    setState(() {
+      _hideRegulars = on;
+      _selected = -1;
+    });
+    PlatesPrefs.setHideRegulars(on);
+  }
+
+  bool get _hideRegularsOn =>
+      hideRegularsActive(hideRegulars: _hideRegulars, filter: _deskFilter);
+
+  /// Number of loaded raw reads currently hidden by "Hide regulars".
+  int _hiddenRegularCount(Set<String> watched) {
+    if (!_hideRegularsOn) return 0;
+    return _plates.length -
+        withoutRegularReads(
+          _plates,
+          watched: watched.contains,
+          stats: (p) => _stats[p],
+        ).length;
+  }
+
+  Set<String> get _watchedPlates => {
+    for (final e in _watchlist)
+      if (!e.isIgnore) e.plate,
+  };
+
+  /// "Hide regulars" then the desk filter, over collapsed groups. Shared by
+  /// the List and Grid views so they and the keyboard selection agree.
+  List<PlateGroup> _filterGroups(List<PlateGroup> groups, Set<String> watched) {
+    if (_hideRegularsOn || _deskFilter != DeskFilter.all) {
+      // Stats-based filters need every loaded plate's history, not just the
+      // rows on screen.
+      _stats.want(groups.map((g) => g.representative.plate));
+    }
+    var out = groups;
+    if (_hideRegularsOn) {
+      out = withoutRegularGroups(
+        out,
+        watched: watched.contains,
+        stats: (p) => _stats[p],
+      );
+    }
+    if (_deskFilter == DeskFilter.all) return out;
+    return out
+        .where(
+          (g) => deskFilterMatches(
+            _deskFilter,
+            watched: watched.contains(g.representative.plate),
+            stats: _stats[g.representative.plate],
+          ),
+        )
+        .toList();
   }
 
   void _setDeskFilter(DeskFilter f) {
@@ -614,22 +673,7 @@ class _PlatesScreenState extends State<PlatesScreen> {
     final groups = _collapse
         ? collapsePlateReads(_plates)
         : [for (final p in _plates) PlateGroup(p, [p])];
-    // Stats-based filters need every loaded plate's history, not just the
-    // rows on screen.
-    if (_deskFilter != DeskFilter.all) {
-      _stats.want(groups.map((g) => g.representative.plate));
-    }
-    final visible = _deskFilter == DeskFilter.all
-        ? groups
-        : groups
-              .where(
-                (g) => deskFilterMatches(
-                  _deskFilter,
-                  watched: watched.contains(g.representative.plate),
-                  stats: _stats[g.representative.plate],
-                ),
-              )
-              .toList();
+    final visible = _filterGroups(groups, watched);
     final entries = flattenLedger(
       visible,
       groupByPlate: _groupByPlate,
@@ -643,7 +687,9 @@ class _PlatesScreenState extends State<PlatesScreen> {
       list = Center(
         child: Text(
           _deskFilter == DeskFilter.all
-              ? 'No plate reads in this window.'
+              ? (_hideRegularsOn
+                    ? 'Only regulars among the loaded reads (hidden).'
+                    : 'No plate reads in this window.')
               : (_stats.unsupported
                     ? 'This server does not report plate history.'
                     : 'No ${deskFilterLabel(_deskFilter).toLowerCase()} among the loaded reads.'),
@@ -725,6 +771,16 @@ class _PlatesScreenState extends State<PlatesScreen> {
     );
   }
 
+  List<PlateRead> _groupedReads(Set<String> watched) {
+    if (!_hideRegularsOn) return _plates;
+    _stats.want(_plates.map((r) => r.plate));
+    return withoutRegularReads(
+      _plates,
+      watched: watched.contains,
+      stats: (p) => _stats[p],
+    );
+  }
+
   /// The grid view: the inset / loupe / tall controls, then fixed-size cards
   /// (the same passes, filters and group-by-plate as the list).
   Widget _buildSheet(BuildContext context, Set<String> watched) {
@@ -732,20 +788,7 @@ class _PlatesScreenState extends State<PlatesScreen> {
     final groups = _collapse
         ? collapsePlateReads(_plates)
         : [for (final p in _plates) PlateGroup(p, [p])];
-    if (_deskFilter != DeskFilter.all) {
-      _stats.want(groups.map((g) => g.representative.plate));
-    }
-    final visible = _deskFilter == DeskFilter.all
-        ? groups
-        : groups
-              .where(
-                (g) => deskFilterMatches(
-                  _deskFilter,
-                  watched: watched.contains(g.representative.plate),
-                  stats: _stats[g.representative.plate],
-                ),
-              )
-              .toList();
+    final visible = _filterGroups(groups, watched);
     // Grouped: one card per plate (stacked when it has several passes).
     final entries = flattenLedger(visible, groupByPlate: _groupByPlate);
     _entries = entries;
@@ -1476,7 +1519,8 @@ class _PlatesScreenState extends State<PlatesScreen> {
         const SizedBox(width: 12),
         if (!_loading)
           Text(
-            '$_total plate${_total == 1 ? '' : 's'}',
+            '$_total plate${_total == 1 ? '' : 's'}'
+            '${_hiddenRegularCount(_watchedPlates) > 0 ? ' \u00b7 ${_hiddenRegularCount(_watchedPlates)} hidden' : ''}',
             style: const TextStyle(color: Colors.white54, fontSize: 12),
           ),
         IconButton(
@@ -1488,6 +1532,18 @@ class _PlatesScreenState extends State<PlatesScreen> {
           icon: const Icon(Icons.refresh, color: Colors.white70, size: 18),
         ),
       ],
+    );
+    final hideRegularsToggle = _ToolToggle(
+      label: 'Hide regulars',
+      on: _hideRegularsOn,
+      tooltip: _deskFilter == DeskFilter.regulars
+          ? 'Unavailable while the Regulars filter is on'
+          : (_hideRegulars
+                ? 'Regulars hidden (${_hiddenRegularCount(_watchedPlates)} loaded reads). Watchlisted plates always show. Click to show them.'
+                : 'Hide reads of regular plates (seen often in the last 30 days).\nWatchlisted plates always show.'),
+      onTap: _deskFilter == DeskFilter.regulars
+          ? null
+          : () => _setHideRegulars(!_hideRegulars),
     );
     final viewRow = Row(
       children: [
@@ -1519,6 +1575,7 @@ class _PlatesScreenState extends State<PlatesScreen> {
                             'Fold every read of a plate into one expandable row',
                         onTap: () => _setGroupByPlate(!_groupByPlate),
                       ),
+                      hideRegularsToggle,
                       if (_viewMode == PlatesViewMode.list)
                         _ToolToggle(
                           label: 'Merge duplicates',
@@ -1531,6 +1588,8 @@ class _PlatesScreenState extends State<PlatesScreen> {
                     ],
                   ),
                 ),
+              if (_viewMode == PlatesViewMode.grouped)
+                _ToolGroup(child: hideRegularsToggle),
               if (_deskFilter != DeskFilter.all)
                 InputChip(
                   label: Text(deskFilterLabel(_deskFilter)),
@@ -1641,7 +1700,7 @@ class _PlatesScreenState extends State<PlatesScreen> {
         return _buildSheet(context, watched);
       case PlatesViewMode.grouped:
         return _PlateGroupedList(
-          reads: _plates,
+          reads: _groupedReads(watched),
           camName: camName,
           api: widget.api,
           session: widget.session,
@@ -1796,7 +1855,7 @@ class _ToolToggle extends StatelessWidget {
 
   final String label;
   final bool on;
-  final VoidCallback onTap;
+  final VoidCallback? onTap;
   final String? tooltip;
 
   @override
