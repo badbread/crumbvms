@@ -1,4 +1,12 @@
-// Plates tab: newest-first browser of license-plate reads (LPR). A filter bar
+// Plates tab ("plate desk"): newest-first browser of license-plate reads
+// (LPR). Above the list, today's header (reads, unique plates, new plates,
+// watchlist hits, and the regulars / returning / first-time split, all
+// clickable filters) from GET /lpr/overview; every row carries the plate's
+// history from POST /lpr/plates/stats (see plate_desk_api.dart). Both degrade
+// on an older server: the header hides and history cells show "-". The list
+// rows, header and Density control live in plate_ledger.dart.
+//
+// A filter bar
 // (plate search + match mode, camera multi-select, time range) over a list of
 // reads; each row shows the plate, the sibling snapshot, camera, local time,
 // and a confidence chip. Clicking a row with a linked detection event opens a
@@ -19,8 +27,10 @@
 // provider URL.
 
 import 'dart:async';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart' show listEquals, visibleForTesting;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
@@ -30,15 +40,21 @@ import 'package:crumb_desktop/api/clips_api.dart' show ClipsApi;
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/http_client.dart';
 import 'package:crumb_desktop/api/models.dart';
+import 'package:crumb_desktop/api/plate_desk_api.dart';
 import 'package:crumb_desktop/api/plates_api.dart';
 import 'package:crumb_desktop/ui/clips/clip_player_shell.dart';
 import 'package:crumb_desktop/ui/hotkeys/hotkey_gate.dart';
 import 'package:crumb_desktop/ui/plates/ab_benchmark.dart';
 import 'package:crumb_desktop/ui/plates/plate_collapse.dart';
 import 'package:crumb_desktop/ui/plates/plate_crop.dart';
+import 'package:crumb_desktop/ui/plates/plate_desk_logic.dart';
 import 'package:crumb_desktop/ui/plates/plate_name_dialog.dart';
 import 'package:crumb_desktop/ui/plates/plate_report_dialog.dart';
 import 'package:crumb_desktop/ui/plates/plates_prefs.dart';
+
+part 'plate_contact_sheet.dart';
+part 'plate_ledger.dart';
+part 'plate_profile.dart';
 
 /// A plate-hit clip that stalls this long without progressing is retried (the
 /// clip is transcoded on demand server-side, so a cold clip can be slow). Same
@@ -119,6 +135,10 @@ class _PlatesScreenState extends State<PlatesScreen> {
   // row that has a linked detection event; the overlay plays that read's clip.
   PlateRead? _playing;
 
+  // The plate profile covering the results area (null = closed). Opened from
+  // any row; the clip player can still open on top of it.
+  PlateRead? _profile;
+
   // Watchlist side panel. Readable by any account that can see this tab; the
   // add/remove affordances are gated on [widget.canManageWatchlist].
   bool _showWatchlist = true;
@@ -148,6 +168,36 @@ class _PlatesScreenState extends State<PlatesScreen> {
   // into a single row (persisted via [PlatesPrefs]).
   bool _collapse = true;
 
+  // Plate desk (list view). Density is the list's one display control;
+  // group-by-plate folds every pass of a plate into one expandable row.
+  PlateDensity _density = PlateDensity.standard;
+  bool _groupByPlate = false;
+  final Set<String> _expanded = {};
+  DeskFilter _deskFilter = DeskFilter.all;
+  LprOverview? _overview; // null = not loaded, or an older server
+  late final PlateStatsCache _stats;
+  // Keyboard selection in the ledger (index into [_entries]); -1 = none.
+  int _selected = -1;
+  List<LedgerEntry> _entries = const [];
+  // Optional ledger columns that fit the current width (set by the
+  // LayoutBuilder before the rows build).
+  LedgerColumns _ledgerCols = const LedgerColumns(
+    frame: true,
+    crop: true,
+    spark: true,
+  );
+  final ScrollController _listScroll = ScrollController();
+  bool _loadingMore = false;
+  // Grid ("contact sheet") view.
+  int _gridLoupe = 2; // 0 = off
+  bool _gridTall = false;
+  final ScrollController _gridScroll = ScrollController();
+  int _gridColumns = 1;
+  // The single shared hover loupe over plate crops.
+  OverlayEntry? _loupeEntry;
+  PlateRead? _loupeRead;
+  Rect? _loupeAnchor;
+
   Timer? _searchDebounce;
   final _thumbGate = _ConcurrencyGate(_thumbConcurrency);
 
@@ -157,6 +207,11 @@ class _PlatesScreenState extends State<PlatesScreen> {
     // Default to every visible camera selected — the natural "show me
     // everything" starting point for a plate log.
     _selectedCameraIds = {for (final c in widget.cameras) c.id};
+    _stats = PlateStatsCache(
+      (plates) => widget.api.getPlateStats(widget.session, plates),
+    )..addListener(_onStatsChanged);
+    _listScroll.addListener(_hideLoupe);
+    HardwareKeyboard.instance.addHandler(_onListKey);
     _restoreViewMode();
     _load();
     _loadWatchlist();
@@ -192,8 +247,16 @@ class _PlatesScreenState extends State<PlatesScreen> {
     final size = await PlatesPrefs.getCropSize();
     final collapse = await PlatesPrefs.getCollapseDuplicates();
     final showWatchlist = await PlatesPrefs.getShowWatchlist();
+    final density = await PlatesPrefs.getDensity();
+    final groupByPlate = await PlatesPrefs.getGroupByPlate();
+    final gridLoupe = await PlatesPrefs.getGridLoupe();
+    final gridTall = await PlatesPrefs.getGridTall();
     if (!mounted) return;
     setState(() {
+      _gridLoupe = gridLoupe;
+      _gridTall = gridTall;
+      _density = density;
+      _groupByPlate = groupByPlate;
       _viewMode = mode;
       _imageDisplay = display;
       _cropCorner = corner;
@@ -201,6 +264,638 @@ class _PlatesScreenState extends State<PlatesScreen> {
       _collapse = collapse;
       _showWatchlist = showWatchlist;
     });
+  }
+
+  void _onStatsChanged() {
+    if (mounted) setState(() {});
+  }
+
+  void _setDensity(PlateDensity d) {
+    if (d == _density) return;
+    _hideLoupe();
+    setState(() => _density = d);
+    PlatesPrefs.setDensity(d);
+  }
+
+  void _setGroupByPlate(bool on) {
+    if (on == _groupByPlate) return;
+    setState(() {
+      _groupByPlate = on;
+      _selected = -1;
+    });
+    PlatesPrefs.setGroupByPlate(on);
+  }
+
+  void _setDeskFilter(DeskFilter f) {
+    setState(() {
+      _deskFilter = f;
+      _selected = -1;
+    });
+  }
+
+  void _toggleExpanded(String plate) {
+    setState(() {
+      if (!_expanded.remove(plate)) _expanded.add(plate);
+    });
+  }
+
+  /// Today's header. A null answer (older server) hides it; any other
+  /// failure keeps the last good header rather than flashing an error.
+  Future<void> _loadOverview() async {
+    final all = _selectedCameraIds.length == widget.cameras.length;
+    try {
+      final o = await widget.api.getLprOverview(
+        widget.session,
+        cameraIds: all ? null : _effectiveCameraIds,
+      );
+      if (!mounted) return;
+      setState(() => _overview = o);
+    } catch (_) {
+      // Keep whatever was showing.
+    }
+  }
+
+  /// Append the next page of reads (the list shows [_platesPageSize] at a
+  /// time; "Load more" at the end fetches the next page).
+  Future<void> _loadMore() async {
+    if (_loadingMore || _plates.length >= _total) return;
+    final ids = _effectiveCameraIds;
+    if (ids.isEmpty) return;
+    setState(() => _loadingMore = true);
+    final DateTime? end;
+    final DateTime? start;
+    if (_hours == 0) {
+      end = null;
+      start = null;
+    } else {
+      end = _anchorEnd ?? DateTime.now();
+      start = end.subtract(Duration(hours: _hours));
+    }
+    try {
+      final page = await widget.api.listPlates(
+        widget.session,
+        cameraIds: ids,
+        query: _query,
+        match: _match,
+        start: start,
+        end: end,
+        limit: _platesPageSize,
+        offset: _plates.length,
+      );
+      if (!mounted) return;
+      final seen = {for (final p in _plates) p.id};
+      final merged = [
+        ..._plates,
+        for (final p in page.plates)
+          if (!seen.contains(p.id)) p,
+      ];
+      // Fuzzy search is ordered by closeness server-side; everything else is
+      // newest first.
+      if (!(_match == 'fuzzy' && _query.trim().isNotEmpty)) {
+        merged.sort((a, b) => b.ts.compareTo(a.ts));
+      }
+      setState(() {
+        _plates = merged;
+        _total = page.total;
+        _loadingMore = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _loadingMore = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Couldn't load more plates: $e")),
+      );
+    }
+  }
+
+  // ── loupe ────────────────────────────────────────────────────────────────
+
+  void _onLoupe(PlateRead read, Rect? anchor) {
+    if (anchor == null) {
+      if (_loupeRead?.id == read.id) _hideLoupe();
+      return;
+    }
+    _loupeRead = read;
+    _loupeAnchor = anchor;
+    final entry = _loupeEntry;
+    if (entry != null) {
+      entry.markNeedsBuild();
+      return;
+    }
+    final e = OverlayEntry(builder: _buildLoupe);
+    _loupeEntry = e;
+    Overlay.of(context).insert(e);
+  }
+
+  void _hideLoupe() {
+    _loupeEntry?.remove();
+    _loupeEntry = null;
+    _loupeRead = null;
+    _loupeAnchor = null;
+  }
+
+  Widget _buildLoupe(BuildContext context) {
+    final read = _loupeRead;
+    final a = _loupeAnchor;
+    if (read == null || a == null) return const SizedBox.shrink();
+    final screen = MediaQuery.sizeOf(context);
+    const w = 380.0;
+    var left = a.right + 12;
+    if (left + w > screen.width - 8) left = a.left - w - 12;
+    final maxLeft = screen.width - w - 8;
+    left = left.clamp(8.0, maxLeft < 8 ? 8.0 : maxLeft);
+    final maxTop = screen.height - 360;
+    final top = (a.top - 60).clamp(8.0, maxTop < 8 ? 8.0 : maxTop);
+    return Positioned(
+      left: left,
+      top: top,
+      child: IgnorePointer(child: _LoupeCard(read: read)),
+    );
+  }
+
+  // ── keyboard ─────────────────────────────────────────────────────────────
+
+  /// j / k / arrows move the selection, Enter opens it, Esc clears it,
+  /// Left / Right collapse / expand a grouped plate, 1 / 2 / 3 pick the
+  /// density. A HardwareKeyboard handler (focus-chain handlers below the app
+  /// root never see keys, see hotkey_gate.dart), so it applies the gate
+  /// itself: never while typing, under a dialog, or with the clip open.
+  bool _onListKey(KeyEvent event) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) return false;
+    if (!mounted || _playing != null) return false;
+    if (hotkeyContextBlocked(context)) return false;
+    if (_profile != null &&
+        event is KeyDownEvent &&
+        event.logicalKey == LogicalKeyboardKey.escape) {
+      _closeProfile();
+      return true;
+    }
+    if (_viewMode != PlatesViewMode.list &&
+        _viewMode != PlatesViewMode.gallery) {
+      return false;
+    }
+    final keys = HardwareKeyboard.instance;
+    if (keys.isControlPressed || keys.isAltPressed || keys.isMetaPressed) {
+      return false;
+    }
+    final k = event.logicalKey;
+    final n = _entries.length;
+    if (k == LogicalKeyboardKey.keyJ || k == LogicalKeyboardKey.arrowDown) {
+      if (n == 0) return false;
+      _select((_selected + 1).clamp(0, n - 1));
+      return true;
+    }
+    if (k == LogicalKeyboardKey.keyK || k == LogicalKeyboardKey.arrowUp) {
+      if (n == 0) return false;
+      _select((_selected - 1).clamp(0, n - 1));
+      return true;
+    }
+    if (event is! KeyDownEvent) return false;
+    if (k == LogicalKeyboardKey.enter || k == LogicalKeyboardKey.numpadEnter) {
+      if (_selected < 0 || _selected >= n) return false;
+      _openEntry(_entries[_selected]);
+      return true;
+    }
+    if (k == LogicalKeyboardKey.escape) {
+      if (_selected < 0) return false;
+      setState(() => _selected = -1);
+      return true;
+    }
+    if (k == LogicalKeyboardKey.arrowRight ||
+        k == LogicalKeyboardKey.arrowLeft) {
+      if (_selected < 0 || _selected >= n) return false;
+      final b = _entries[_selected].bundle;
+      if (b == null || b.passCount < 2) return false;
+      final open = k == LogicalKeyboardKey.arrowRight;
+      if (open != _expanded.contains(b.plate)) _toggleExpanded(b.plate);
+      return true;
+    }
+    final density = switch (k) {
+      LogicalKeyboardKey.digit1 => PlateDensity.compact,
+      LogicalKeyboardKey.digit2 => PlateDensity.standard,
+      LogicalKeyboardKey.digit3 => PlateDensity.large,
+      _ => null,
+    };
+    if (density != null && _viewMode == PlatesViewMode.list) {
+      _setDensity(density);
+      return true;
+    }
+    return false;
+  }
+
+  void _select(int i) {
+    setState(() {
+      _selected = i;
+      // An open profile follows the selection, so j/k pages through plates.
+      if (_profile != null && i >= 0 && i < _entries.length) {
+        _profile = _entries[i].group.representative;
+        _stats.want([_profile!.plate]);
+      }
+    });
+    final grid = _viewMode == PlatesViewMode.gallery;
+    final ctrl = grid ? _gridScroll : _listScroll;
+    if (!ctrl.hasClients) return;
+    final extent = grid
+        ? _cardExtent(_gridTall) + 12
+        : densityMetrics(_density).rowExtent;
+    final top = grid ? (i ~/ _gridColumns) * extent : i * extent;
+    final pos = ctrl.position;
+    if (top < pos.pixels) {
+      ctrl.jumpTo(top);
+    } else if (top + extent > pos.pixels + pos.viewportDimension) {
+      final target = top + extent - pos.viewportDimension;
+      ctrl.jumpTo(target > pos.maxScrollExtent ? pos.maxScrollExtent : target);
+    }
+  }
+
+  void _openEntry(LedgerEntry e) => _openProfile(e.group.representative);
+
+  void _openProfile(PlateRead read) {
+    _hideLoupe();
+    _stats.want([read.plate]);
+    setState(() => _profile = read);
+  }
+
+  void _closeProfile() => setState(() => _profile = null);
+
+  /// The newest server-resolved name for [plate] among the loaded reads.
+  String? _nameFor(String plate, String? fallback) {
+    for (final p in _plates) {
+      if (p.plate == plate) return p.displayName;
+    }
+    return fallback;
+  }
+
+  PlateWatchlistEntry? _watchEntryFor(String plate) {
+    for (final e in _watchlist) {
+      if (e.plate == plate) return e;
+    }
+    return null;
+  }
+
+  Future<void> _unwatchPlate(PlateWatchlistEntry entry) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Remove ${entry.plate} from the watchlist?'),
+        content: const Text(
+          'You will no longer be alerted when this plate is read.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Remove'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    try {
+      await _removeFromWatchlist(entry);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            e is CrumbApiException && e.statusCode == 403
+                ? 'Only admins can manage the watchlist.'
+                : 'Remove from watchlist failed: $e',
+          ),
+        ),
+      );
+    }
+  }
+
+  Widget _buildProfile(PlateRead focus) {
+    final byId = {for (final c in widget.cameras) c.id: c};
+    _stats.want([focus.plate]);
+    final entry = _watchEntryFor(focus.plate);
+    return _PlateProfile(
+      key: ValueKey('profile:${focus.plate}'),
+      focus: focus,
+      stats: _stats[focus.plate],
+      statsUnsupported: _stats.unsupported,
+      displayName: _nameFor(focus.plate, focus.displayName),
+      watchEntry: entry,
+      cameraIds: [for (final c in widget.cameras) c.id],
+      camName: (id) => byId[id]?.name ?? '(unknown camera)',
+      api: widget.api,
+      session: widget.session,
+      gate: _thumbGate,
+      canManage: widget.canManageWatchlist,
+      canName: widget.canNamePlates,
+      onClose: _closeProfile,
+      onPlay: _openRead,
+      onTimeline: (r) {
+        setState(() => _profile = null);
+        widget.onViewFootage(r.cameraId, r.ts);
+      },
+      onName: () =>
+          _namePlate(focus.plate, _nameFor(focus.plate, focus.displayName)),
+      onWatch: () => _addReadToWatchlist(focus),
+      onUnwatch: () {
+        if (entry != null) _unwatchPlate(entry);
+      },
+      onReport: _openPlateReport,
+    );
+  }
+
+  /// The plate desk list: header, column titles, the fixed-extent ledger and
+  /// a "Load more" footer.
+  Widget _buildLedger(BuildContext context, Set<String> watched) {
+    final byId = {for (final c in widget.cameras) c.id: c};
+    final m = densityMetrics(_density);
+    final groups = _collapse
+        ? collapsePlateReads(_plates)
+        : [for (final p in _plates) PlateGroup(p, [p])];
+    // Stats-based filters need every loaded plate's history, not just the
+    // rows on screen.
+    if (_deskFilter != DeskFilter.all) {
+      _stats.want(groups.map((g) => g.representative.plate));
+    }
+    final visible = _deskFilter == DeskFilter.all
+        ? groups
+        : groups
+              .where(
+                (g) => deskFilterMatches(
+                  _deskFilter,
+                  watched: watched.contains(g.representative.plate),
+                  stats: _stats[g.representative.plate],
+                ),
+              )
+              .toList();
+    final entries = flattenLedger(
+      visible,
+      groupByPlate: _groupByPlate,
+      expanded: _expanded,
+    );
+    _entries = entries;
+    if (_selected >= entries.length) _selected = entries.length - 1;
+    final hasMore = _plates.length < _total;
+    Widget list;
+    if (entries.isEmpty) {
+      list = Center(
+        child: Text(
+          _deskFilter == DeskFilter.all
+              ? 'No plate reads in this window.'
+              : (_stats.unsupported
+                    ? 'This server does not report plate history.'
+                    : 'No ${deskFilterLabel(_deskFilter).toLowerCase()} among the loaded reads.'),
+          style: const TextStyle(color: Colors.white38),
+        ),
+      );
+    } else {
+      list = ListView.builder(
+        controller: _listScroll,
+        itemExtent: m.rowExtent,
+        itemCount: entries.length + (hasMore ? 1 : 0),
+        itemBuilder: (context, i) {
+          if (i >= entries.length) {
+            return Center(
+              child: _loadingMore
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : TextButton(
+                      onPressed: _loadMore,
+                      child: Text(
+                        'Load ${(_total - _plates.length).clamp(0, _platesPageSize)} more '
+                        '(${_plates.length} of $_total loaded)',
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                    ),
+            );
+          }
+          final e = entries[i];
+          final read = e.group.representative;
+          _stats.want([read.plate]);
+          final bundle = e.bundle;
+          return RepaintBoundary(
+            child: _LedgerRow(
+              key: ValueKey(e.key),
+              entry: e,
+              m: m,
+              cols: _ledgerCols,
+              stats: _stats[read.plate],
+              statsUnsupported: _stats.unsupported,
+              watched: watched.contains(read.plate),
+              cameraName: byId[read.cameraId]?.name ?? '(unknown camera)',
+              selected: i == _selected,
+              expanded: bundle != null && _expanded.contains(bundle.plate),
+              api: widget.api,
+              session: widget.session,
+              gate: _thumbGate,
+              canManage: widget.canManageWatchlist,
+              canName: widget.canNamePlates,
+              onTap: () {
+                setState(() => _selected = i);
+                _openEntry(e);
+              },
+              onToggleExpand: () {
+                if (bundle != null) _toggleExpanded(bundle.plate);
+              },
+              onAddToWatchlist: () => _addReadToWatchlist(read),
+              onNamePlate: () => _namePlate(read.plate, read.displayName),
+              onReport: () => _openPlateReport(read),
+              onLoupe: _onLoupe,
+            ),
+          );
+        },
+      );
+    }
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final cols = ledgerColumns(m, constraints.maxWidth);
+        _ledgerCols = cols;
+        return Column(
+          children: [
+            _LedgerColumns(m: m, cols: cols),
+            Expanded(child: list),
+          ],
+        );
+      },
+    );
+  }
+
+  /// The grid view: the inset / loupe / tall controls, then fixed-size cards
+  /// (the same passes, filters and group-by-plate as the list).
+  Widget _buildSheet(BuildContext context, Set<String> watched) {
+    final byId = {for (final c in widget.cameras) c.id: c};
+    final groups = _collapse
+        ? collapsePlateReads(_plates)
+        : [for (final p in _plates) PlateGroup(p, [p])];
+    if (_deskFilter != DeskFilter.all) {
+      _stats.want(groups.map((g) => g.representative.plate));
+    }
+    final visible = _deskFilter == DeskFilter.all
+        ? groups
+        : groups
+              .where(
+                (g) => deskFilterMatches(
+                  _deskFilter,
+                  watched: watched.contains(g.representative.plate),
+                  stats: _stats[g.representative.plate],
+                ),
+              )
+              .toList();
+    // Grouped: one card per plate (stacked when it has several passes).
+    final entries = flattenLedger(visible, groupByPlate: _groupByPlate);
+    _entries = entries;
+    if (_selected >= entries.length) _selected = entries.length - 1;
+    final hasMore = _plates.length < _total;
+    final controls = _SheetControls(
+      size: _cropSize,
+      corner: _cropCorner,
+      display: _imageDisplay,
+      loupe: _gridLoupe,
+      tall: _gridTall,
+      onSize: _setCropSize,
+      onCorner: _setCropCorner,
+      onDisplay: _setImageDisplay,
+      onLoupe: (z) {
+        setState(() => _gridLoupe = z);
+        PlatesPrefs.setGridLoupe(z);
+      },
+      onTall: (on) {
+        setState(() => _gridTall = on);
+        PlatesPrefs.setGridTall(on);
+      },
+    );
+    if (entries.isEmpty) {
+      return Column(
+        children: [
+          controls,
+          const Expanded(
+            child: Center(
+              child: Text(
+                'No plate reads to show.',
+                style: TextStyle(color: Colors.white38),
+              ),
+            ),
+          ),
+        ],
+      );
+    }
+    return Column(
+      children: [
+        controls,
+        Expanded(
+          child: LayoutBuilder(
+            builder: (context, c) {
+              _gridColumns = ((c.maxWidth - 24 + 12) / (_kCardMaxWidth + 12))
+                  .ceil()
+                  .clamp(1, 64);
+              return CustomScrollView(
+                controller: _gridScroll,
+                slivers: [
+                  SliverPadding(
+                    padding: const EdgeInsets.all(12),
+                    sliver: SliverGrid.builder(
+                      gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
+                        maxCrossAxisExtent: _kCardMaxWidth,
+                        mainAxisExtent: _cardExtent(_gridTall),
+                        mainAxisSpacing: 12,
+                        crossAxisSpacing: 12,
+                      ),
+                      itemCount: entries.length,
+                      itemBuilder: (context, i) {
+                        final e = entries[i];
+                        final read = e.group.representative;
+                        _stats.want([read.plate]);
+                        return RepaintBoundary(
+                          child: _SheetCard(
+                            key: ValueKey(e.key),
+                            entry: e,
+                            stats: _stats[read.plate],
+                            watched: watched.contains(read.plate),
+                            cameraName:
+                                byId[read.cameraId]?.name ?? '(unknown camera)',
+                            selected: i == _selected,
+                            insetSize: _cropSize,
+                            insetCorner: _cropCorner,
+                            showInset:
+                                _imageDisplay != PlateImageDisplay.fullOnly,
+                            loupe: _gridLoupe,
+                            tall: _gridTall,
+                            session: widget.session,
+                            gate: _thumbGate,
+                            canManage: widget.canManageWatchlist,
+                            canName: widget.canNamePlates,
+                            onTap: () {
+                              setState(() => _selected = i);
+                              _openProfile(read);
+                            },
+                            onAddToWatchlist: () => _addReadToWatchlist(read),
+                            onNamePlate: () =>
+                                _namePlate(read.plate, read.displayName),
+                            onReport: () => _openPlateReport(read),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                  if (hasMore)
+                    SliverToBoxAdapter(
+                      child: Padding(
+                        padding: const EdgeInsets.only(bottom: 16),
+                        child: Center(
+                          child: _loadingMore
+                              ? const SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              : TextButton(
+                                  onPressed: _loadMore,
+                                  child: Text(
+                                    'Load more (${_plates.length} of $_total loaded)',
+                                    style: const TextStyle(fontSize: 12),
+                                  ),
+                                ),
+                        ),
+                      ),
+                    ),
+                ],
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+
+
+  /// The header above every view (hidden on an older server).
+  Widget? _buildDeskHeader() {
+    final o = _overview;
+    if (o == null) return null;
+    return _DeskHeader(
+      overview: o,
+      filter: _deskFilter,
+      groupByPlate: _groupByPlate,
+      onFilter: (f) {
+        _setDeskFilter(f);
+        if (f != DeskFilter.all && _viewMode != PlatesViewMode.list &&
+            _viewMode != PlatesViewMode.gallery) {
+          _setViewMode(PlatesViewMode.list);
+        }
+      },
+      onGroupByPlate: (on) {
+        _setGroupByPlate(on);
+        if (on && _viewMode != PlatesViewMode.list &&
+            _viewMode != PlatesViewMode.gallery) {
+          _setViewMode(PlatesViewMode.list);
+        }
+      },
+    );
   }
 
   void _setCollapse(bool on) {
@@ -211,6 +906,7 @@ class _PlatesScreenState extends State<PlatesScreen> {
 
   void _setViewMode(PlatesViewMode mode) {
     if (mode == _viewMode) return;
+    _hideLoupe();
     setState(() => _viewMode = mode);
     PlatesPrefs.setViewMode(mode);
   }
@@ -269,6 +965,13 @@ class _PlatesScreenState extends State<PlatesScreen> {
 
   @override
   void dispose() {
+    HardwareKeyboard.instance.removeHandler(_onListKey);
+    _hideLoupe();
+    _listScroll.dispose();
+    _gridScroll.dispose();
+    _stats
+      ..removeListener(_onStatsChanged)
+      ..dispose();
     _searchDebounce?.cancel();
     _searchController.dispose();
     super.dispose();
@@ -294,8 +997,11 @@ class _PlatesScreenState extends State<PlatesScreen> {
     setState(() {
       _loading = true;
       _error = null;
+      _selected = -1;
     });
     _thumbGate.reset();
+    _hideLoupe();
+    unawaited(_loadOverview());
     final DateTime? end;
     final DateTime? start;
     if (_hours == 0) {
@@ -371,12 +1077,14 @@ class _PlatesScreenState extends State<PlatesScreen> {
       kind: kind,
     );
     await _loadWatchlist();
+    unawaited(_loadOverview());
   }
 
   /// Remove a watchlist entry, then refresh. Rethrows for the caller to report.
   Future<void> _removeFromWatchlist(PlateWatchlistEntry entry) async {
     await widget.api.deleteWatchlist(widget.session, entry.id);
     await _loadWatchlist();
+    unawaited(_loadOverview());
   }
 
   /// Per-read "add to watchlist" affordance: opens the Watch/Ignore chooser for
@@ -532,6 +1240,7 @@ class _PlatesScreenState extends State<PlatesScreen> {
   /// it falls back to the Playback timeline hand-off directly (the previous
   /// row-click behavior).
   void _openRead(PlateRead read) {
+    _hideLoupe();
     final eventId = read.eventId;
     if (eventId == null || eventId.isEmpty) {
       widget.onViewFootage(read.cameraId, read.ts);
@@ -574,10 +1283,19 @@ class _PlatesScreenState extends State<PlatesScreen> {
             Column(
               children: [
                 _buildFilterBar(context),
+                ?_buildDeskHeader(),
                 Expanded(
                   child: Row(
                     children: [
-                      Expanded(child: _buildBody(context)),
+                      Expanded(
+                        child: Stack(
+                          children: [
+                            Positioned.fill(child: _buildBody(context)),
+                            if (_profile != null)
+                              Positioned.fill(child: _buildProfile(_profile!)),
+                          ],
+                        ),
+                      ),
                       if (_showWatchlist)
                         _WatchlistPanel(
                           entries: _watchlist,
@@ -610,8 +1328,8 @@ class _PlatesScreenState extends State<PlatesScreen> {
                 read: playing,
                 cameraName:
                     byId[playing.cameraId]?.name ?? '(unknown camera)',
-                imageMode: _imageDisplay,
-                cropSize: _cropSize,
+                imageMode: PlateImageDisplay.both,
+                cropSize: PlateCropSize.medium,
                 canName: widget.canNamePlates,
                 onReport: () => _openPlateReport(playing),
                 onNamePlate: () =>
@@ -729,6 +1447,36 @@ class _PlatesScreenState extends State<PlatesScreen> {
             ),
           _ViewModeToggle(value: _viewMode, onChanged: _setViewMode),
           if (_viewMode == PlatesViewMode.list)
+            _DensityToggle(value: _density, onChanged: _setDensity),
+          if (_viewMode == PlatesViewMode.list ||
+              _viewMode == PlatesViewMode.gallery)
+            FilterChip(
+              label: const Text('Group by plate'),
+              selected: _groupByPlate,
+              onSelected: _setGroupByPlate,
+              showCheckmark: false,
+              tooltip: 'Fold every read of a plate into one expandable row',
+              labelStyle: TextStyle(
+                fontSize: 12,
+                color: _groupByPlate ? Colors.white : Colors.white70,
+              ),
+              selectedColor: _kPink.withValues(alpha: 0.35),
+              backgroundColor: const Color(0xFF2A2D35),
+              side: BorderSide.none,
+              visualDensity: VisualDensity.compact,
+            ),
+          if (_deskFilter != DeskFilter.all)
+            InputChip(
+              label: Text(deskFilterLabel(_deskFilter)),
+              labelStyle: const TextStyle(fontSize: 12, color: Colors.white),
+              backgroundColor: _kPink.withValues(alpha: 0.25),
+              side: BorderSide.none,
+              onDeleted: () => _setDeskFilter(DeskFilter.all),
+              deleteIconColor: Colors.white70,
+              tooltip: 'Clear the filter',
+              visualDensity: VisualDensity.compact,
+            ),
+          if (_viewMode == PlatesViewMode.list)
             Tooltip(
               message: _collapse
                   ? 'Collapsing duplicate reads of the same car (both engines +\nrepeat reads) into one row. Click to show every raw read.'
@@ -744,14 +1492,6 @@ class _PlatesScreenState extends State<PlatesScreen> {
                 ),
               ),
             ),
-          _DisplayOptionsButton(
-            imageMode: _imageDisplay,
-            cropCorner: _cropCorner,
-            cropSize: _cropSize,
-            onModeChanged: _setImageDisplay,
-            onCornerChanged: _setCropCorner,
-            onSizeChanged: _setCropSize,
-          ),
           if (_abAvailable)
             TextButton.icon(
               onPressed: () => showAbBenchmark(
@@ -766,28 +1506,52 @@ class _PlatesScreenState extends State<PlatesScreen> {
                 style: TextStyle(color: Colors.white70, fontSize: 12),
               ),
             ),
-          TextButton.icon(
-            onPressed: () => setState(() {
-              _showWatchlist = !_showWatchlist;
-              PlatesPrefs.setShowWatchlist(_showWatchlist);
-            }),
-            icon: Icon(
-              _showWatchlist
-                  ? Icons.playlist_add_check
-                  : Icons.playlist_add,
-              size: 16,
-              color: Colors.white70,
-            ),
-            label: Text(
-              _watchlist.isEmpty
-                  ? 'Watchlist'
-                  : 'Watchlist (${_watchlist.length})',
-              style: const TextStyle(color: Colors.white70, fontSize: 12),
+          // A toggle for the watchlist panel: accent colour + tinted fill while
+          // the panel is showing (same behaviour as PR #651).
+          Tooltip(
+            message: _showWatchlist
+                ? 'Hide the watchlist panel'
+                : 'Show the watchlist panel',
+            child: TextButton.icon(
+              style: _showWatchlist
+                  ? TextButton.styleFrom(
+                      backgroundColor: Theme.of(
+                        context,
+                      ).colorScheme.primary.withValues(alpha: 0.16),
+                    )
+                  : null,
+              onPressed: () => setState(() {
+                _showWatchlist = !_showWatchlist;
+                PlatesPrefs.setShowWatchlist(_showWatchlist);
+              }),
+              icon: Icon(
+                _showWatchlist
+                    ? Icons.playlist_add_check
+                    : Icons.playlist_add,
+                size: 16,
+                color: _showWatchlist
+                    ? Theme.of(context).colorScheme.primary
+                    : Colors.white70,
+              ),
+              label: Text(
+                _watchlist.isEmpty
+                    ? 'Watchlist'
+                    : 'Watchlist (${_watchlist.length})',
+                style: TextStyle(
+                  color: _showWatchlist
+                      ? Theme.of(context).colorScheme.primary
+                      : Colors.white70,
+                  fontSize: 12,
+                ),
+              ),
             ),
           ),
           IconButton(
             tooltip: 'Refresh',
-            onPressed: _load,
+            onPressed: () {
+              _stats.invalidate();
+              _load();
+            },
             icon: const Icon(Icons.refresh, color: Colors.white70, size: 18),
           ),
           if (!_loading)
@@ -821,56 +1585,19 @@ class _PlatesScreenState extends State<PlatesScreen> {
       );
     }
     final byId = {for (final c in widget.cameras) c.id: c};
-    final watched = {for (final e in _watchlist) e.plate};
+    final watched = {
+      for (final e in _watchlist)
+        if (!e.isIgnore) e.plate,
+    };
     String camName(String id) => byId[id]?.name ?? '(unknown camera)';
     switch (_viewMode) {
       case PlatesViewMode.list:
-        // Collapse duplicate reads of one car (both engines + Frigate's own OCR
-        // refinements) into a single representative row; off = every raw read.
-        final groups = _collapse
-            ? collapsePlateReads(_plates)
-            : [for (final p in _plates) PlateGroup(p, [p])];
-        return ListView.separated(
-          padding: const EdgeInsets.symmetric(vertical: 6),
-          itemCount: groups.length,
-          separatorBuilder: (_, _) =>
-              const Divider(height: 1, color: Colors.white10),
-          itemBuilder: (context, i) {
-            final g = groups[i];
-            final p = g.representative;
-            return _PlateRow(
-              key: ValueKey(p.id),
-              read: p,
-              group: g,
-              cameraName: camName(p.cameraId),
-              api: widget.api,
-              session: widget.session,
-              gate: _thumbGate,
-              imageMode: _imageDisplay,
-              cropCorner: _cropCorner,
-              cropSize: _cropSize,
-              onTap: () => _openRead(p),
-              canManage: widget.canManageWatchlist,
-              canName: widget.canNamePlates,
-              watched: watched.contains(p.plate),
-              onAddToWatchlist: () => _addReadToWatchlist(p),
-              onNamePlate: () => _namePlate(p.plate, p.displayName),
-              onReport: () => _openPlateReport(p),
-            );
-          },
-        );
+        // Duplicate reads of one car (both engines + Frigate's own OCR
+        // refinements) still collapse into one pass when [_collapse] is on;
+        // group-by-plate then folds passes of the same plate together.
+        return _buildLedger(context, watched);
       case PlatesViewMode.gallery:
-        return _PlateGallery(
-          reads: _plates,
-          camName: camName,
-          api: widget.api,
-          session: widget.session,
-          gate: _thumbGate,
-          imageMode: _imageDisplay,
-          cropCorner: _cropCorner,
-          cropSize: _cropSize,
-          onTap: _openRead,
-        );
+        return _buildSheet(context, watched);
       case PlatesViewMode.grouped:
         return _PlateGroupedList(
           reads: _plates,
@@ -878,9 +1605,9 @@ class _PlatesScreenState extends State<PlatesScreen> {
           api: widget.api,
           session: widget.session,
           gate: _thumbGate,
-          imageMode: _imageDisplay,
-          cropCorner: _cropCorner,
-          cropSize: _cropSize,
+          imageMode: PlateImageDisplay.both,
+          cropCorner: PlateCropCorner.bottomRight,
+          cropSize: PlateCropSize.medium,
           onTap: _openRead,
           canManage: widget.canManageWatchlist,
           canName: widget.canNamePlates,
@@ -896,9 +1623,9 @@ class _PlatesScreenState extends State<PlatesScreen> {
           api: widget.api,
           session: widget.session,
           gate: _thumbGate,
-          imageMode: _imageDisplay,
-          cropCorner: _cropCorner,
-          cropSize: _cropSize,
+          imageMode: PlateImageDisplay.both,
+          cropCorner: PlateCropCorner.bottomRight,
+          cropSize: PlateCropSize.medium,
           onTap: _openRead,
         );
     }
@@ -944,97 +1671,9 @@ class _ViewModeToggle extends StatelessWidget {
       mainAxisSize: MainAxisSize.min,
       children: [
         seg(PlatesViewMode.list, Icons.view_list, 'List'),
-        seg(PlatesViewMode.gallery, Icons.grid_view, 'Gallery'),
+        seg(PlatesViewMode.gallery, Icons.grid_view, 'Grid'),
         seg(PlatesViewMode.grouped, Icons.workspaces_outline, 'Grouped by plate'),
         seg(PlatesViewMode.timeline, Icons.timeline, 'Timeline feed'),
-      ],
-    );
-  }
-}
-
-/// Toolbar popover to configure how plate previews show their image(s):
-/// full frame + crop / full only / crop only, and (when both) which corner the
-/// crop pins to over the full frame. Persisted via [PlatesPrefs].
-class _DisplayOptionsButton extends StatelessWidget {
-  const _DisplayOptionsButton({
-    required this.imageMode,
-    required this.cropCorner,
-    required this.cropSize,
-    required this.onModeChanged,
-    required this.onCornerChanged,
-    required this.onSizeChanged,
-  });
-
-  final PlateImageDisplay imageMode;
-  final PlateCropCorner cropCorner;
-  final PlateCropSize cropSize;
-  final ValueChanged<PlateImageDisplay> onModeChanged;
-  final ValueChanged<PlateCropCorner> onCornerChanged;
-  final ValueChanged<PlateCropSize> onSizeChanged;
-
-  @override
-  Widget build(BuildContext context) {
-    final cornersEnabled = imageMode == PlateImageDisplay.both;
-    final cropEnabled = imageMode != PlateImageDisplay.fullOnly;
-    PopupMenuItem<Object> header(String text) => PopupMenuItem<Object>(
-          enabled: false,
-          height: 26,
-          child: Text(
-            text,
-            style: const TextStyle(
-              color: Colors.white38,
-              fontSize: 11,
-              fontWeight: FontWeight.w600,
-              letterSpacing: 0.4,
-            ),
-          ),
-        );
-    CheckedPopupMenuItem<Object> modeItem(PlateImageDisplay m, String label) =>
-        CheckedPopupMenuItem<Object>(
-          value: m,
-          checked: imageMode == m,
-          child: Text(label, style: const TextStyle(fontSize: 13)),
-        );
-    CheckedPopupMenuItem<Object> cornerItem(PlateCropCorner c, String label) =>
-        CheckedPopupMenuItem<Object>(
-          value: c,
-          checked: cropCorner == c,
-          enabled: cornersEnabled,
-          child: Text(label, style: const TextStyle(fontSize: 13)),
-        );
-    CheckedPopupMenuItem<Object> sizeItem(PlateCropSize s, String label) =>
-        CheckedPopupMenuItem<Object>(
-          value: s,
-          checked: cropSize == s,
-          enabled: cropEnabled,
-          child: Text(label, style: const TextStyle(fontSize: 13)),
-        );
-    return PopupMenuButton<Object>(
-      tooltip: 'Image display',
-      icon: const Icon(Icons.photo_size_select_large,
-          color: Colors.white70, size: 18),
-      color: const Color(0xFF23262E),
-      onSelected: (v) {
-        if (v is PlateImageDisplay) onModeChanged(v);
-        if (v is PlateCropCorner) onCornerChanged(v);
-        if (v is PlateCropSize) onSizeChanged(v);
-      },
-      itemBuilder: (context) => [
-        header('SHOW'),
-        modeItem(PlateImageDisplay.both, 'Full frame + plate crop'),
-        modeItem(PlateImageDisplay.fullOnly, 'Full frame only'),
-        modeItem(PlateImageDisplay.cropOnly, 'Plate crop only'),
-        const PopupMenuDivider(),
-        header('CROP SIZE'),
-        sizeItem(PlateCropSize.small, 'Small'),
-        sizeItem(PlateCropSize.medium, 'Medium'),
-        sizeItem(PlateCropSize.large, 'Large'),
-        const PopupMenuDivider(),
-        header('CROP CORNER (IN CARDS)'),
-        cornerItem(PlateCropCorner.topLeft, 'Top-left'),
-        cornerItem(PlateCropCorner.topRight, 'Top-right'),
-        cornerItem(PlateCropCorner.bottomLeft, 'Bottom-left'),
-        cornerItem(PlateCropCorner.bottomRight, 'Bottom-right'),
       ],
     );
   }
@@ -1482,7 +2121,6 @@ class _PlateThumb extends StatefulWidget {
     required this.gate,
     this.width = 92,
     this.height = 56,
-    this.radius = 6,
     this.iconSize = 22,
     this.imageMode = PlateImageDisplay.fullOnly,
     this.cropCorner = PlateCropCorner.bottomRight,
@@ -1496,7 +2134,7 @@ class _PlateThumb extends StatefulWidget {
   final _ConcurrencyGate gate;
   final double width;
   final double height;
-  final double radius;
+  final double radius = 6;
   final double iconSize;
 
   /// Which image(s) to show — the full frame, the plate crop, or both. The crop
@@ -1847,178 +2485,6 @@ class _ChipBox extends StatelessWidget {
   }
 }
 
-// ─── gallery view ──────────────────────────────────────────────────────────
-
-/// Responsive grid of plate cards: snapshot thumbnail (or placeholder), the
-/// plate (mono), camera, time, and a confidence chip. A card tap routes through
-/// the same [onTap] the list uses (pop-up clip player, or timeline hand-off for
-/// a read with no linked event).
-class _PlateGallery extends StatelessWidget {
-  const _PlateGallery({
-    required this.reads,
-    required this.camName,
-    required this.api,
-    required this.session,
-    required this.gate,
-    required this.imageMode,
-    required this.cropCorner,
-    required this.cropSize,
-    required this.onTap,
-  });
-
-  final List<PlateRead> reads;
-  final String Function(String cameraId) camName;
-  final CrumbApi api;
-  final Session session;
-  final _ConcurrencyGate gate;
-  final PlateImageDisplay imageMode;
-  final PlateCropCorner cropCorner;
-  final PlateCropSize cropSize;
-  final void Function(PlateRead) onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return GridView.builder(
-      padding: const EdgeInsets.all(12),
-      gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-        maxCrossAxisExtent: 260,
-        mainAxisSpacing: 12,
-        crossAxisSpacing: 12,
-        childAspectRatio: 1.15,
-      ),
-      itemCount: reads.length,
-      itemBuilder: (context, i) {
-        final p = reads[i];
-        return _PlateGalleryCard(
-          key: ValueKey(p.id),
-          read: p,
-          cameraName: camName(p.cameraId),
-          api: api,
-          session: session,
-          gate: gate,
-          imageMode: imageMode,
-          cropCorner: cropCorner,
-          cropSize: cropSize,
-          onTap: () => onTap(p),
-        );
-      },
-    );
-  }
-}
-
-class _PlateGalleryCard extends StatelessWidget {
-  const _PlateGalleryCard({
-    super.key,
-    required this.read,
-    required this.cameraName,
-    required this.api,
-    required this.session,
-    required this.gate,
-    required this.imageMode,
-    required this.cropCorner,
-    required this.cropSize,
-    required this.onTap,
-  });
-
-  final PlateRead read;
-  final String cameraName;
-  final CrumbApi api;
-  final Session session;
-  final _ConcurrencyGate gate;
-  final PlateImageDisplay imageMode;
-  final PlateCropCorner cropCorner;
-  final PlateCropSize cropSize;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      color: const Color(0xFF1E2026),
-      borderRadius: BorderRadius.circular(8),
-      clipBehavior: Clip.antiAlias,
-      child: InkWell(
-        onTap: onTap,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Expanded(
-              child: _PlateThumb(
-                read: read,
-                api: api,
-                session: session,
-                gate: gate,
-                width: double.infinity,
-                height: double.infinity,
-                radius: 0,
-                iconSize: 34,
-                // Gallery cards feature the plate: the crop pins to the chosen
-                // corner over the full frame (or per the operator's display
-                // preference — full-only / crop-only). Falls back gracefully
-                // when there's no bbox.
-                imageMode: imageMode,
-                cropCorner: cropCorner,
-                cropSize: cropSize,
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(10, 8, 10, 10),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Row(
-                    children: [
-                      Expanded(
-                        child: _PlateHeadline(
-                          name: read.displayName,
-                          plate: read.plate,
-                          plateStyle: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 16,
-                            fontWeight: FontWeight.w700,
-                            letterSpacing: 1.3,
-                            fontFamily: 'monospace',
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 6),
-                      _ConfidenceChip(read.confidence),
-                    ],
-                  ),
-                  const SizedBox(height: 4),
-                  Row(
-                    children: [
-                      const Icon(Icons.videocam_outlined,
-                          size: 12, color: Colors.white38),
-                      const SizedBox(width: 4),
-                      Flexible(
-                        child: Text(
-                          cameraName,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: Colors.white70,
-                            fontSize: 11,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 2),
-                  Text(
-                    _fmtDateTime(read.ts),
-                    style: const TextStyle(color: Colors.white54, fontSize: 10),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
 // ─── grouped-by-plate view ─────────────────────────────────────────────────
 
 /// One collapsed group: a unique normalized plate, its sighting count,
@@ -2154,6 +2620,7 @@ class _PlateGroupedList extends StatelessWidget {
                 _PlateRow(
                   key: ValueKey(r.id),
                   read: r,
+                  group: PlateGroup(r, [r]),
                   cameraName: camName(r.cameraId),
                   api: api,
                   session: session,
