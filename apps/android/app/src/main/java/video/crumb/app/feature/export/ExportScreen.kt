@@ -729,21 +729,7 @@ private const val EXPORT_CACHE_SUBDIR = "exports"
 /** Sub-folder created under the device Downloads dir for exported clips (#134). */
 private const val DOWNLOAD_SUBDIR = "CrumbVMS"
 
-/**
- * Extension (without the dot, lowercased) to save an export output under, taken
- * from the server-reported basename in [ExportOutputFile.filename]. The server
- * may hand back `.mkv` (no-transcode passthrough) or a whole-job `.zip`, not
- * just `.mp4` - saving everything as `.mp4` produced an unplayable/corrupt-looking
- * file whenever the real container differed. Falls back to "mp4" only when the
- * server didn't report a filename (old persisted jobs).
- */
-private fun exportFileExtension(outputFile: ExportOutputFile): String {
-    val name = outputFile.filename
-    val dot = name.lastIndexOf('.')
-    return if (dot in 0 until name.length - 1) name.substring(dot + 1).lowercase() else "mp4"
-}
-
-/** MIME type matching [exportFileExtension]'s output, for MediaStore/share intents. */
+/** MIME type matching the saved file's extension, for MediaStore/share intents. */
 private fun exportMimeType(extension: String): String = when (extension.lowercase()) {
     "mkv" -> "video/x-matroska"
     "zip" -> "application/zip"
@@ -785,10 +771,10 @@ private suspend fun saveExportToDownloads(
             // no code path puts the bearer token in a URL anymore. #147-9.)
             val absoluteUrl = "$base$path"
 
-            val safeId = outputFile.cameraId.replace(Regex("[^a-zA-Z0-9_-]"), "_")
-            val extension = exportFileExtension(outputFile)
-            // Timestamp so repeated downloads don't collide / silently overwrite.
-            val fileName = "crumb-export-$safeId-${System.currentTimeMillis()}.$extension"
+            // Server's readable name (sanitized, allow-listed extension), or a
+            // camera-id fallback. See ExportFileNames.kt.
+            val fileName = exportSaveFileName(outputFile)
+            val extension = fileName.substringAfterLast('.')
 
             val request = Request.Builder().url(absoluteUrl).build()
             client.newCall(request).execute().use { response ->
@@ -856,9 +842,14 @@ private fun writeToMediaStoreDownloads(
 private fun writeToLegacyDownloads(fileName: String, input: InputStream): String {
     val downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
     val dir = File(downloads, DOWNLOAD_SUBDIR).apply { mkdirs() }
-    val dest = File(dir, fileName)
+    // Readable names repeat across downloads; never overwrite an earlier save.
+    val stem = fileName.substringBeforeLast('.')
+    val ext = fileName.substringAfterLast('.', "")
+    var dest = File(dir, fileName)
+    var n = 1
+    while (dest.exists()) dest = File(dir, "$stem (${n++}).$ext")
     dest.outputStream().use { out -> input.copyTo(out) }
-    return "Downloads/$DOWNLOAD_SUBDIR/$fileName"
+    return "Downloads/$DOWNLOAD_SUBDIR/${dest.name}"
 }
 
 /**
@@ -897,8 +888,7 @@ private suspend fun downloadExportFileToCache(
             // was removed — nothing puts the bearer token in a URL now. #147-9.)
             val absoluteUrl = "$base$path"
 
-            val safeId = outputFile.cameraId.replace(Regex("[^a-zA-Z0-9_-]"), "_")
-            val fileName = "crumb-export-$safeId.${exportFileExtension(outputFile)}"
+            val fileName = exportSaveFileName(outputFile)
             val exportDir = File(context.cacheDir, EXPORT_CACHE_SUBDIR).apply { mkdirs() }
             val destFile = File(exportDir, fileName)
 
