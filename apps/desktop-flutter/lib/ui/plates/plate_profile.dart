@@ -65,7 +65,7 @@ class _PlateProfile extends StatefulWidget {
   final bool canManage;
   final bool canName;
   final VoidCallback onClose;
-  final ValueChanged<PlateRead> onPlay;
+  final void Function(PlateRead read, {Duration? position}) onPlay;
   final ValueChanged<PlateRead> onTimeline;
   final VoidCallback onName;
   final VoidCallback onWatch;
@@ -553,7 +553,9 @@ class _PlateProfileState extends State<_PlateProfile> {
       _profileVisitsMinW,
       _profileVisitsMaxW,
     );
-    final totalH = videoH + _profileCaptionH + 2;
+    final hasClip = _selected.eventId != null && _selected.eventId!.isNotEmpty;
+    final totalH =
+        videoH + (hasClip ? kClipControlsHeight : 0) + _profileCaptionH + 2;
     return Padding(
       padding: const EdgeInsets.only(bottom: 14),
       child: Row(
@@ -617,33 +619,36 @@ class _PlateProfileState extends State<_PlateProfile> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          SizedBox(
-            height: h,
-            child: hasClip
-                ? _InlineClip(
-                    key: ValueKey('inline:${r.id}'),
-                    api: widget.api,
-                    session: widget.session,
-                    read: r,
-                  )
-                : Center(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const Text(
-                          'No clip for this read.',
-                          style: TextStyle(color: Colors.white54),
-                        ),
-                        const SizedBox(height: 8),
-                        _ProfileButton(
-                          icon: Icons.timeline,
-                          label: 'View on timeline',
-                          onTap: () => widget.onTimeline(r),
-                        ),
-                      ],
+          if (hasClip)
+            _InlineClip(
+              key: ValueKey('inline:${r.id}'),
+              api: widget.api,
+              session: widget.session,
+              read: r,
+              height: h,
+              onFullscreen: (pos) => widget.onPlay(r, position: pos),
+            )
+          else
+            SizedBox(
+              height: h,
+              child: Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text(
+                      'No clip for this read.',
+                      style: TextStyle(color: Colors.white54),
                     ),
-                  ),
-          ),
+                    const SizedBox(height: 8),
+                    _ProfileButton(
+                      icon: Icons.timeline,
+                      label: 'View on timeline',
+                      onTap: () => widget.onTimeline(r),
+                    ),
+                  ],
+                ),
+              ),
+            ),
           Container(
             color: _kSurface1,
             height: _profileCaptionH,
@@ -954,7 +959,7 @@ Widget debugPlateProfile({
     canManage: true,
     canName: true,
     onClose: () {},
-    onPlay: (_) {},
+    onPlay: (_, {position}) {},
     onTimeline: (_) {},
     onName: () {},
     onWatch: () {},
@@ -963,23 +968,39 @@ Widget debugPlateProfile({
   );
 }
 
+/// Seconds of footage before the read at the start of a plate clip (the
+/// server's `LPR_CLIP_LEAD_SECS`, `services/api/src/clips.rs`): the clip window
+/// is `[read.ts - 8 s, read.ts + 4 s]`, so the read sits 8 s in.
+const kPlateClipLead = Duration(seconds: 8);
+
 /// The profile's hero player: plays [read]'s detection clip inline (muted,
-/// autoplay, with media_kit's standard transport controls). Resolves the clip
-/// like the pop-up [_PlateClipPlayer]: `/clip/d:<event>/clip.mp4` on a scoped
-/// media `?token=`. Key it by the read so switching reads builds a fresh Video
-/// (media_kit binds the controller only in initState). Any failure to resolve
-/// or open (offline, tests) degrades to a text placeholder.
+/// autoplay) with Crumb's shared clip controls ([ClipControls]) beneath it:
+/// scrub bar, play/pause, restart, jumps, frame step, speed, loop, mute, clip
+/// and wall-clock time, and a full-screen button into the pop-up player.
+/// Resolves the clip like the pop-up [_PlateClipPlayer]:
+/// `/clip/d:<event>/clip.mp4` on a scoped media `?token=`. Key it by the read
+/// so switching reads builds a fresh Video (media_kit binds the controller only
+/// in initState). Any failure to resolve or open (offline, tests) degrades to
+/// a text placeholder.
 class _InlineClip extends StatefulWidget {
   const _InlineClip({
     super.key,
     required this.api,
     required this.session,
     required this.read,
+    required this.height,
+    required this.onFullscreen,
   });
 
   final CrumbApi api;
   final Session session;
   final PlateRead read;
+
+  /// Height of the video area (the controls sit below it).
+  final double height;
+
+  /// Open the pop-up player at this clip position.
+  final ValueChanged<Duration> onFullscreen;
 
   @override
   State<_InlineClip> createState() => _InlineClipState();
@@ -988,13 +1009,26 @@ class _InlineClip extends StatefulWidget {
 class _InlineClipState extends State<_InlineClip> {
   Player? _player;
   VideoController? _controller;
+  MediaKitClipTransport? _transport;
   String? _error;
   bool _disposed = false;
 
   @override
   void initState() {
     super.initState();
+    HardwareKeyboard.instance.addHandler(_onKey);
     unawaited(_open());
+  }
+
+  /// Space / Left / Right / , / . while the profile is up. Stands down for a
+  /// text field, a dialog, or the pop-up player (which has its own handler).
+  /// Esc is deliberately not handled here, so the profile still closes.
+  bool _onKey(KeyEvent event) {
+    final t = _transport;
+    if (t == null || !mounted) return false;
+    if (_PlateClipPlayerState.openCount > 0) return false;
+    if (hotkeyContextBlocked(context)) return false;
+    return handleClipTransportKey(event, t);
   }
 
   Future<void> _open() async {
@@ -1012,11 +1046,13 @@ class _InlineClipState extends State<_InlineClip> {
       }
       final player = Player();
       final controller = VideoController(player);
+      final transport = MediaKitClipTransport(player, muted: true);
       setState(() {
         _player = player;
         _controller = controller;
+        _transport = transport;
       });
-      await player.setVolume(0);
+      await transport.applyInitialMute();
       await player.open(Media(url));
       await player.play();
     } catch (_) {
@@ -1029,6 +1065,8 @@ class _InlineClipState extends State<_InlineClip> {
   @override
   void dispose() {
     _disposed = true;
+    HardwareKeyboard.instance.removeHandler(_onKey);
+    _transport?.dispose();
     final p = _player;
     if (p != null) {
       // Dispose after the frame so the Video widget has let go of the
@@ -1038,23 +1076,51 @@ class _InlineClipState extends State<_InlineClip> {
     super.dispose();
   }
 
+  Future<void> _fullscreen() async {
+    final t = _transport;
+    if (t == null) return;
+    final pos = t.position;
+    await t.pause();
+    widget.onFullscreen(pos);
+  }
+
   @override
   Widget build(BuildContext context) {
+    final c = _controller;
+    final t = _transport;
+    Widget video;
     if (_error != null) {
-      return Center(
+      video = Center(
         child: Text(_error!, style: const TextStyle(color: Colors.white54)),
       );
-    }
-    final c = _controller;
-    if (c == null) {
-      return const Center(
+    } else if (c == null) {
+      video = const Center(
         child: SizedBox(
           width: 22,
           height: 22,
           child: CircularProgressIndicator(strokeWidth: 2),
         ),
       );
+    } else {
+      video = Video(controller: c, controls: NoVideoControls, fit: BoxFit.contain);
     }
-    return Video(controller: c, fit: BoxFit.contain);
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        SizedBox(height: widget.height, child: video),
+        if (t != null && _error == null)
+          ColoredBox(
+            color: _kSurface1,
+            child: ClipControls(
+              transport: t,
+              wallStart: widget.read.ts.subtract(kPlateClipLead),
+              markAt: kPlateClipLead,
+              onFullscreen: () => unawaited(_fullscreen()),
+            ),
+          )
+        else
+          const SizedBox(height: kClipControlsHeight),
+      ],
+    );
   }
 }

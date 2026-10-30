@@ -43,6 +43,7 @@ import 'package:crumb_desktop/api/http_client.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/plate_desk_api.dart';
 import 'package:crumb_desktop/api/plates_api.dart';
+import 'package:crumb_desktop/ui/clips/clip_controls.dart';
 import 'package:crumb_desktop/ui/clips/clip_player_shell.dart';
 import 'package:crumb_desktop/ui/hotkeys/hotkey_gate.dart';
 import 'package:crumb_desktop/ui/plates/ab_benchmark.dart';
@@ -136,6 +137,9 @@ class _PlatesScreenState extends State<PlatesScreen> {
   // The read whose pop-up clip player is open (null = none). Set by tapping a
   // row that has a linked detection event; the overlay plays that read's clip.
   PlateRead? _playing;
+
+  /// Clip position the pop-up opens at (from the profile's full-screen button).
+  Duration? _playingAt;
 
   // The plate profile covering the results area (null = closed). Opened from
   // any row; the clip player can still open on top of it.
@@ -434,6 +438,13 @@ class _PlatesScreenState extends State<PlatesScreen> {
     }
     if (_viewMode != PlatesViewMode.list &&
         _viewMode != PlatesViewMode.gallery) {
+      return false;
+    }
+    // With the profile open, Left / Right belong to its clip controls, not to
+    // the (hidden) list's expand/collapse.
+    if (_profile != null &&
+        (event.logicalKey == LogicalKeyboardKey.arrowLeft ||
+            event.logicalKey == LogicalKeyboardKey.arrowRight)) {
       return false;
     }
     final keys = HardwareKeyboard.instance;
@@ -1241,14 +1252,17 @@ class _PlatesScreenState extends State<PlatesScreen> {
   /// on that read's short plate-hit clip; a read with no event has no clip, so
   /// it falls back to the Playback timeline hand-off directly (the previous
   /// row-click behavior).
-  void _openRead(PlateRead read) {
+  void _openRead(PlateRead read, {Duration? position}) {
     _hideLoupe();
     final eventId = read.eventId;
     if (eventId == null || eventId.isEmpty) {
       widget.onViewFootage(read.cameraId, read.ts);
       return;
     }
-    setState(() => _playing = read);
+    setState(() {
+      _playing = read;
+      _playingAt = position;
+    });
   }
 
   /// Open the single-plate report builder for [read] (OpenALPR-style: case
@@ -1331,6 +1345,7 @@ class _PlatesScreenState extends State<PlatesScreen> {
                 api: widget.api,
                 session: widget.session,
                 read: playing,
+                initialPosition: _playingAt,
                 cameraName:
                     byId[playing.cameraId]?.name ?? '(unknown camera)',
                 imageMode: PlateImageDisplay.both,
@@ -2784,6 +2799,7 @@ class _PlateClipPlayer extends StatefulWidget {
     required this.api,
     required this.session,
     required this.read,
+    this.initialPosition,
     required this.cameraName,
     required this.imageMode,
     required this.cropSize,
@@ -2797,6 +2813,9 @@ class _PlateClipPlayer extends StatefulWidget {
   final CrumbApi api;
   final Session session;
   final PlateRead read;
+
+  /// Seek here once the clip has loaded (the profile's full-screen hand-off).
+  final Duration? initialPosition;
   final String cameraName;
 
   /// Operator's plate-image preference — hides the prominent plate crop above
@@ -2821,7 +2840,12 @@ class _PlateClipPlayer extends StatefulWidget {
 }
 
 class _PlateClipPlayerState extends State<_PlateClipPlayer> {
+  /// Open pop-ups; the profile's inline player stands its shortcuts down while
+  /// this is non-zero so Space etc. act on the pop-up only.
+  static int openCount = 0;
+
   Player? _player;
+  MediaKitClipTransport? _transport;
   VideoController? _controller;
   int _loadAttempt = 0;
   Timer? _watchdog;
@@ -2834,9 +2858,6 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
   // clip has exactly these two renditions (there is no live "Auto" to pick).
   String _quality = 'preview';
   bool _qualityBusy = false;
-  // Drives the custom transport bar's play/pause icon (issue #143): we render
-  // our own minimal controls, not media_kit's native overlay.
-  bool _playing = false;
   // Latches true once the clip has ever started playing. The cold-load watchdog
   // must only retry a stalled INITIAL load — once playback has begun, a paused
   // state is the user pausing (or a seek/frame-step), NOT a stall, so the
@@ -2849,6 +2870,7 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
     // Esc closes the pop-up regardless of which node holds keyboard focus — a
     // HardwareKeyboard handler fires for every key event, independent of the
     // focus chain (same rationale as the Clips clip player's _onKeyEvent).
+    openCount++;
     HardwareKeyboard.instance.addHandler(_onKeyEvent);
     unawaited(_open(resetAttempt: true));
   }
@@ -2881,6 +2903,11 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
       if (text.isEmpty) return false;
       unawaited(copyPlateToClipboard(context, text));
       return true;
+    }
+    // Shared clip shortcuts (Space, Left / Right, `,` `.`).
+    final t = _transport;
+    if (t != null && !hotkeyContextBlocked(context)) {
+      return handleClipTransportKey(event, t);
     }
     return false;
   }
@@ -2977,7 +3004,6 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
           _everPlayed = true;
           _watchdog?.cancel();
         }
-        if (mounted) setState(() => _playing = playing);
       });
       // Rebuild once the video's dimensions are known so the pane can
       // shrink-wrap the video's aspect — the dark space around it is then
@@ -2990,9 +3016,11 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
         if (h != null && h > 0 && mounted) setState(() {});
       });
       final controller = VideoController(player);
+      final transport = MediaKitClipTransport(player);
       setState(() {
         _player = player;
         _controller = controller;
+        _transport = transport;
       });
     }
     // The property-setting loop above awaits — the overlay can be closed
@@ -3003,6 +3031,18 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
     await player.open(Media(url));
     await player.play();
     _armWatchdog();
+    final at = widget.initialPosition;
+    if (at != null && at > Duration.zero) {
+      // Seeking before the demuxer reports a duration is dropped; wait for it.
+      try {
+        await player.stream.duration
+            .firstWhere((d) => d > Duration.zero)
+            .timeout(const Duration(seconds: 8));
+        if (mounted) await player.seek(at);
+      } catch (_) {
+        // Non-fatal: the clip just starts from the beginning.
+      }
+    }
   }
 
   /// A cold plate-hit clip is transcoded on demand, so a slow first load is
@@ -3043,7 +3083,9 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
 
   @override
   void dispose() {
+    openCount--;
     HardwareKeyboard.instance.removeHandler(_onKeyEvent);
+    _transport?.dispose();
     _watchdog?.cancel();
     _playingSub?.cancel();
     _widthSub?.cancel();
@@ -3086,7 +3128,18 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
         // Our own minimal transport (issue #143): restart + frame-step +
         // play/pause, directly under the video. Native media_kit controls are
         // suppressed via NoVideoControls.
-        transport: (_error == null && _controller != null) ? _buildTransport() : null,
+        transport: (_error == null && _transport != null)
+            ? Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 900),
+                  child: ClipControls(
+                    transport: _transport!,
+                    wallStart: widget.read.ts.subtract(kPlateClipLead),
+                    markAt: kPlateClipLead,
+                  ),
+                ),
+              )
+            : null,
         // Primary actions live in a row under the transport (the shell lays
         // them out); the title bar keeps just the plate label and the X.
         actions: [
@@ -3158,92 +3211,6 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
       return AspectRatio(aspectRatio: vw / vh, child: video);
     }
     return video;
-  }
-
-  /// Minimal control bar: back-to-start and play/pause, driven by the player.
-  ///
-  /// Step the clip by exactly one frame, using libmpv's native `frame-step` /
-  /// `frame-back-step` through the media_kit [NativePlayer] command channel —
-  /// the same commands the playback transport uses (see
-  /// `playback_transport_controller.dart`). Frame-exact in BOTH directions.
-  ///
-  /// Do NOT "simplify" this back to a `position ± 1000/fps` seek: mpv resolves
-  /// a backward seek to the nearest KEYFRAME, so a seek-based back-step keeps
-  /// snapping to the same keyframe and the button appears dead while forward
-  /// works. That was this popup's bug (#390) — the identical failure the
-  /// playback transport had already hit and fixed. The fps seek survives only
-  /// as the fallback for a non-native platform (never the case on desktop).
-  Future<void> _stepFrame(bool forward) async {
-    final p = _player;
-    if (p == null) return;
-    await p.pause();
-    try {
-      final platform = p.platform;
-      if (platform is NativePlayer) {
-        // Frame-exact native step (mpv pauses itself on step, matching the
-        // explicit pause above).
-        await platform.command([forward ? 'frame-step' : 'frame-back-step']);
-        return;
-      }
-      const frame = Duration(milliseconds: 33);
-      final pos = p.state.position;
-      var target = forward ? pos + frame : pos - frame;
-      if (target < Duration.zero) target = Duration.zero;
-      await p.seek(target);
-    } catch (_) {
-      // Non-fatal — a disposed player must not throw out of a tap handler.
-    }
-  }
-
-  Widget _buildTransport() {
-    return Padding(
-      padding: const EdgeInsets.only(top: 8),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          IconButton(
-            tooltip: 'Back to start',
-            onPressed: () {
-              final p = _player;
-              if (p == null) return;
-              p.seek(Duration.zero);
-              p.play();
-            },
-            icon: const Icon(Icons.replay, color: Colors.white70, size: 24),
-          ),
-          const SizedBox(width: 8),
-          IconButton(
-            tooltip: 'Back one frame',
-            onPressed: () => unawaited(_stepFrame(false)),
-            icon: const Icon(Icons.navigate_before,
-                color: Colors.white70, size: 26),
-          ),
-          IconButton(
-            tooltip: _playing ? 'Pause' : 'Play',
-            onPressed: () {
-              final p = _player;
-              if (p == null) return;
-              if (p.state.playing) {
-                p.pause();
-              } else {
-                p.play();
-              }
-            },
-            icon: Icon(
-              _playing ? Icons.pause : Icons.play_arrow,
-              color: Colors.white,
-              size: 28,
-            ),
-          ),
-          IconButton(
-            tooltip: 'Forward one frame',
-            onPressed: () => unawaited(_stepFrame(true)),
-            icon: const Icon(Icons.navigate_next,
-                color: Colors.white70, size: 26),
-          ),
-        ],
-      ),
-    );
   }
 }
 
