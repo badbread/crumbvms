@@ -1,5 +1,5 @@
 // Persisted client-side preference: the Plates screen's last view mode
-// (List / Gallery / Grouped-by-plate / Timeline feed). Restoring it means a
+// (List / Gallery / Grouped-by-plate). Restoring it means a
 // tab switch or a fresh app launch reopens the plate browser in the layout the
 // operator left, instead of resetting to the dense list every time.
 //
@@ -15,7 +15,9 @@ import 'package:crumb_desktop/ui/plates/plate_desk_logic.dart';
 
 /// The four Plates layouts. Stored by [name] so adding a mode never renumbers
 /// an existing persisted value.
-enum PlatesViewMode { list, gallery, grouped, timeline }
+// "timeline" (a large-row feed) was dropped: it duplicated List. A saved
+// "timeline" falls back to List in getViewMode.
+enum PlatesViewMode { list, gallery, grouped }
 
 /// Gallery cards: show the plate crop as an inset over the frame ([both]) or
 /// the frame alone ([fullOnly]). Stored by [name]. The list no longer reads
@@ -44,6 +46,7 @@ class PlatesPrefs {
   static const String _kShowWatchlist = 'crumb_plates_show_watchlist';
   static const String _kDensity = 'crumb_plates_density';
   static const String _kGroupByPlate = 'crumb_plates_group_by_plate';
+  static const String _kHideRegulars = 'crumb_plates_hide_regulars';
   static const String _kGridLoupe = 'crumb_plates_grid_loupe';
   static const String _kGridTall = 'crumb_plates_grid_tall';
 
@@ -231,6 +234,26 @@ class PlatesPrefs {
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool(_kGroupByPlate, on);
+    } catch (_) {
+      /* best-effort persistence */
+    }
+  }
+
+  /// Whether reads of known regulars are hidden from the views. Defaults to
+  /// false.
+  static Future<bool> getHideRegulars() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getBool(_kHideRegulars) ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<void> setHideRegulars(bool on) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_kHideRegulars, on);
     } catch (_) {
       /* best-effort persistence */
     }

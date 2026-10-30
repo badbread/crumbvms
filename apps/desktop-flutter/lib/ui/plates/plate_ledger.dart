@@ -379,7 +379,7 @@ class _DensityToggle extends StatelessWidget {
         child: InkWell(
           onTap: () => onChanged(d),
           child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
             color: on ? _kPink : _kSurface2,
             child: Text(
               label,
@@ -1147,10 +1147,19 @@ class _CropCellState extends State<_CropCell> {
     final crop = _crop;
     Widget child;
     if (crop != null) {
-      child = Container(
-        color: Colors.black,
-        alignment: Alignment.center,
-        child: Image.memory(crop, fit: BoxFit.contain, gaplessPlayback: true),
+      // Fill the cell. A centred Container gave the image loose constraints,
+      // so it drew at the crop's native size (often ~60 px wide) in the
+      // middle of a big black box.
+      child = ColoredBox(
+        color: _kSurface0,
+        child: SizedBox.expand(
+          child: Image.memory(
+            crop,
+            fit: BoxFit.contain,
+            filterQuality: FilterQuality.medium,
+            gaplessPlayback: true,
+          ),
+        ),
       );
     } else if (_failed) {
       child = _PlateTile(plate: widget.read.plate, height: widget.height);
@@ -1179,29 +1188,37 @@ class _CropCellState extends State<_CropCell> {
 
 /// A plate-looking tile with the plate text, for reads without a crop.
 class _PlateTile extends StatelessWidget {
-  const _PlateTile({required this.plate, required this.height});
+  const _PlateTile({
+    required this.plate,
+    required this.height,
+    this.selectable = false,
+  });
 
   final String plate;
   final double height;
 
+  /// Lets the text be drag-selected and copied (the profile's hero plate).
+  final bool selectable;
+
   @override
   Widget build(BuildContext context) {
+    final text = plate.isEmpty ? '-' : plate;
+    final style = TextStyle(
+      color: const Color(0xFF1D2B63),
+      fontSize: (height * 0.42).clamp(9, 40).toDouble(),
+      fontWeight: FontWeight.w800,
+      letterSpacing: 1.2,
+      fontFamily: 'monospace',
+    );
     return Container(
       color: const Color(0xFFF6F5EF),
       alignment: Alignment.center,
       padding: const EdgeInsets.symmetric(horizontal: 4),
       child: FittedBox(
         fit: BoxFit.scaleDown,
-        child: Text(
-          plate.isEmpty ? '-' : plate,
-          style: TextStyle(
-            color: const Color(0xFF1D2B63),
-            fontSize: (height * 0.42).clamp(9, 40).toDouble(),
-            fontWeight: FontWeight.w800,
-            letterSpacing: 1.2,
-            fontFamily: 'monospace',
-          ),
-        ),
+        child: selectable
+            ? SelectableText(text, style: style, maxLines: 1)
+            : Text(text, style: style),
       ),
     );
   }

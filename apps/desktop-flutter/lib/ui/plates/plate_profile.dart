@@ -14,6 +14,14 @@ part of 'plates_screen.dart';
 /// Visits list: the newest reads of the plate fetched for the profile.
 const _profileReadLimit = 200;
 
+/// Main-column width from which the visits list sits beside the hero video.
+const _profileSideBySideMin = 1100.0;
+const _profileVisitsMinW = 320.0;
+const _profileVisitsMaxW = 380.0;
+
+/// Height of the caption bar under the hero video.
+const _profileCaptionH = 32.0;
+
 /// Most visits drawn in the profile.
 const _profileMaxVisits = 40;
 
@@ -74,6 +82,11 @@ class _PlateProfileState extends State<_PlateProfile> {
   bool _loading = true;
   String? _error;
 
+  /// The read whose clip the hero player shows: starts as the read the profile
+  /// was opened from, then follows the visit row the operator clicks.
+  late PlateRead _selected = widget.focus;
+  final ScrollController _scroll = ScrollController();
+
   String get _plate => widget.focus.plate;
 
   @override
@@ -85,7 +98,28 @@ class _PlateProfileState extends State<_PlateProfile> {
   @override
   void didUpdateWidget(_PlateProfile old) {
     super.didUpdateWidget(old);
-    if (old.focus.plate != widget.focus.plate) _loadVisits();
+    if (old.focus.plate != widget.focus.plate) {
+      _selected = widget.focus;
+      _loadVisits();
+    }
+  }
+
+  @override
+  void dispose() {
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  /// A visit row was clicked: play that visit's best read in the hero player.
+  void _selectRead(PlateRead r) {
+    setState(() => _selected = r);
+    if (_scroll.hasClients) {
+      _scroll.animateTo(
+        0,
+        duration: const Duration(milliseconds: 250),
+        curve: Curves.easeOut,
+      );
+    }
   }
 
   Future<void> _loadVisits() async {
@@ -125,20 +159,107 @@ class _PlateProfileState extends State<_PlateProfile> {
 
   @override
   Widget build(BuildContext context) {
-    return Material(
-      color: _kSurface0,
+    // The mouse's Back button returns to the list, like Esc.
+    return Listener(
+      onPointerDown: (e) {
+        if (e.buttons & kBackMouseButton != 0) widget.onClose();
+      },
+      child: Material(
+        color: _kSurface0,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            _header(),
+            Expanded(
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  SizedBox(width: 290, child: _aside(context)),
+                  const VerticalDivider(width: 1, color: _kSurface2),
+                  Expanded(child: _main(context)),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// The screen's title bar: a filled Back button, where you are, and how to
+  /// get back. It replaces the list's controls so the profile can't be
+  /// mistaken for part of the list.
+  Widget _header() {
+    final name = widget.displayName?.trim() ?? '';
+    return Container(
+      height: 54,
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      decoration: const BoxDecoration(
+        color: Color(0xFF262A33),
+        border: Border(bottom: BorderSide(color: _kPink, width: 2)),
+      ),
       child: Row(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          SizedBox(width: 290, child: _aside(context)),
-          const VerticalDivider(width: 1, color: _kSurface2),
-          Expanded(child: _main(context)),
+          FilledButton.icon(
+            onPressed: widget.onClose,
+            icon: const Icon(Icons.arrow_back, size: 18),
+            label: const Text('Back to plates'),
+            style: FilledButton.styleFrom(
+              backgroundColor: _kPink,
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            ),
+          ),
+          const SizedBox(width: 18),
+          const Text(
+            'Plate profile',
+            style: TextStyle(color: Colors.white54, fontSize: 13),
+          ),
+          const Icon(Icons.chevron_right, color: Colors.white38, size: 18),
+          Expanded(
+            child: Text(
+              name.isEmpty ? _plate : '$_plate  ·  $name',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 15,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+          const Flexible(
+            child: Text(
+              'Esc or mouse Back to return',
+              maxLines: 1,
+              overflow: TextOverflow.fade,
+              softWrap: false,
+              style: TextStyle(color: Colors.white38, fontSize: 12),
+            ),
+          ),
+          const SizedBox(width: 6),
         ],
       ),
     );
   }
 
   // ── left column ──────────────────────────────────────────────────────────
+
+  void _copyPlate(BuildContext context) {
+    final plate = _plate;
+    if (plate.isEmpty) return;
+    Clipboard.setData(ClipboardData(text: plate));
+    ScaffoldMessenger.maybeOf(context)
+      ?..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text('Copied $plate'),
+          duration: const Duration(seconds: 2),
+          behavior: SnackBarBehavior.floating,
+          width: 220,
+        ),
+      );
+  }
 
   Widget _aside(BuildContext context) {
     final s = widget.stats;
@@ -194,34 +315,41 @@ class _PlateProfileState extends State<_PlateProfile> {
     return Container(
       color: _kSurface1,
       child: ListView(
-        padding: const EdgeInsets.fromLTRB(18, 10, 18, 18),
+        padding: const EdgeInsets.fromLTRB(18, 16, 18, 18),
         children: [
-          Align(
-            alignment: Alignment.centerLeft,
-            child: TextButton.icon(
-              onPressed: widget.onClose,
-              icon: const Icon(Icons.arrow_back, size: 16),
-              label: const Text('Back to plates (Esc)'),
-              style: TextButton.styleFrom(foregroundColor: Colors.white54),
-            ),
-          ),
-          const SizedBox(height: 6),
-          ClipRRect(
-            borderRadius: BorderRadius.circular(8),
-            child: SizedBox(
-              height: 78,
-              child: _PlateTile(plate: _plate, height: 78),
+          // Click to copy the plate (the text is also selectable).
+          Tooltip(
+            message: 'Click to copy',
+            child: MouseRegion(
+              cursor: SystemMouseCursors.click,
+              child: GestureDetector(
+                onTap: () => _copyPlate(context),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: SizedBox(
+                    height: 78,
+                    child: _PlateTile(
+                      plate: _plate,
+                      height: 78,
+                      selectable: true,
+                    ),
+                  ),
+                ),
+              ),
             ),
           ),
           if (crop != null) ...[
             const SizedBox(height: 8),
+            // The crop at the column's full width in its own shape: a fixed
+            // black box letterboxed it into a small strip with wide bars.
             ClipRRect(
               borderRadius: BorderRadius.circular(6),
-              child: Container(
-                color: Colors.black,
-                height: 74,
-                alignment: Alignment.center,
-                child: Image.memory(crop, fit: BoxFit.contain),
+              child: Image.memory(
+                crop,
+                width: double.infinity,
+                fit: BoxFit.fitWidth,
+                filterQuality: FilterQuality.medium,
+                gaplessPlayback: true,
               ),
             ),
           ],
@@ -305,14 +433,14 @@ class _PlateProfileState extends State<_PlateProfile> {
               if (read.eventId != null && read.eventId!.isNotEmpty)
                 _ProfileButton(
                   icon: Icons.play_arrow,
-                  label: 'Play clip',
+                  label: 'Full-screen clip',
                   primary: true,
-                  onTap: () => widget.onPlay(read),
+                  onTap: () => widget.onPlay(_selected),
                 ),
               _ProfileButton(
                 icon: Icons.timeline,
                 label: 'View on timeline',
-                onTap: () => widget.onTimeline(read),
+                onTap: () => widget.onTimeline(_selected),
               ),
               if (plateCopyText(read).isNotEmpty)
                 _ProfileButton(
@@ -343,18 +471,24 @@ class _PlateProfileState extends State<_PlateProfile> {
     return LayoutBuilder(
       builder: (context, c) {
         final wide = c.maxWidth >= 640;
+        // Wide screens: the visits list sits beside the hero video instead of
+        // below the stats, so the video needs no letterbox bars.
+        final side = c.maxWidth >= _profileSideBySideMin;
+        final avail = c.maxWidth - 44;
         final left = <Widget>[
           _card('Last 30 days', _daysStrip(s)),
           _card('Cameras', _cameraBreakdown(s)),
         ];
         final clock = _card('Hour of day', _clock(s));
         return ListView(
+          controller: _scroll,
           padding: const EdgeInsets.fromLTRB(22, 18, 22, 22),
           children: [
+            if (side) _heroRow(avail, c.maxHeight, s) else _hero(avail),
             if (summary != null && summary.isNotEmpty)
               Container(
-                margin: const EdgeInsets.only(bottom: 14),
-                padding: const EdgeInsets.fromLTRB(14, 10, 14, 10),
+                margin: const EdgeInsets.only(bottom: 12),
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
                 decoration: BoxDecoration(
                   color: _kPink.withValues(alpha: 0.12),
                   border: const Border(
@@ -367,7 +501,7 @@ class _PlateProfileState extends State<_PlateProfile> {
                 ),
                 child: Text(
                   summary,
-                  style: const TextStyle(color: Colors.white, fontSize: 13.5),
+                  style: const TextStyle(color: Colors.white, fontSize: 12.5),
                 ),
               ),
             if (s == null && widget.statsUnsupported)
@@ -392,10 +526,138 @@ class _PlateProfileState extends State<_PlateProfile> {
               ...left,
               clock,
             ],
-            _card('Recent visits', _visitsList(s)),
+            if (!side)
+              _card(
+                'Recent visits (click one to play it above)',
+                _visitsList(s),
+              ),
           ],
         );
       },
+    );
+  }
+
+  /// Wide layout: the clip at its own 16:9 (no black side bars) with the
+  /// visits panel to its right, the same height, scrolling internally.
+  Widget _heroRow(double avail, double maxHeight, PlateStats? s) {
+    const gap = 14.0;
+    final budget = (maxHeight.isFinite ? maxHeight * 0.58 : 460.0).clamp(
+      260.0,
+      560.0,
+    );
+    var videoW = budget * 16 / 9;
+    final maxVideoW = avail - gap - _profileVisitsMinW;
+    if (videoW > maxVideoW) videoW = maxVideoW;
+    final videoH = videoW * 9 / 16;
+    final panelW = (avail - videoW - gap).clamp(
+      _profileVisitsMinW,
+      _profileVisitsMaxW,
+    );
+    final totalH = videoH + _profileCaptionH + 2;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 14),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: videoW,
+            child: _hero(videoW, videoHeight: videoH, bottomMargin: 0),
+          ),
+          const SizedBox(width: gap),
+          Container(
+            key: const ValueKey('profile-visits'),
+            width: panelW,
+            height: totalH,
+            padding: const EdgeInsets.fromLTRB(14, 14, 8, 8),
+            decoration: BoxDecoration(
+              color: _kSurface1,
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text(
+                  'RECENT VISITS',
+                  style: TextStyle(
+                    color: Colors.white38,
+                    fontSize: 11,
+                    letterSpacing: 0.6,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Expanded(
+                  child: SingleChildScrollView(
+                    padding: const EdgeInsets.only(right: 6),
+                    child: _visitsList(s),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// The hero: the selected read's clip, large, at the top of the column.
+  Widget _hero(double width, {double? videoHeight, double bottomMargin = 14}) {
+    final r = _selected;
+    final hasClip = r.eventId != null && r.eventId!.isNotEmpty;
+    final h = videoHeight ?? (width * 9 / 16).clamp(180.0, 480.0);
+    final now = DateTime.now();
+    return Container(
+      key: const ValueKey('profile-hero'),
+      margin: EdgeInsets.only(bottom: bottomMargin),
+      decoration: BoxDecoration(
+        color: Colors.black,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: _kSurface2),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          SizedBox(
+            height: h,
+            child: hasClip
+                ? _InlineClip(
+                    key: ValueKey('inline:${r.id}'),
+                    api: widget.api,
+                    session: widget.session,
+                    read: r,
+                  )
+                : Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Text(
+                          'No clip for this read.',
+                          style: TextStyle(color: Colors.white54),
+                        ),
+                        const SizedBox(height: 8),
+                        _ProfileButton(
+                          icon: Icons.timeline,
+                          label: 'View on timeline',
+                          onTap: () => widget.onTimeline(r),
+                        ),
+                      ],
+                    ),
+                  ),
+          ),
+          Container(
+            color: _kSurface1,
+            height: _profileCaptionH,
+            alignment: Alignment.centerLeft,
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            child: Text(
+              '${widget.camName(r.cameraId)}  ·  ${_fmtWhen(r.ts, now)}',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: Colors.white70, fontSize: 12),
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -430,36 +692,7 @@ class _PlateProfileState extends State<_PlateProfile> {
 
   Widget _daysStrip(PlateStats? s) {
     if (s == null) return _empty(widget.statsUnsupported ? '-' : 'Loading...');
-    final now = DateTime.now();
-    final first = now.subtract(const Duration(days: 29));
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        SizedBox(
-          height: 64,
-          child: CustomPaint(painter: _DayBarsPainter(s.days30)),
-        ),
-        const SizedBox(height: 4),
-        Row(
-          children: [
-            Text(
-              fmtShortDate(first, now),
-              style: const TextStyle(color: Colors.white24, fontSize: 10),
-            ),
-            const Spacer(),
-            Text(
-              '${s.seen30d} reads',
-              style: const TextStyle(color: Colors.white38, fontSize: 10),
-            ),
-            const Spacer(),
-            const Text(
-              'today',
-              style: TextStyle(color: Colors.white24, fontSize: 10),
-            ),
-          ],
-        ),
-      ],
-    );
+    return _DayBarsChart(days: s.days30, total: s.seen30d);
   }
 
   Widget _cameraBreakdown(PlateStats? s) {
@@ -520,26 +753,9 @@ class _PlateProfileState extends State<_PlateProfile> {
     if (s == null) return _empty(widget.statsUnsupported ? '-' : 'Loading...');
     final focusHour = widget.focus.ts.toLocal().hour;
     final unusual = isUnusualHour(s.hours, focusHour);
-    final (peak, peakN) = busiestHours(s.hours, 1);
     return Column(
       children: [
-        SizedBox(
-          width: 200,
-          height: 200,
-          child: CustomPaint(
-            painter: _RadialClockPainter(
-              s.hours,
-              highlight: unusual ? focusHour : null,
-            ),
-          ),
-        ),
-        const SizedBox(height: 6),
-        Text(
-          peakN == 0
-              ? 'Midnight at the top'
-              : 'Peak ${fmtHour(peak)}  ·  midnight at the top',
-          style: const TextStyle(color: Colors.white38, fontSize: 11),
-        ),
+        _HourClock(hours: s.hours, highlight: unusual ? focusHour : null),
         if (unusual)
           const Padding(
             padding: EdgeInsets.only(top: 4),
@@ -596,12 +812,20 @@ class _PlateProfileState extends State<_PlateProfile> {
         ? ''
         : ', ${(v.bestConfidence! * 100).round()}%';
     final hasClip = best.eventId != null && best.eventId!.isNotEmpty;
+    final playing = v.reads.any((r) => r.id == _selected.id);
     return InkWell(
-      onTap: () => hasClip ? widget.onPlay(best) : widget.onTimeline(best),
+      onTap: () => hasClip ? _selectRead(best) : widget.onTimeline(best),
       child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 6),
-        decoration: const BoxDecoration(
-          border: Border(top: BorderSide(color: _kSurface2)),
+        padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 6),
+        decoration: BoxDecoration(
+          color: playing ? _kPink.withValues(alpha: 0.14) : null,
+          border: Border(
+            top: const BorderSide(color: _kSurface2),
+            left: BorderSide(
+              color: playing ? _kPink : Colors.transparent,
+              width: 3,
+            ),
+          ),
         ),
         child: Row(
           children: [
@@ -629,11 +853,13 @@ class _PlateProfileState extends State<_PlateProfile> {
               ]),
             ),
             Tooltip(
-              message: hasClip ? 'Play clip' : 'View on timeline',
+              message: hasClip ? 'Play above' : 'View on timeline',
               child: Icon(
-                hasClip ? Icons.play_circle_outline : Icons.timeline,
+                hasClip
+                    ? (playing ? Icons.play_circle : Icons.play_circle_outline)
+                    : Icons.timeline,
                 size: 18,
-                color: Colors.white38,
+                color: playing ? _kPink : Colors.white38,
               ),
             ),
           ],
@@ -698,110 +924,6 @@ class _ProfileButton extends StatelessWidget {
   }
 }
 
-// ─── painters ──────────────────────────────────────────────────────────────
-
-/// 30 daily bars, oldest left; today is the solid one.
-class _DayBarsPainter extends CustomPainter {
-  _DayBarsPainter(this.days);
-
-  final List<int> days;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    if (days.isEmpty) return;
-    final maxV = days.fold<int>(1, (a, b) => b > a ? b : a);
-    final slot = size.width / days.length;
-    final w = (slot * 0.78).clamp(1.0, 24.0);
-    for (var i = 0; i < days.length; i++) {
-      final v = days[i];
-      final h = v == 0 ? 2.0 : 3 + (size.height - 3) * v / maxV;
-      final isToday = i == days.length - 1;
-      canvas.drawRRect(
-        RRect.fromRectAndRadius(
-          Rect.fromLTWH(i * slot + (slot - w) / 2, size.height - h, w, h),
-          const Radius.circular(2),
-        ),
-        Paint()
-          ..color = v == 0
-              ? _kSurface2
-              : isToday
-              ? _kPink
-              : _kPink.withValues(alpha: 0.45),
-      );
-    }
-  }
-
-  @override
-  bool shouldRepaint(_DayBarsPainter old) => !listEquals(old.days, days);
-}
-
-/// The 24-hour "clock": one wedge per hour, midnight at the top, longer and
-/// brighter for busier hours. [highlight] draws that hour in amber.
-class _RadialClockPainter extends CustomPainter {
-  _RadialClockPainter(this.hours, {this.highlight});
-
-  final List<int> hours;
-  final int? highlight;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final c = size.center(Offset.zero);
-    final r = size.shortestSide / 2;
-    final inner = r * 0.36;
-    final span = r - inner - 4;
-    final maxV = hours.fold<int>(1, (a, b) => b > a ? b : a);
-    canvas.drawCircle(c, inner - 4, Paint()..color = _kSurface0);
-    const sweep = 2 * math.pi / 24;
-    for (var h = 0; h < 24 && h < hours.length; h++) {
-      final v = hours[h];
-      final outer = inner + (v == 0 ? 2 : 4 + (span - 4) * v / maxV);
-      final start = -math.pi / 2 + h * sweep + 0.02;
-      final path = Path()
-        ..arcTo(
-          Rect.fromCircle(center: c, radius: outer),
-          start,
-          sweep - 0.04,
-          true,
-        )
-        ..arcTo(
-          Rect.fromCircle(center: c, radius: inner),
-          start + sweep - 0.04,
-          -(sweep - 0.04),
-          false,
-        )
-        ..close();
-      final isHi = h == highlight;
-      final alpha = v == 0 ? 0.12 : 0.35 + 0.65 * v / maxV;
-      canvas.drawPath(
-        path,
-        Paint()
-          ..color = (isHi ? _kAmber : _kPink).withValues(
-            alpha: isHi ? 1 : alpha,
-          ),
-      );
-    }
-    final tp = TextPainter(textDirection: TextDirection.ltr);
-    void label(String text, double angle) {
-      tp.text = TextSpan(
-        text: text,
-        style: const TextStyle(color: Colors.white38, fontSize: 9),
-      );
-      tp.layout();
-      final p = c + Offset(math.cos(angle), math.sin(angle)) * (inner - 14);
-      tp.paint(canvas, p - Offset(tp.width / 2, tp.height / 2));
-    }
-
-    label('0', -math.pi / 2);
-    label('6', 0);
-    label('12', math.pi / 2);
-    label('18', math.pi);
-  }
-
-  @override
-  bool shouldRepaint(_RadialClockPainter old) =>
-      old.highlight != highlight || !listEquals(old.hours, hours);
-}
-
 /// The profile at a given size with no server (the visits fetch fails fast
 /// under test), for layout tests.
 @visibleForTesting
@@ -839,4 +961,100 @@ Widget debugPlateProfile({
     onUnwatch: () {},
     onReport: (_) {},
   );
+}
+
+/// The profile's hero player: plays [read]'s detection clip inline (muted,
+/// autoplay, with media_kit's standard transport controls). Resolves the clip
+/// like the pop-up [_PlateClipPlayer]: `/clip/d:<event>/clip.mp4` on a scoped
+/// media `?token=`. Key it by the read so switching reads builds a fresh Video
+/// (media_kit binds the controller only in initState). Any failure to resolve
+/// or open (offline, tests) degrades to a text placeholder.
+class _InlineClip extends StatefulWidget {
+  const _InlineClip({
+    super.key,
+    required this.api,
+    required this.session,
+    required this.read,
+  });
+
+  final CrumbApi api;
+  final Session session;
+  final PlateRead read;
+
+  @override
+  State<_InlineClip> createState() => _InlineClipState();
+}
+
+class _InlineClipState extends State<_InlineClip> {
+  Player? _player;
+  VideoController? _controller;
+  String? _error;
+  bool _disposed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_open());
+  }
+
+  Future<void> _open() async {
+    try {
+      final id = Uri.encodeComponent('d:${widget.read.eventId}');
+      final url = await widget.api.mediaUrlForCamera(
+        widget.session,
+        widget.read.cameraId,
+        '/clip/$id/clip.mp4?q=preview',
+      );
+      if (_disposed || !mounted) return;
+      if (url == null) {
+        setState(() => _error = 'Could not authorize this clip.');
+        return;
+      }
+      final player = Player();
+      final controller = VideoController(player);
+      setState(() {
+        _player = player;
+        _controller = controller;
+      });
+      await player.setVolume(0);
+      await player.open(Media(url));
+      await player.play();
+    } catch (_) {
+      if (mounted && !_disposed) {
+        setState(() => _error = 'Clip unavailable.');
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    final p = _player;
+    if (p != null) {
+      // Dispose after the frame so the Video widget has let go of the
+      // controller first.
+      WidgetsBinding.instance.addPostFrameCallback((_) => p.dispose());
+    }
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_error != null) {
+      return Center(
+        child: Text(_error!, style: const TextStyle(color: Colors.white54)),
+      );
+    }
+    final c = _controller;
+    if (c == null) {
+      return const Center(
+        child: SizedBox(
+          width: 22,
+          height: 22,
+          child: CircularProgressIndicator(strokeWidth: 2),
+        ),
+      );
+    }
+    return Video(controller: c, fit: BoxFit.contain);
+  }
 }
