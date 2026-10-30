@@ -223,6 +223,25 @@ void main() {
       expect(expiredBookmarks(const []), isEmpty);
     });
 
+    test('expiredBookmarks never includes a protected bookmark', () {
+      final future = DateTime.now().add(const Duration(days: 3));
+      final protected = Bookmark.fromJson({
+        ..._bookmarkJson(expired: true),
+        'id': 'p1',
+        'protect_until': future.toUtc().toIso8601String(),
+      });
+      final lapsed = Bookmark.fromJson({
+        ..._bookmarkJson(expired: true),
+        'id': 'p2',
+        'protect_until': DateTime.now()
+            .subtract(const Duration(days: 1))
+            .toUtc()
+            .toIso8601String(),
+      });
+      expect(protected.isProtected, isTrue);
+      expect(expiredBookmarks([protected, lapsed]).map((x) => x.id), ['p2']);
+    });
+
     test('deleted message pluralises', () {
       expect(bookmarksDeletedMessage(1), 'Bookmark deleted');
       expect(bookmarksDeletedMessage(3), '3 bookmarks deleted');

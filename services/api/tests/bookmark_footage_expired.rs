@@ -171,6 +171,66 @@ async fn bookmark_footage_expired_distinguishes_retention_from_gaps() {
     assert_eq!(body_json(resp).await["footage_expired"], true);
 }
 
+/// A protected bookmark whose moment sits in a recording gap, with protected
+/// footage inside its window and older footage evicted, must NOT be flagged:
+/// "Remove expired" would delete the bookmark, lift the protection and let
+/// retention delete the footage that still exists.
+#[tokio::test]
+async fn protected_bookmark_with_footage_in_window_is_not_expired() {
+    let app = TestApp::new().await;
+    let storage = seed_storage(app.pool(), &format!("/tmp/{}", unique("bm-protected"))).await;
+    let cam = seed_camera(app.pool()).await;
+    let now = now_secs();
+    let ts = now - Duration::hours(1);
+
+    // Oldest remaining footage starts AFTER the bookmark moment but inside
+    // its default protect window [ts-60s, ts+300s]: motion-style gap at `ts`.
+    insert_segment(app.pool(), cam, storage, ts + Duration::seconds(20), 70).await;
+    insert_segment(app.pool(), cam, storage, now - Duration::minutes(10), 4).await;
+
+    let until = now + Duration::days(3);
+    let mk = |note: &'static str, t: DateTime<Utc>, pre: i64, post: i64| {
+        let pool = app.pool().clone();
+        async move {
+            db::create_bookmark(
+                &pool,
+                cam,
+                t,
+                Some(note),
+                None,
+                Some(until),
+                Some(t - Duration::seconds(pre)),
+                Some(t + Duration::seconds(post)),
+            )
+            .await
+            .expect("create_bookmark");
+        }
+    };
+    mk("protected-gap", ts, 60, 300).await;
+    // Positive: protected, but nothing overlaps its window and it predates
+    // the oldest footage: genuinely expired.
+    mk("protected-empty-window", now - Duration::hours(5), 60, 300).await;
+    // Unprotected twin of the gap case keeps the old (expired) verdict.
+    bookmark(app.pool(), cam, ts, "unprotected-gap").await;
+
+    let admin = seed_admin(app.pool()).await;
+    let token = login(&app, &admin.username, &admin.password).await;
+    let resp = app
+        .send(get_auth(&format!("/bookmarks?camera_id={cam}"), &token))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut got = expired_by_note(&body_json(resp).await);
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            ("protected-empty-window".to_owned(), true),
+            ("protected-gap".to_owned(), false),
+            ("unprotected-gap".to_owned(), true),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn cameras_list_reports_oldest_footage_ts() {
     let app = TestApp::new().await;
