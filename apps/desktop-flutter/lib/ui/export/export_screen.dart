@@ -27,6 +27,7 @@ import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/export_api.dart';
 import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/ui/folder_picker_dialog.dart';
+import 'package:crumb_desktop/ui/export/viewfinder_progress.dart';
 
 import 'export_builder_dialog.dart';
 import 'package:crumb_desktop/ui/motion/live_motion.dart';
@@ -74,6 +75,17 @@ class _ExportScreenState extends State<ExportScreen> {
   final _passwordCtrl = TextEditingController();
   bool _obscurePassword = true;
 
+  /// Bundle a multi-clip batch into one .zip, or save one file per clip.
+  /// A password always zips (the archive is what gets encrypted). Persisted
+  /// across launches via [_kExportZipKey].
+  bool _zip = true;
+  bool get _hasPassword => _passwordCtrl.text.isNotEmpty;
+
+  // ── size estimate (POST /export/estimate; heuristic fallback) ────────────
+  ExportEstimate? _serverEstimate;
+  Timer? _estimateDebounce;
+  int _estimateToken = 0;
+
   // ── destination folder (persisted across launches via [_kExportDirKey]) ──
   String? _destDir;
   final _destDirCtrl = TextEditingController();
@@ -90,6 +102,16 @@ class _ExportScreenState extends State<ExportScreen> {
   Timer? _pollTimer;
   DateTime? _earliestStart;
 
+  /// Download progress after the server finishes, e.g. "2 of 4 · 340 MB".
+  String? _downloadStatus;
+
+  // Real progress detail for the viewfinder (see viewfinder_progress.dart).
+  int _clipNo = 0;
+  int _clipCount = 0;
+  String _jobPhase = '';
+  int? _savePct;
+  String? _saveDetail;
+
   /// Wall-clock export timing: started when a job is submitted, ticked once a
   /// second while running so the UI shows LIVE elapsed time, and frozen when the
   /// job reaches a terminal state so the final "took Ns" is held on screen.
@@ -98,6 +120,7 @@ class _ExportScreenState extends State<ExportScreen> {
   Timer? _elapsedTicker;
 
   static const _kExportDirKey = 'crumb.export.dir';
+  static const _kExportZipKey = 'crumb.export.zip';
 
   void _startElapsedTicker() {
     _startedAt = DateTime.now();
@@ -125,24 +148,51 @@ class _ExportScreenState extends State<ExportScreen> {
       _list.addAll(widget.initialClips);
       _reflow.markSeen(widget.initialClips.map((c) => c.id));
       // Keep new ids above every seeded one so add/edit never collide.
-      _seq = widget.initialClips.map((c) => c.id).reduce((a, b) => a > b ? a : b);
+      _seq = widget.initialClips
+          .map((c) => c.id)
+          .reduce((a, b) => a > b ? a : b);
     }
     _restoreDestDir();
+    _refreshEstimate();
   }
 
-  /// Push the current batch up to the host so it survives a tab rebuild.
-  void _notifyChanged() => widget.onListChanged?.call(List.of(_list));
+  /// Push the current batch up to the host so it survives a tab rebuild, and
+  /// re-estimate its size.
+  void _notifyChanged() {
+    widget.onListChanged?.call(List.of(_list));
+    _refreshEstimate();
+  }
+
+  void _refreshEstimate() {
+    _estimateDebounce?.cancel();
+    final token = ++_estimateToken;
+    if (_list.isEmpty) {
+      if (_serverEstimate != null) setState(() => _serverEstimate = null);
+      return;
+    }
+    _estimateDebounce = Timer(const Duration(milliseconds: 300), () async {
+      final est = await widget.api.estimateExport(widget.session, [
+        for (final it in _list)
+          BatchExportItem(cameraId: it.cameraId, start: it.start, end: it.end),
+      ]);
+      if (!mounted || token != _estimateToken) return;
+      setState(() => _serverEstimate = est);
+    });
+  }
 
   Future<void> _restoreDestDir() async {
     try {
       final prefs = await SharedPreferences.getInstance();
       final dir = prefs.getString(_kExportDirKey);
-      if (dir != null && dir.isNotEmpty && mounted) {
-        setState(() {
+      final zip = prefs.getBool(_kExportZipKey);
+      if (!mounted) return;
+      setState(() {
+        if (dir != null && dir.isNotEmpty) {
           _destDir = dir;
           _destDirCtrl.text = dir;
-        });
-      }
+        }
+        if (zip != null) _zip = zip;
+      });
     } catch (_) {
       /* prefs unavailable */
     }
@@ -167,11 +217,21 @@ class _ExportScreenState extends State<ExportScreen> {
     }
   }
 
+  Future<void> _persistZip(bool zip) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_kExportZipKey, zip);
+    } catch (_) {
+      /* best-effort */
+    }
+  }
+
   @override
   void dispose() {
     _pollTimer?.cancel();
     _elapsedTicker?.cancel();
     _reflow.dispose();
+    _estimateDebounce?.cancel();
     _passwordCtrl.dispose();
     _destDirCtrl.dispose();
     super.dispose();
@@ -268,13 +328,19 @@ class _ExportScreenState extends State<ExportScreen> {
     _ => 0.05, // copy / remux
   };
 
-  /// Rough size estimate, scaled by codec. Heuristic ~10 Mbps main stream —
-  /// modern IP cameras (esp. the 4K/2K ones here) record far above the old
-  /// 4 Mbps assumption, which under-estimated a copy export by ~3x. Still only a
-  /// ballpark (real bitrate varies by camera/scene), hence the "~".
+  /// Size estimate, scaled by codec. Uses the server's sum of the recorded
+  /// segments the batch covers (exact for Copy, which passes them through);
+  /// the flat ~10 Mbps guess is only the fallback for a server without
+  /// `/export/estimate`; it came out 2.2x low on a real 4K export.
   String _estSize() {
-    final ms = _totalDuration.inMilliseconds;
-    final bytes = (ms / 1000) * 1250000 * _codecSizeFactor; // ~10 Mbps ≈ 1.25 MB/s
+    final est = _serverEstimate;
+    final double bytes;
+    if (est != null) {
+      bytes = est.bytes * _codecSizeFactor;
+    } else {
+      final ms = _totalDuration.inMilliseconds;
+      bytes = (ms / 1000) * 1250000 * _codecSizeFactor; // ~10 Mbps ≈ 1.25 MB/s
+    }
     if (bytes >= 1e9) return '~${(bytes / 1e9).toStringAsFixed(1)} GB';
     if (bytes >= 1e6) return '~${(bytes / 1e6).round()} MB';
     return '~${(bytes / 1e3).clamp(1, double.infinity).round()} KB';
@@ -407,6 +473,7 @@ class _ExportScreenState extends State<ExportScreen> {
         videoCodec: _videoCodec,
         container: _container,
         password: _passwordCtrl.text,
+        zip: _zip,
       );
       if (!mounted) return;
       setState(() {
@@ -452,6 +519,9 @@ class _ExportScreenState extends State<ExportScreen> {
       setState(() {
         _progressPct = job.progressPct.clamp(0, 100).toInt();
         _status = job.status;
+        _clipNo = job.currentClip;
+        _clipCount = job.clipCount;
+        _jobPhase = job.phase;
       });
 
       switch (job.status) {
@@ -494,23 +564,31 @@ class _ExportScreenState extends State<ExportScreen> {
     }
   }
 
-  String _friendlyFilename(ExportOutputFile file) {
-    final start = _earliestStart ?? DateTime.now();
-    final l = start.toLocal();
+  /// File name to save [file] under: the server's own name (camera name and
+  /// local date and times) when it sends one, else one built here. Made safe
+  /// for Windows whatever the source.
+  String _outputName(ExportOutputFile file) {
     String p2(int n) => n.toString().padLeft(2, '0');
-    final stamp = '${l.year}${p2(l.month)}${p2(l.day)}-${p2(l.hour)}${p2(l.minute)}';
-    if (file.isArchive) return 'crumb-export-$stamp.zip';
-    final ext = RegExp(
+    final server = file.downloadName;
+    if (server != null && server.trim().isNotEmpty) return safeFileName(server);
+    final now = DateTime.now();
+    final ext =
+        RegExp(
           r'\.([a-z0-9]+)$',
           caseSensitive: false,
         ).firstMatch(file.filename)?.group(1)?.toLowerCase() ??
         'mp4';
-    var name = _cameraName(file.cameraId).replaceAll(
-      RegExp(r'[^a-zA-Z0-9_-]'),
-      '_',
+    if (file.isArchive) {
+      return safeFileName(
+        'Crumb export ${now.year}-${p2(now.month)}-${p2(now.day)} '
+        '${p2(now.hour)}.${p2(now.minute)}.zip',
+      );
+    }
+    final l = (_earliestStart ?? now).toLocal();
+    return safeFileName(
+      '${_cameraName(file.cameraId)} ${l.year}-${p2(l.month)}-${p2(l.day)} '
+      '${p2(l.hour)}.${p2(l.minute)}.${p2(l.second)}.$ext',
     );
-    if (name.length > 40) name = name.substring(0, 40);
-    return 'crumb-$name-$stamp.$ext';
   }
 
   Future<void> _downloadAll(List<ExportOutputFile> files) async {
@@ -527,24 +605,44 @@ class _ExportScreenState extends State<ExportScreen> {
       return;
     }
     String? failure;
-    for (final file in files) {
+    var saved = 0;
+    for (final (i, file) in files.indexed) {
       try {
-        final bytes = await widget.api.downloadExportFile(
+        final path = uniquePath(destDir, _outputName(file));
+        await widget.api.downloadExportFileTo(
           widget.session,
           file,
+          path,
+          onProgress: (got, total) {
+            if (!mounted) return;
+            final of = files.length > 1 ? '${i + 1} of ${files.length} · ' : '';
+            final pct = total > 0 ? ' (${(got * 100 / total).round()}%)' : '';
+            setState(() {
+              _downloadStatus = 'Saving $of${_mb(got)}$pct';
+              _savePct = total > 0 ? (got * 100 / total).round() : null;
+              _saveDetail = [
+                if (files.length > 1) 'file ${i + 1} of ${files.length}',
+                total > 0 ? '${_mb(got)} of ${_mb(total)}' : _mb(got),
+              ].join(' · ');
+            });
+          },
         );
-        final path = '$destDir${Platform.pathSeparator}${_friendlyFilename(file)}';
-        await File(path).writeAsBytes(bytes);
+        saved++;
       } catch (e) {
-        failure = 'Download failed for ${file.filename}: $e';
+        failure = 'Download failed for ${_outputName(file)}: $e';
       }
     }
     if (!mounted) return;
     setState(() {
-      _completed = true;
+      _downloadStatus = null;
+      _completed = saved > 0;
       _error = failure;
     });
   }
+
+  static String _mb(int bytes) => bytes >= 1e9
+      ? '${(bytes / 1e9).toStringAsFixed(2)} GB'
+      : '${(bytes / 1e6).round()} MB';
 
   // ── build ──────────────────────────────────────────────────────────────
 
@@ -695,9 +793,7 @@ class _ExportScreenState extends State<ExportScreen> {
                   const SizedBox(height: 8),
                   DropdownButtonFormField<String>(
                     initialValue: _videoCodec,
-                    decoration: const InputDecoration(
-                      labelText: 'Video codec',
-                    ),
+                    decoration: const InputDecoration(labelText: 'Video codec'),
                     items: const [
                       DropdownMenuItem(
                         value: 'copy',
@@ -727,6 +823,45 @@ class _ExportScreenState extends State<ExportScreen> {
                       _clearCompletedState();
                     }),
                   ),
+                  const SizedBox(height: 12),
+                  Text('Save as', style: theme.textTheme.bodySmall),
+                  const SizedBox(height: 4),
+                  SegmentedButton<bool>(
+                    showSelectedIcon: false,
+                    segments: const [
+                      ButtonSegment(
+                        value: false,
+                        icon: Icon(Icons.movie_outlined, size: 16),
+                        label: Text('Separate files'),
+                      ),
+                      ButtonSegment(
+                        value: true,
+                        icon: Icon(Icons.folder_zip_outlined, size: 16),
+                        label: Text('One .zip'),
+                      ),
+                    ],
+                    // A password always produces an encrypted zip.
+                    selected: {_zip || _hasPassword},
+                    onSelectionChanged: _hasPassword
+                        ? null
+                        : (v) {
+                            setState(() {
+                              _zip = v.first;
+                              _clearCompletedState();
+                            });
+                            _persistZip(v.first);
+                          },
+                  ),
+                  if (_hasPassword)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 4),
+                      child: Text(
+                        'A password always saves one encrypted .zip.',
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.hintColor,
+                        ),
+                      ),
+                    ),
                   const SizedBox(height: 8),
                   TextField(
                     controller: _passwordCtrl,
@@ -745,7 +880,8 @@ class _ExportScreenState extends State<ExportScreen> {
                         ),
                       ),
                     ),
-                    onChanged: (_) => _clearCompletedState(),
+                    // Rebuild so the Save as toggle reflects the forced zip.
+                    onChanged: (_) => setState(_clearCompletedState),
                   ),
                   const SizedBox(height: 16),
                   const Divider(),
@@ -787,20 +923,15 @@ class _ExportScreenState extends State<ExportScreen> {
                   // takes over — the old code kept this block alive on `_status`
                   // and its bar fell back to INDETERMINATE (endless animation)
                   // even though the export was done.
-                  if (_submitting || _running) ...[
-                    LinearProgressIndicator(
-                      // Determinate while running so the bar tracks real progress;
-                      // only the brief submit handshake is indeterminate.
-                      value: _running ? _progressPct / 100 : null,
-                      minHeight: 4,
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      _submitting
-                          ? 'Submitting…'
-                          : '${_statusLabel(_status)} $_progressPct%'
-                                '  ·  ${_fmtDuration(_elapsed)} elapsed',
-                      style: theme.textTheme.bodySmall,
+                  if (_submitting ||
+                      _running ||
+                      _downloadStatus != null ||
+                      _completed) ...[
+                    ViewfinderProgress(
+                      phase: _viewfinderPhase(),
+                      percent: _viewfinderPercent(),
+                      detail: _viewfinderDetail(),
+                      elapsed: _elapsed,
                     ),
                     const SizedBox(height: 8),
                   ],
@@ -905,13 +1036,39 @@ class _ExportScreenState extends State<ExportScreen> {
     ),
   );
 
-  String _statusLabel(ExportJobStatus? s) => switch (s) {
-    ExportJobStatus.queued => 'Queued…',
-    ExportJobStatus.running => 'Exporting…',
-    ExportJobStatus.done => 'Complete',
-    ExportJobStatus.failed => 'Failed',
-    ExportJobStatus.cancelled => 'Cancelled',
-    null => '',
+  ViewfinderPhase _viewfinderPhase() {
+    if (_submitting) return ViewfinderPhase.submitting;
+    if (_downloadStatus != null) return ViewfinderPhase.saving;
+    if (_running) {
+      return _jobPhase == 'packaging'
+          ? ViewfinderPhase.packaging
+          : ViewfinderPhase.encoding;
+    }
+    if (_completed) return ViewfinderPhase.done;
+    return switch (_status) {
+      ExportJobStatus.failed => ViewfinderPhase.failed,
+      ExportJobStatus.cancelled => ViewfinderPhase.cancelled,
+      _ => ViewfinderPhase.done,
+    };
+  }
+
+  /// Only real numbers: ffmpeg progress while encoding, bytes while saving,
+  /// none while submitting or building the zip.
+  int? _viewfinderPercent() => switch (_viewfinderPhase()) {
+    ViewfinderPhase.encoding => _progressPct,
+    ViewfinderPhase.saving => _savePct,
+    ViewfinderPhase.done => 100,
+    _ => null,
+  };
+
+  String? _viewfinderDetail() => switch (_viewfinderPhase()) {
+    ViewfinderPhase.submitting => 'starting export',
+    ViewfinderPhase.encoding =>
+      _clipCount > 1 ? 'clip $_clipNo of $_clipCount' : 'encoding',
+    ViewfinderPhase.packaging => 'building zip',
+    ViewfinderPhase.saving => _saveDetail,
+    ViewfinderPhase.done => 'took ${_fmtDuration(_elapsed)}',
+    _ => null,
   };
 
   String _submitButtonLabel() {
@@ -977,10 +1134,7 @@ class _ClipRow extends StatelessWidget {
               mainAxisSize: MainAxisSize.min,
               children: [
                 Text(cameraName, overflow: TextOverflow.ellipsis),
-                Text(
-                  rangeLabel,
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
+                Text(rangeLabel, style: Theme.of(context).textTheme.bodySmall),
               ],
             ),
           ),
@@ -1058,5 +1212,45 @@ class _ClipThumbnailState extends State<_ClipThumbnail> {
         },
       ),
     );
+  }
+}
+
+final _reservedFileNames = {
+  'CON',
+  'PRN',
+  'AUX',
+  'NUL',
+  for (var i = 1; i <= 9; i++) ...['COM$i', 'LPT$i'],
+};
+
+/// [name] made safe as a single Windows/POSIX file name: path separators and
+/// other forbidden characters become `_`, trailing dots/spaces go, and a
+/// reserved device name gets a `_` prefix.
+@visibleForTesting
+String safeFileName(String name) {
+  var n = name
+      .replaceAll(RegExp(r'[<>:"/\\|?*\x00-\x1F]'), '_')
+      .replaceAll(RegExp(r'\s+'), ' ')
+      .trim()
+      .replaceAll(RegExp(r'[. ]+$'), '');
+  if (n.isEmpty) n = 'export';
+  final stem = n.split('.').first.toUpperCase();
+  if (_reservedFileNames.contains(stem)) n = '_$n';
+  return n;
+}
+
+/// `dir/name`, or `dir/name (2).ext`, `(3)`… if that already exists, so a
+/// new export never overwrites an earlier one.
+@visibleForTesting
+String uniquePath(String dir, String name) {
+  final sep = Platform.pathSeparator;
+  final base = dir.endsWith(sep) || dir.endsWith('/') ? dir : '$dir$sep';
+  if (!File('$base$name').existsSync()) return '$base$name';
+  final dot = name.lastIndexOf('.');
+  final stem = dot > 0 ? name.substring(0, dot) : name;
+  final ext = dot > 0 ? name.substring(dot) : '';
+  for (var i = 2; ; i++) {
+    final candidate = '$base$stem ($i)$ext';
+    if (!File(candidate).existsSync()) return candidate;
   }
 }
