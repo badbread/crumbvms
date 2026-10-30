@@ -1069,6 +1069,8 @@ class _WallScreenState extends State<WallScreen>
                     wallOrder: i,
                     audio: widget.audio,
                     showInfoBar: showInfoBar,
+                    infoBarOverlay:
+                        widget.clientOptions?.infoBarOverlay ?? false,
                     zoomToMain: widget.clientOptions?.zoomSwitchesToMain ?? false,
                     // Custom cells can be any aspect — letterbox, don't crop.
                     fit: BoxFit.contain,
@@ -1147,6 +1149,7 @@ class _WallScreenState extends State<WallScreen>
                 wallOrder: i,
                 audio: widget.audio,
                 showInfoBar: showInfoBar,
+                infoBarOverlay: widget.clientOptions?.infoBarOverlay ?? false,
                 zoomToMain: widget.clientOptions?.zoomSwitchesToMain ?? false,
                 // Cells rarely land on 16:9 once they fill the pane — letterbox
                 // rather than crop, matching _viewGrid and the old client.
@@ -1236,6 +1239,7 @@ class _WallTile extends StatefulWidget {
     required this.liveStatus,
     required this.showInfoBar,
     required this.onTap,
+    this.infoBarOverlay = false,
     this.streamPrefs,
     this.adaptive,
     this.wallOrder = 0,
@@ -1262,6 +1266,10 @@ class _WallTile extends StatefulWidget {
   final String? paneIdOverride;
   final LiveStatusController liveStatus;
   final bool showInfoBar;
+
+  /// With [showInfoBar]: float the bar over the top of the video instead of
+  /// giving it its own row, so the video keeps the tile's full size.
+  final bool infoBarOverlay;
   final VoidCallback onTap;
   final StreamPrefsStore? streamPrefs;
 
@@ -2147,16 +2155,29 @@ class _WallTileState extends State<_WallTile>
   @override
   Widget build(BuildContext context) {
     // Header-bar mode: a title strip on top, video inset below it (the video is
-    // not covered by any floating overlay). Otherwise: video fills the tile with
-    // floating badge row + name label composited over it.
-    final content = Container(
-      color: Colors.grey.shade900,
-      child: widget.showInfoBar
-          ? Column(
-              children: [_infoBar(), Expanded(child: _videoArea())],
-            )
-          : _videoArea(),
-    );
+    // not covered by any floating overlay). Overlay mode: the same strip,
+    // translucent, floats over the top edge of a full-size video. Otherwise:
+    // video fills the tile with floating badge row + name label over it.
+    final Widget body;
+    if (!widget.showInfoBar) {
+      body = _videoArea();
+    } else if (widget.infoBarOverlay) {
+      body = Stack(
+        fit: StackFit.expand,
+        children: [
+          _videoArea(),
+          Positioned(
+            left: 0,
+            top: 0,
+            right: 0,
+            child: _infoBar(translucent: true),
+          ),
+        ],
+      );
+    } else {
+      body = Column(children: [_infoBar(), Expanded(child: _videoArea())]);
+    }
+    final content = Container(color: Colors.grey.shade900, child: body);
     // Selected (single-tapped / snapshot-target) tile gets an outline in the
     // app-wide accent (the active tab's colour).
     return ValueListenableBuilder<String?>(
@@ -2203,7 +2224,7 @@ class _WallTileState extends State<_WallTile>
 
   /// The per-tile title strip (header-bar mode). Listens to the shared
   /// LiveStatusController so only the strip rebuilds on a poll tick.
-  Widget _infoBar() {
+  Widget _infoBar({bool translucent = false}) {
     return ListenableBuilder(
       listenable: widget.liveStatus,
       builder: (context, _) {
@@ -2217,6 +2238,7 @@ class _WallTileState extends State<_WallTile>
           detectionKeys: widget.liveStatus.detectionKeysFor(widget.camera.id),
           dataSaver: _activeQuality == StreamQuality.dataSaver,
           autoReduced: _autoReduced,
+          translucent: translucent,
         );
       },
     );
