@@ -400,6 +400,9 @@ data class ExportOutputFile(
     /** Basename of the file on disk, including the real extension (e.g. `.mkv`
      *  or `crumb_export.zip`). May be blank on old persisted jobs. */
     @SerialName("filename") val filename: String = "",
+    /** Readable name the server offers for saving (also its `Content-Disposition`
+     *  filename). Untrusted: sanitize before use. Blank on older servers. */
+    @SerialName("download_name") val downloadName: String = "",
 )
 
 @Serializable
