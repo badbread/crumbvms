@@ -48,6 +48,15 @@ whether or not you scrub much, which is why it's off by default (a small box
 shouldn't do work nobody asked for). Turn it on if you review footage often and
 want it to feel instant everywhere.
 
+How much, measured on real camera footage: about 7 to 20 percent of one CPU
+core per camera while it records (4K cameras at the top of that range, 1080p at
+the bottom), and about 1 GB of preview images per camera per day, which the
+preview cache budget (20 GB by default) keeps in check by dropping the oldest.
+Crumb builds one preview at a time, so this never takes more than about one CPU
+core however many cameras you have. With more than about five to seven 4K cameras it
+can't cover everything, so it concentrates on the most recent two hours, and
+older footage gets its previews the normal way the first time you drag there.
+
 The easiest way to turn it on is the admin console: **Server settings → Scrub
 previews**. Flip "Pre-generate scrub previews" and it starts within a few
 seconds, no restart, no container access needed. The same panel lets you adjust
