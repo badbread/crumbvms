@@ -8,6 +8,99 @@ revisit.
 
 ---
 
+## 2026-10-29, LPR plate corrections: an admin-managed alias table resolved on the server; raw reads are never rewritten
+
+**Context.** Plate OCR sometimes misreads one character, so one car shows up
+as two plates (the owner's example: `GIF2GAB` and `GIT2GAB`). Its history,
+"regular" status, counts and profile were split in two with no way to tell
+Crumb they are the same vehicle (issue #673).
+
+**Decision.**
+
+- **Storage: `plate_aliases` (migration 0084)**, `alias_plate` (primary key)
+  -> `canonical_plate`, plus `created_by` and `created_at`. Both are
+  normalized plates. `plate_reads` is never rewritten: a read keeps what the
+  engine read, a correction applies when reads are queried, and deleting the
+  row undoes it. Not pruned by plate retention (operator curation, like
+  `plate_labels` and the watchlist).
+- **One level only.** A canonical plate is never itself an alias. The write
+  path (`db::create_plate_alias`, under an advisory lock) flattens: correcting
+  `A -> B` when `B -> C` exists stores `A -> C`; aliases that pointed at `A`
+  move to its new canonical plate; correcting `B -> A` when `A -> B` exists
+  swaps them. Resolution is therefore always a single LEFT JOIN on the alias
+  primary key, never a recursive walk.
+- **Resolution rule (every read path, verbatim):** a read counts as
+  `COALESCE(plate_aliases.canonical_plate, plate_reads.plate)`.
+  - `GET /plates`: `plate` is the canonical plate; new nullable
+    `corrected_from` carries the raw read when it was corrected. Every search
+    mode matches the raw read OR its canonical plate, so an exact search for
+    the canonical plate (the profile's visits) returns its misreads, and a
+    search for the misread string still finds the reads. The name resolves as
+    `COALESCE(label(canonical), label(raw), watchlist label(canonical),
+    watchlist label(raw))`.
+  - `POST /lpr/plates/stats`: a requested misread is answered under its
+    canonical plate, and a canonical plate's numbers include every read stored
+    under its aliases. The SQL still groups by the stored plate through the
+    `(plate, ts)` index and folds the groups in Rust.
+  - `GET /lpr/overview`: today's unique plates, new plates, regulars and
+    watchlist hits are counted per canonical plate.
+  - Ingest: the ignore list and watchlist alert matching also try the read's
+    canonical plate, so a known misread of a watched plate alerts.
+  - The A/B engine benchmark does NOT resolve (`PlateReadQuery::resolve_aliases
+    = false`): it must score the engines on what they read, and a correction
+    would inflate their accuracy.
+- **Server-side resolution, not client-side**, so every client agrees and the
+  clients that already show reads (Android, iOS, the web console) show
+  corrected plates with no client change.
+- **Endpoints and permissions:** `GET /lpr/plate-aliases[?canonical=]` and
+  `GET /lpr/plate-alias-suggestions?plate=` are `view_plates`-gated (like the
+  watchlist read) with camera-scoped read counts; suggestions only consider
+  plates seen on cameras the caller may see. `POST /lpr/plate-aliases` and
+  `DELETE /lpr/plate-aliases/:alias` are admin-only, the same gate as plate
+  names and watchlist writes: a correction changes what every operator sees.
+- **Suggestions** reuse the watchlist matcher's distance (`db::levenshtein`,
+  OCR-confusable pairs such as `O`/`0` cost nothing): plates in scope within 2
+  edits, folded onto their canonical plates, closest then busiest first. It
+  scans the distinct plates of the right length, which plate retention bounds;
+  it backs an admin dialog, not a hot path.
+- **Desktop:** "Correct plate..." in the plate profile and the list row menu
+  opens a dialog with likely matches, the effect ("GIT2GAB's 12 reads will
+  count as GIF2GAB"), and Undo; the canonical plate's profile lists its known
+  misreads with Undo.
+
+**Rejected.**
+
+- *Rewriting `plate_reads.plate`* (a one-shot "merge"): simplest to query, but
+  irreversible, destroys the OCR text needed for audit and for the engine
+  benchmark, and a wrong merge could not be told apart from a real read.
+- *Client-side resolution* (each client fetches the alias list and re-maps):
+  five clients would have to agree on the rule, server counts (stats, overview)
+  would still be split, and an old client would show split plates forever.
+- *Applying corrections to every confusable or fuzzy variant automatically*
+  (the plate-names entry, 2026-07-31, deferred naming fuzzy variants for the
+  same reason): it risks merging genuinely different plates. A correction is
+  an explicit, per-string operator decision.
+- *A per-read override in this change* (correct one read without aliasing the
+  string): deferred. An alias on a one-off misread only affects that string,
+  and the dialog shows how many reads it moves before saving, so the alias
+  covers the reported case. Because resolution is centralized in the
+  `COALESCE` above, an override column on `plate_reads` can be added later as
+  the first term.
+
+**Trade-offs accepted.** Every plate query now carries a LEFT JOIN on a small
+primary-keyed table (and stats one extra lookup). The alias list is visible
+to anyone with `view_plates`, like the watchlist, though its read counts are
+camera-scoped. Events on the timeline (`events.sub_label`) still show the raw
+plate. Android and iOS display corrected plates but cannot make corrections
+yet. The watchlist-hit tile now counts a watched plate's misreads too.
+
+**Revisit if.** Operators need to correct single reads (add the per-read
+override), non-admins should be able to correct (split a capability), the
+alias table grows large enough that the suggestion scan shows up as slow, or
+the timeline should show corrected plates.
+
+---
+
 ## 2026-10-29, Bookmarks whose footage retention deleted: flag at read time, never auto-delete
 
 **Chosen:** `footage_expired` is computed in the bookmark SELECT on every read

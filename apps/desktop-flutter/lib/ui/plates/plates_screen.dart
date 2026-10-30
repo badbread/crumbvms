@@ -48,6 +48,7 @@ import 'package:crumb_desktop/ui/clips/clip_player_shell.dart';
 import 'package:crumb_desktop/ui/hotkeys/hotkey_gate.dart';
 import 'package:crumb_desktop/ui/plates/ab_benchmark.dart';
 import 'package:crumb_desktop/ui/plates/plate_collapse.dart';
+import 'package:crumb_desktop/ui/plates/plate_correction_dialog.dart';
 import 'package:crumb_desktop/ui/plates/plate_crop.dart';
 import 'package:crumb_desktop/ui/plates/plate_desk_logic.dart';
 import 'package:crumb_desktop/ui/plates/plate_name_dialog.dart';
@@ -217,6 +218,7 @@ class _PlatesScreenState extends State<PlatesScreen> {
     _stats = PlateStatsCache(
       (plates) => widget.api.getPlateStats(widget.session, plates),
     )..addListener(_onStatsChanged);
+    plateCorrections.addListener(_onPlateCorrected);
     _listScroll.addListener(_hideLoupe);
     HardwareKeyboard.instance.addHandler(_onListKey);
     _restoreViewMode();
@@ -1019,8 +1021,23 @@ class _PlatesScreenState extends State<PlatesScreen> {
     setState(() => _lprConfig = updated);
   }
 
+  /// A plate correction (or its undo) was saved from this client: the
+  /// server now groups reads differently, so reload the reads and history.
+  /// A profile open on the corrected plate moves to the real plate.
+  void _onPlateCorrected() {
+    if (!mounted) return;
+    final e = plateCorrections.last;
+    final open = _profile;
+    if (e != null && e.canonical != null && open?.plate == e.alias) {
+      setState(() => _profile = plateReadAs(open!, e.canonical!));
+    }
+    _stats.invalidate();
+    _load();
+  }
+
   @override
   void dispose() {
+    plateCorrections.removeListener(_onPlateCorrected);
     HardwareKeyboard.instance.removeHandler(_onListKey);
     _hideLoupe();
     _listScroll.dispose();
