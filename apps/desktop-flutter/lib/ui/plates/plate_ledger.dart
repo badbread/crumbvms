@@ -11,9 +11,15 @@ part of 'plates_screen.dart';
 
 // ─── palette ───────────────────────────────────────────────────────────────
 
-const _kPink = Color(0xFFE05A8A); // LPR accent, watchlist
+// "Registration blue" LPR scheme. The accent is also the Regular colour;
+// Returning is slate, First-time/NEW green, Watchlist (and unusual hour)
+// amber.
+const _kLprAccent = Color(0xFF4F8DFF); // LPR accent, Regular
+const _kLprInk = Color(0xFF0B1220); // text/icons on accent fills
+const _kLprHot = Color(0xFF86B1FF); // hover / hot variant of the accent
+const _kLprChipBg = Color(0x334F8DFF); // accent chip bg (20%)
 const _kGreen = Color(0xFF57C888); // new / first-time
-const _kAmber = Color(0xFFE8A33D); // regular
+const _kAmber = Color(0xFFE8A33D); // watchlist, unusual hour
 const _kRed = Color(0xFFE05A5A);
 const _kSlate = Color(0xFF8A93A6); // returning
 const _kSurface0 = Color(0xFF14171C);
@@ -21,9 +27,9 @@ const _kSurface1 = Color(0xFF1B1D22);
 const _kSurface2 = Color(0xFF24272E);
 
 Color? _railColor(PlateRail r) => switch (r) {
-  PlateRail.watchlist => _kPink,
+  PlateRail.watchlist => _kAmber,
   PlateRail.newPlate => _kGreen,
-  PlateRail.regular => _kAmber,
+  PlateRail.regular => _kLprAccent,
   PlateRail.none => null,
 };
 
@@ -98,7 +104,7 @@ class _DeskHeader extends StatelessWidget {
                 width: tileW,
                 value: o.readsToday,
                 label: 'Reads today',
-                color: _kPink,
+                color: _kLprAccent,
                 active: filter == DeskFilter.all && !groupByPlate,
                 tooltip: 'Show every read',
                 onTap: () {
@@ -130,7 +136,7 @@ class _DeskHeader extends StatelessWidget {
                 width: tileW,
                 value: o.watchlistHitsToday,
                 label: 'Watchlist hits',
-                color: _kPink,
+                color: _kAmber,
                 active: filter == DeskFilter.watchlist,
                 tooltip: 'Only plates on the watchlist',
                 onTap: () => _toggle(DeskFilter.watchlist),
@@ -257,7 +263,7 @@ class _SplitCard extends StatelessWidget {
       (
         DeskFilter.regulars,
         split.regulars,
-        _kAmber,
+        _kLprAccent,
         'Regulars ($regularMin+ in 30 d)',
       ),
       (DeskFilter.returning, split.returning, _kSlate, 'Returning'),
@@ -372,24 +378,15 @@ class _DensityToggle extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    Widget seg(PlateDensity d, String label, String tip) {
+    Widget seg(PlateDensity d, IconData icon, String tip) {
       final on = value == d;
       return Tooltip(
         message: tip,
-        child: InkWell(
+        child: _FbSegCell(
+          on: on,
           onTap: () => onChanged(d),
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-            color: on ? _kPink : _kSurface2,
-            child: Text(
-              label,
-              style: TextStyle(
-                color: on ? Colors.white : Colors.white70,
-                fontSize: 12,
-                fontWeight: on ? FontWeight.w600 : FontWeight.w400,
-              ),
-            ),
-          ),
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+          child: Icon(icon, size: 16, color: on ? _kLprInk : Colors.white70),
         ),
       );
     }
@@ -401,11 +398,19 @@ class _DensityToggle extends StatelessWidget {
         children: [
           seg(
             PlateDensity.compact,
-            'Compact',
-            'Text only, one line per read (1)',
+            Icons.density_small,
+            'Compact: text only, one line per read (1)',
           ),
-          seg(PlateDensity.standard, 'Standard', 'Frame and plate crop (2)'),
-          seg(PlateDensity.large, 'Large', 'Big frame and plate crop (3)'),
+          seg(
+            PlateDensity.standard,
+            Icons.density_medium,
+            'Standard: frame and plate crop (2)',
+          ),
+          seg(
+            PlateDensity.large,
+            Icons.density_large,
+            'Large: big frame and plate crop (3)',
+          ),
         ],
       ),
     );
@@ -641,7 +646,7 @@ class _LedgerRowState extends State<_LedgerRow> {
             ),
           ),
           foregroundDecoration: widget.selected
-              ? BoxDecoration(border: Border.all(color: _kPink, width: 1))
+              ? BoxDecoration(border: Border.all(color: _kLprAccent, width: 1))
               : null,
           padding: EdgeInsets.only(
             left: widget.entry.isChild ? 34 : 10,
@@ -688,9 +693,11 @@ class _LedgerRowState extends State<_LedgerRow> {
                             size: Size(m.sparkWidth, m.sparkHeight),
                             painter: _SparklinePainter(
                               s.days30,
-                              s.isRegular || widget.watched
-                                  ? _kPink
-                                  : _kPink.withValues(alpha: 0.7),
+                              widget.watched
+                                  ? _kAmber
+                                  : s.isRegular
+                                  ? _kLprAccent
+                                  : _kLprAccent.withValues(alpha: 0.7),
                             ),
                           ),
                   ),
@@ -737,33 +744,59 @@ class _LedgerRowState extends State<_LedgerRow> {
     final marks = <Widget>[
       if (!widget.entry.isChild) ...[
         if (hints.isNew) _tag('NEW', _kGreen),
-        if (widget.watched) _tag('WATCHLIST', _kPink),
-        if (hints.showToday) _tag('${hints.todayCount}x TODAY', _kPink),
+        if (widget.watched) _tag('WATCHLIST', _kAmber),
+        if (hints.showToday) _tag('${hints.todayCount}x TODAY', _kLprAccent),
       ],
       if (hints.unusualHour) _tag('UNUSUAL HOUR', _kAmber),
-      if (name.isNotEmpty)
-        Padding(
-          padding: const EdgeInsets.only(left: 8),
-          child: Text(
-            widget.watched ? '★ $name' : name,
-            maxLines: 1,
-            style: TextStyle(
-              color: widget.watched ? _kPink : Colors.white70,
-              fontSize: m.subFont,
-            ),
-          ),
-        ),
     ];
+    // The known name is its own slot after the marks: it keeps up to ~45% of
+    // the room beside the plate and scrolls (only it) when longer.
+    final nameStyle = TextStyle(
+      color: widget.watched ? _kAmber : Colors.white70,
+      fontSize: m.subFont,
+    );
+    final nameText = widget.watched ? '★ $name' : name;
+    final plateStyle = TextStyle(
+      fontSize: m.plateFont,
+      fontWeight: FontWeight.w700,
+      letterSpacing: 1.2,
+      fontFamily: 'monospace',
+    );
     final headline = LayoutBuilder(
-      builder: (context, c) => Row(
-        children: [
-          ConstrainedBox(
-            constraints: BoxConstraints(maxWidth: c.maxWidth),
-            child: plateText,
-          ),
-          if (marks.isNotEmpty) Expanded(child: _clipRow(marks)),
-        ],
-      ),
+      builder: (context, c) {
+        // Exact widths, so the row can never overflow: the plate first, then
+        // the name (up to ~45% of what is left, at least 110 px), then the
+        // marks take whatever remains.
+        final plateW = math.min(
+          marqueeTextWidth(
+                context,
+                read.plate.isEmpty ? '-' : read.plate,
+                plateStyle,
+              ) +
+              2,
+          c.maxWidth,
+        );
+        var nameW = 0.0;
+        if (name.isNotEmpty) {
+          final natural = marqueeTextWidth(context, nameText, nameStyle) + 1;
+          final room = math.max(0.0, c.maxWidth - plateW - 8);
+          nameW = math.min(natural, math.min(room, math.max(110.0, room * 0.45)));
+        }
+        return Row(
+          children: [
+            SizedBox(width: plateW, child: plateText),
+            if (marks.isNotEmpty) Flexible(child: _clipRow(marks)),
+            if (nameW > 0)
+              Padding(
+                padding: const EdgeInsets.only(left: 8),
+                child: SizedBox(
+                  width: nameW,
+                  child: MarqueeText(nameText, style: nameStyle),
+                ),
+              ),
+          ],
+        );
+      },
     );
     final subParts = <InlineSpan>[
       TextSpan(text: widget.cameraName),
@@ -836,7 +869,7 @@ class _LedgerRowState extends State<_LedgerRow> {
       maxLines: 1,
       overflow: TextOverflow.ellipsis,
       style: TextStyle(
-        color: strong ? _kPink : Colors.white,
+        color: strong ? _kLprAccent : Colors.white,
         fontSize: m.subFont + 2,
         fontWeight: FontWeight.w700,
       ),
@@ -1317,7 +1350,7 @@ class _FrameWithBoxState extends State<_FrameWithBox> {
               height: (b[3] * widget.width / aspect).clamp(2, widget.width),
               child: DecoratedBox(
                 decoration: BoxDecoration(
-                  border: Border.all(color: _kPink, width: 2),
+                  border: Border.all(color: _kLprAccent, width: 2),
                 ),
               ),
             ),
@@ -1344,7 +1377,7 @@ class _LoupeCard extends StatelessWidget {
       elevation: 12,
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(8),
-        side: const BorderSide(color: _kPink),
+        side: const BorderSide(color: _kLprAccent),
       ),
       clipBehavior: Clip.antiAlias,
       child: SizedBox(

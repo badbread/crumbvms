@@ -4,14 +4,13 @@
 // radial clock. Each is a small StatefulWidget that owns its animation, so a
 // hover repaints only the chart (the painters listen to the controllers via
 // CustomPaint.repaint) and never rebuilds the profile. Both grow in on first
-// show (staggered), highlight the hovered bar / wedge in hot pink while the
+// show (staggered), highlight the hovered bar / wedge in the hot accent while the
 // rest dim, and show the hovered number. Reduced motion
 // (MediaQuery.disableAnimations) skips the intro and snaps every transition.
 // A `part` of plates_screen.dart.
 
 part of 'plates_screen.dart';
 
-const _kHotPink = Color(0xFFF06A9C);
 const _kTipBg = Color(0xFF262A33);
 const _kTipBorder = Color(0xFF3A3F4B);
 
@@ -211,7 +210,7 @@ class _DayBarsChartState extends State<_DayBarsChart>
             Text(
               hoverDate ?? '${widget.total} reads',
               style: TextStyle(
-                color: hoverDate == null ? Colors.white38 : _kHotPink,
+                color: hoverDate == null ? Colors.white38 : _kLprHot,
                 fontSize: 10,
               ),
             ),
@@ -257,7 +256,7 @@ class _DayBarsChartState extends State<_DayBarsChart>
                       Text(
                         '$n',
                         style: const TextStyle(
-                          color: _kHotPink,
+                          color: _kLprHot,
                           fontSize: 16,
                           fontWeight: FontWeight.w600,
                           fontFeatures: [FontFeature.tabularFigures()],
@@ -350,9 +349,9 @@ class _DayBarsPainter extends CustomPainter {
       final base = v == 0
           ? _kSurface2
           : isToday
-          ? _kPink
-          : _kPink.withValues(alpha: 0.45);
-      final color = Color.lerp(base, _kHotPink, e)!;
+          ? _kLprAccent
+          : _kLprAccent.withValues(alpha: 0.45);
+      final color = Color.lerp(base, _kLprHot, e)!;
       final fade = 1 - 0.65 * dim * (1 - e);
       canvas.drawRRect(
         RRect.fromRectAndRadius(
@@ -502,7 +501,7 @@ class _HourClockState extends State<_HourClock> with TickerProviderStateMixin {
         Text(
           footer,
           style: TextStyle(
-            color: idx == null ? Colors.white38 : _kHotPink,
+            color: idx == null ? Colors.white38 : _kLprHot,
             fontSize: 11,
           ),
         ),
@@ -545,7 +544,7 @@ class _HourClockState extends State<_HourClock> with TickerProviderStateMixin {
 
 /// The 24-hour "clock": one wedge per hour, midnight at the top, longer and
 /// brighter for busier hours. [highlight] draws that hour in amber; the
-/// hovered wedge (via [hover]) goes hot pink and pushes out.
+/// hovered wedge (via [hover]) goes the hot accent and pushes out.
 class _RadialClockPainter extends CustomPainter {
   _RadialClockPainter(
     this.hours, {
@@ -599,10 +598,10 @@ class _RadialClockPainter extends CustomPainter {
       final mid = start + (sweep - 0.04) / 2;
       final isHi = h == highlight;
       final baseA = v == 0 ? 0.12 : 0.35 + 0.65 * v / maxV;
-      final base = (isHi ? _kAmber : _kPink).withValues(
+      final base = (isHi ? _kAmber : _kLprAccent).withValues(
         alpha: isHi ? 1 : baseA,
       );
-      final color = Color.lerp(base, _kHotPink, e)!;
+      final color = Color.lerp(base, _kLprHot, e)!;
       final fade = (1 - 0.7 * dim * (1 - e)) * bloom;
       canvas.save();
       canvas.translate(math.cos(mid) * 6 * pop, math.sin(mid) * 6 * pop);
