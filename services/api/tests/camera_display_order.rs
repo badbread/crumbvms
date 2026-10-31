@@ -99,7 +99,11 @@ async fn admin_sets_display_order_for_every_client() {
             &serde_json::json!({ "camera_ids": [c, a, Uuid::new_v4()] }),
         ))
         .await;
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "unknown ids are ignored");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "unknown ids are ignored"
+    );
     assert_eq!(listed(&app, "/cameras", &token, &ours).await, vec![c, a, b]);
     assert_eq!(
         listed(&app, "/config/cameras", &token, &ours).await,
@@ -134,7 +138,10 @@ async fn admin_sets_display_order_for_every_client() {
         .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     // ...but sees the admin's order.
-    assert_eq!(listed(&app, "/cameras", &vtoken, &ours).await, vec![c, a, b]);
+    assert_eq!(
+        listed(&app, "/cameras", &vtoken, &ours).await,
+        vec![c, a, b]
+    );
 
     // An empty list resets to name order.
     let resp = app
