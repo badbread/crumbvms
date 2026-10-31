@@ -7,6 +7,15 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.ripple
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Size
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.ui.draw.drawBehind
@@ -59,14 +68,14 @@ fun CrumbModeTabs(
     modifier: Modifier = Modifier,
 ) {
     Row(
-        horizontalArrangement = Arrangement.spacedBy(24.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
         verticalAlignment = Alignment.CenterVertically,
         // Small phones can't fit Live+Playback+Clips+Plates without squeezing a
         // label onto two lines (seen with "Plates"); scroll sideways instead of
         // wrapping. maxLines=1 on each label (below) is the actual wrap-prevention —
         // this just lets the (wider-than-the-screen) row overflow gracefully.
         modifier = modifier
-            .padding(start = 4.dp)
+            .padding(start = 12.dp)
             .horizontalScroll(rememberScrollState()),
     ) {
         ModeTab("Live", selected == CrumbMode.LIVE, TealAccent, onLive)
@@ -89,38 +98,43 @@ private fun ModeTab(
     selectedColor: Color,
     onClick: () -> Unit,
 ) {
+    // G2/L1: 48 dp cell with a bounded 8 dp-radius ripple (was indication = null, so
+    // the tabs gave no press feedback). The 2 dp underline spans the label only and
+    // fades in/out with the selection instead of snapping.
     val interaction = remember { MutableInteractionSource() }
-    val base = Modifier
-        .padding(vertical = 4.dp)
-        .clickable(interactionSource = interaction, indication = null, onClick = onClick)
-    if (isSelected) {
-        Box(
-            contentAlignment = Alignment.Center,
-            modifier = base.drawBehind {
-                val sw = 2.dp.toPx()
-                val y = size.height - sw / 2f
-                drawLine(
-                    color = selectedColor,
-                    start = Offset(0f, y),
-                    end = Offset(size.width, y),
-                    strokeWidth = sw,
-                )
-            },
-        ) {
-            Text(
-                text = label,
-                style = MaterialTheme.typography.titleMedium,
-                color = selectedColor,
-                maxLines = 1,
-            )
-        }
-    } else {
+    val underline by animateColorAsState(
+        targetValue = if (isSelected) selectedColor else Color.Transparent,
+        animationSpec = tween(200),
+        label = "tabUnderline",
+    )
+    val textColor by animateColorAsState(
+        targetValue = if (isSelected) selectedColor else TextSecondary,
+        animationSpec = tween(200),
+        label = "tabText",
+    )
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = Modifier
+            .height(48.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(interactionSource = interaction, indication = ripple(), onClick = onClick)
+            .padding(horizontal = 4.dp),
+    ) {
         Text(
             text = label,
             style = MaterialTheme.typography.titleMedium,
-            color = TextSecondary,
+            color = textColor,
             maxLines = 1,
-            modifier = base,
+            modifier = Modifier.drawBehind {
+                val sw = 2.dp.toPx()
+                val y = size.height + 6.dp.toPx()
+                drawRoundRect(
+                    color = underline,
+                    topLeft = Offset(0f, y),
+                    size = Size(size.width, sw),
+                    cornerRadius = CornerRadius(sw / 2f, sw / 2f),
+                )
+            },
         )
     }
 }
