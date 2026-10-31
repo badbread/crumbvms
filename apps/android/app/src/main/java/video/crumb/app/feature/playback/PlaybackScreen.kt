@@ -1101,10 +1101,8 @@ fun PlaybackScreen(
                 // within THAT box and the tooltip box itself falls to the video
                 // Box's `contentAlignment = Center` — which floated the arrow dead
                 // centre over the footage. Aligning the wrapper pins it top-left.
-                AnimatedVisibility(
+                FadeWhen(
                     visible = isLandscape && !chromeHidden,
-                    enter = fadeIn(tween(150)),
-                    exit = fadeOut(tween(150)),
                     modifier = Modifier.align(Alignment.TopStart),
                 ) {
                     // P1/P2: the back arrow sits on the 48 dp grid inside the cutout
@@ -1146,10 +1144,8 @@ fun PlaybackScreen(
                 // floated over the video in either orientation.)
 
                 // Controls hidden: keep the time on screen, small and out of the way.
-                AnimatedVisibility(
+                FadeWhen(
                     visible = chromeHidden,
-                    enter = fadeIn(tween(150)),
-                    exit = fadeOut(tween(150)),
                     modifier = Modifier
                         .align(Alignment.BottomEnd)
                         .windowInsetsPadding(WindowInsets.displayCutout.only(WindowInsetsSides.Horizontal))
@@ -1332,6 +1328,18 @@ fun PlaybackScreen(
  * [AnimatedVisibility] overload is used (inside the screen's Column/Box scopes the
  * scoped overloads would otherwise be picked up).
  */
+@Composable
+private fun FadeWhen(visible: Boolean, modifier: Modifier = Modifier, content: @Composable () -> Unit) {
+    AnimatedVisibility(
+        visible = visible,
+        modifier = modifier,
+        enter = fadeIn(tween(150)),
+        exit = fadeOut(tween(150)),
+    ) {
+        content()
+    }
+}
+
 @Composable
 private fun FadeInWhen(visible: Boolean, content: @Composable () -> Unit) {
     AnimatedVisibility(visible = visible, enter = fadeIn(tween(100)), exit = ExitTransition.None) {
