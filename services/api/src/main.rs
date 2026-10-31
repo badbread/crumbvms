@@ -1425,10 +1425,15 @@ mod export_dir_check_tests {
         let _ = tokio::fs::remove_dir_all(&base).await;
         let dir = base.join("exports");
 
-        check_export_dir_writable(&dir).await.expect("a fresh dir is writable");
+        check_export_dir_writable(&dir)
+            .await
+            .expect("a fresh dir is writable");
         assert!(dir.is_dir(), "the export dir is created");
         let mut entries = tokio::fs::read_dir(&dir).await.unwrap();
-        assert!(entries.next_entry().await.unwrap().is_none(), "the probe file is removed");
+        assert!(
+            entries.next_entry().await.unwrap().is_none(),
+            "the probe file is removed"
+        );
 
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
@@ -1437,13 +1442,16 @@ mod export_dir_check_tests {
     /// build box runs the suite as root, so a chmod-based test would pass).
     #[tokio::test]
     async fn reports_an_unusable_dir() {
-        let base = std::env::temp_dir().join(format!("crumb-exportcheck-bad-{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("crumb-exportcheck-bad-{}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&base).await;
         tokio::fs::create_dir_all(&base).await.unwrap();
         let file = base.join("not-a-dir");
         tokio::fs::write(&file, b"x").await.unwrap();
 
-        assert!(check_export_dir_writable(&file.join("exports")).await.is_err());
+        assert!(check_export_dir_writable(&file.join("exports"))
+            .await
+            .is_err());
 
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
