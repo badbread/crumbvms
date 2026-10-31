@@ -107,6 +107,11 @@ missing disk. None of that is visible on a good day, which is the point.
 
 ### Android
 
+- **Landscape Playback gives the video the whole screen.** Tap the video to
+  hide or show the controls; while a recording plays they hide by themselves
+  after a few seconds, and stay up while paused, scrubbing, or with a menu
+  open. The time stays in a corner while they are hidden. Portrait is
+  unchanged (#697).
 - **Simple or advanced playback controls.** A new setting picks between a short
   control set and the full one; existing installs keep the advanced set they
   already had (#690).
@@ -274,6 +279,7 @@ Worth knowing, no action needed:
 Every pull request merged since 0.2.0, newest first. The release integration
 (#682) landed as one merge; the pull requests it carried are listed after it.
 
+- feat(android): hide the Playback controls in landscape (tap the video, auto-hide while playing) (#697)
 - fix(recorder): stop the boot policy shim deadlocking reconcile's camera lookup (#696)
 - feat(android): light polish pass (motion, spacing, cleaner pages) (#691)
 - fix(api): create /exports in the image so a new export volume is writable (#695)
