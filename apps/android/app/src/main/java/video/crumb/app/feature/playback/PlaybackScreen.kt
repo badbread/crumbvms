@@ -746,7 +746,7 @@ fun PlaybackScreen(
                     snackbarHostState.showSnackbar("Snapshot failed")
                 }
             } else {
-                snackbarHostState.showSnackbar("Snapshot unavailable — video not ready")
+                snackbarHostState.showSnackbar("Snapshot unavailable. Video not ready.")
             }
         }
     }

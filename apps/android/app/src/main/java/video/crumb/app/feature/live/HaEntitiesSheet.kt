@@ -140,7 +140,7 @@ fun HaEntitiesSheet(
         }
         if (states?.stale == true) {
             Text(
-                "Home Assistant unreachable — showing last known state",
+                "Home Assistant unreachable. Showing the last known state.",
                 color = HaSecondaryText,
                 fontSize = 12.sp,
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 2.dp),

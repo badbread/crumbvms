@@ -8,6 +8,32 @@ revisit.
 
 ---
 
+## 2026-10-30, Android light polish pass: transitions, spacing and type roles only, no new structure; wall tile to camera is a scale grow, not a shared-element transform
+
+**Decision.** The Android app gets a "light polish" pass (owner brief: same navigation, screens, controls, per-tab colours and fonts; better
+transitions, cleaner pages, better spacing). It is built from shared tokens rather than per-screen tweaks: a spacing scale (`ui/theme/Spacing.kt`,
+4/8/12/16/24), an explicit shape scale (8 tiles and chips, 12 cards, 28 dialogs), `labelMedium` / `bodySmall` type roles plus a mono data
+style (the already bundled JetBrains Mono), one `CrumbFilterChip` (Live, Playback wall, Clips and the LPR active-filter strip), one
+`StateMessage` for empty and error states, a hand-rolled shimmer skeleton, and small motion helpers (`staggerIn`, `dialogEntrance`) in `ui/`.
+Navigation uses a fade-through between tabs (scale 0.92 to 1 only when the target is not the Live wall), and a wall tile opens its camera by
+growing out of the tapped tile and shrinking back on Back (`ui/nav/NavMotion.kt`). No server change, no new dependency.
+
+**Rejected.** `SharedTransitionLayout` / `sharedBounds` for the tile to camera transform: the live tiles are `SurfaceView`s and the fullscreen
+and playback surfaces are separate `TextureView` players, so there is no single element to share, and moving a `SurfaceView` through the
+shared-transition overlay risks blank video during the animation. A scale and fade from the tile's bounds gives most of the feel with no
+risk to playback. Controls auto-hide with fades on single playback (P7), a swipe-camera `AnimatedContent` (F5) and fixed `GridCells.Fixed(2)`
+on Clips were skipped or reduced because each changes behaviour or structure, which the brief ruled out.
+
+**Trade-offs accepted.** The grow transform is an approximation (origin from the last tile position, not pixel-exact bounds). The incoming
+camera slides on swipe but the outgoing one does not (one shared player). The single-camera timeline is taller (88 dp portrait, 56 dp
+landscape) to host the time chip and the detection band. Reduced motion relies on Compose following the system animation scale; the app has
+no separate switch.
+
+**Revisit when.** A shared-element-capable player surface is adopted (for example a single `TextureView` for wall and fullscreen), or testers
+report the grow transform stutters on low-end phones (fall back to the plain fade-through).
+
+---
+
 ## 2026-10-30, Android LPR tab redesign: phone-native (search bar + one filter sheet, two-line rows, pinned-video profile), not the desktop plate desk shrunk
 
 **Decision.** The Android LPR tab is rebuilt around the answers `0A 1A 2A 3B` from the owner's mockup round (the mockup page itself is not in the repo): registration-blue accent shared with desktop (0A);

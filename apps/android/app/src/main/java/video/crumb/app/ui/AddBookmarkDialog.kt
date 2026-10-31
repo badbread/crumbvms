@@ -104,7 +104,7 @@ fun AddBookmarkDialog(
                         )
                     }
                     Text(
-                        "Keeps a clip around this moment from auto-delete (1–30 days).",
+                        "Keeps a clip around this moment from auto-delete (1 to 30 days).",
                         style = MaterialTheme.typography.bodySmall,
                         color = TextSecondary,
                     )

@@ -936,7 +936,7 @@ private fun LowBandwidthAutoFallbackBanner(
             modifier = Modifier.size(16.dp),
         )
         Text(
-            text = "Low bandwidth — tap to restore",
+            text = "Low bandwidth. Tap to restore.",
             style = MaterialTheme.typography.labelMedium,
             color = TextSecondary,
             modifier = Modifier
