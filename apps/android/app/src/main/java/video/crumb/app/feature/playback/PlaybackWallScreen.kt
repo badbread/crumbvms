@@ -101,7 +101,6 @@ import video.crumb.app.ui.CrumbMode
 import video.crumb.app.ui.CrumbModeTabs
 import video.crumb.app.ui.GridLayoutToggle
 import video.crumb.app.ui.HintTooltip
-import video.crumb.app.ui.InlineDivider
 import video.crumb.app.ui.JumpToDateTimeDialog
 import video.crumb.app.ui.Time
 import video.crumb.app.ui.ViewChipsRow
