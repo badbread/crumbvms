@@ -17,6 +17,12 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.ExitTransition
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.heightIn
@@ -773,6 +779,34 @@ fun PlaybackScreen(
     val isLandscape =
         LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
 
+    // Landscape: a tap on the video hides or shows the controls, and while playing
+    // they hide by themselves after a few seconds without a touch, so the video can
+    // use the full height. Portrait never hides (PlaybackChromePolicy).
+    var userHidControls by rememberSaveable { mutableStateOf(false) }
+    var lastTouchAt by remember { mutableStateOf(0L) }
+    val chromeHold = remember { ChromeHold() }
+    val hasVideo = state.currentSegment != null
+    val chromeHidden = PlaybackChromePolicy.hidden(isLandscape, userHidControls, hasVideo)
+    LaunchedEffect(isLandscape) { if (!isLandscape) userHidControls = false }
+    val autoHideArmed = PlaybackChromePolicy.autoHideArmed(
+        landscape = isLandscape,
+        hasVideo = hasVideo,
+        playing = state.playing,
+        scrubbing = state.scrubbing,
+        held = chromeHold.held || showBookmarkDialog,
+        alreadyHidden = userHidControls,
+    )
+    LaunchedEffect(autoHideArmed, lastTouchAt) {
+        if (autoHideArmed) {
+            delay(PlaybackChromePolicy.AUTO_HIDE_MS)
+            userHidControls = true
+        }
+    }
+    val toggleControls: () -> Unit = {
+        userHidControls = !userHidControls
+        lastTouchAt = System.currentTimeMillis()
+    }
+
     // ── UI ───────────────────────────────────────────────────────────────────────
     Scaffold(
         containerColor = NavyDeep,
@@ -974,6 +1008,7 @@ fun PlaybackScreen(
                             // Track zoom/pan so a "Current view" snapshot can crop to
                             // exactly what's on screen.
                             onTransformChange = { viewTransform = it },
+                            onTap = if (isLandscape) toggleControls else null,
                             // Hoisted so the zoom survives segment gaps (#386).
                             state = zoomState,
                         ) {
@@ -1066,7 +1101,12 @@ fun PlaybackScreen(
                 // within THAT box and the tooltip box itself falls to the video
                 // Box's `contentAlignment = Center` — which floated the arrow dead
                 // centre over the footage. Aligning the wrapper pins it top-left.
-                if (isLandscape) {
+                AnimatedVisibility(
+                    visible = isLandscape && !chromeHidden,
+                    enter = fadeIn(tween(150)),
+                    exit = fadeOut(tween(150)),
+                    modifier = Modifier.align(Alignment.TopStart),
+                ) {
                     // P1/P2: the back arrow sits on the 48 dp grid inside the cutout
                     // inset, with the camera name beside it in the letterbox (14 sp
                     // medium at 75%). The alignment lives on a wrapper Row, NOT on the
@@ -1075,7 +1115,6 @@ fun PlaybackScreen(
                     // fall back to the video Box's centre alignment.
                     Row(
                         modifier = Modifier
-                            .align(Alignment.TopStart)
                             .windowInsetsPadding(WindowInsets.displayCutout.only(WindowInsetsSides.Horizontal))
                             .padding(start = Spacing.xs, top = Spacing.xs),
                         verticalAlignment = Alignment.CenterVertically,
@@ -1105,12 +1144,51 @@ fun PlaybackScreen(
                 // (Audio toggle: portrait → top app bar actions; landscape → inline
                 // on the transport row below, next to Snapshot/Bookmark. It is NOT
                 // floated over the video in either orientation.)
+
+                // Controls hidden: keep the time on screen, small and out of the way.
+                AnimatedVisibility(
+                    visible = chromeHidden,
+                    enter = fadeIn(tween(150)),
+                    exit = fadeOut(tween(150)),
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .windowInsetsPadding(WindowInsets.displayCutout.only(WindowInsetsSides.Horizontal))
+                        .padding(Spacing.s),
+                ) {
+                    Text(
+                        text = remember(state.playheadMs / 1000) {
+                            Time.dateTime(Instant.ofEpochMilli(state.playheadMs))
+                        },
+                        style = MaterialTheme.typography.mono,
+                        color = Color.White.copy(alpha = 0.85f),
+                        modifier = Modifier
+                            .background(Color.Black.copy(alpha = 0.45f), RoundedCornerShape(6.dp))
+                            .padding(horizontal = 8.dp, vertical = 3.dp),
+                    )
+                }
             }
 
             // ── PINNED transport bar (controls + timeline) at the bottom ──────────
+            AnimatedVisibility(
+                visible = !chromeHidden,
+                enter = expandVertically(tween(200)) + fadeIn(tween(200)),
+                exit = shrinkVertically(tween(200)) + fadeOut(tween(150)),
+            ) {
+            CompositionLocalProvider(LocalChromeHold provides chromeHold) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
+                    // Any touch on the bar restarts the auto-hide countdown. Observed
+                    // on the Initial pass and never consumed, so the controls still
+                    // get every event.
+                    .pointerInput(Unit) {
+                        awaitPointerEventScope {
+                            while (true) {
+                                awaitPointerEvent(PointerEventPass.Initial)
+                                lastTouchAt = System.currentTimeMillis()
+                            }
+                        }
+                    }
                     .background(NavySurface)
                     // G10: keep the transport clear of the display cutout in landscape.
                     .windowInsetsPadding(WindowInsets.displayCutout.only(WindowInsetsSides.Horizontal)),
@@ -1213,6 +1291,8 @@ fun PlaybackScreen(
                         .padding(horizontal = Spacing.s),
                 )
                 Spacer(Modifier.height(if (isLandscape) 2.dp else 6.dp))
+            }
+            }
             }
         }
     }
@@ -1416,6 +1496,8 @@ private fun PlaybackControls(
     var sheetOpen by remember { mutableStateOf(false) }
     var markMenuOpen by remember { mutableStateOf(false) }
     var switchMenuOpen by remember { mutableStateOf(false) }
+    // Keep the bar up (no auto-hide) while any of its menus, sheets or dialogs is open.
+    HoldChrome(showJump || sheetOpen || markMenuOpen || switchMenuOpen)
 
     val hasMark = onMarkIn != null || onMarkOut != null
     val markTint = if (onClearSelection != null) {
@@ -1714,6 +1796,7 @@ private fun SpeedChip(speed: Float, onSetSpeed: (Float) -> Unit) {
 
 @Composable
 private fun SpeedMenu(open: Boolean, speed: Float, onSetSpeed: (Float) -> Unit, onClose: () -> Unit) {
+    HoldChrome(open)
     DropdownMenu(expanded = open, onDismissRequest = onClose) {
         listOf(8f, 4f, 2f, 1f, 0.5f).forEach { s ->
             val isCurrent = s == speed

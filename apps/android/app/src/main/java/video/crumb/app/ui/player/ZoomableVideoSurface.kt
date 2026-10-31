@@ -132,6 +132,9 @@ fun ZoomableVideoSurface(
     inPip: Boolean = false,
     onSwipeCamera: ((Int) -> Unit)? = null,
     onTransformChange: ((ViewTransform) -> Unit)? = null,
+    // Single tap on the video (Playback uses it to show or hide its controls).
+    // Drags and pinches consume their moves, so they never count as a tap.
+    onTap: (() -> Unit)? = null,
     state: ZoomableSurfaceState = rememberZoomableSurfaceState(),
     content: @Composable () -> Unit,
 ) {
@@ -231,8 +234,8 @@ fun ZoomableVideoSurface(
                     }
                 }
             }
-            .pointerInput(Unit) {
-                detectTapGestures(onDoubleTap = {
+            .pointerInput(onTap) {
+                detectTapGestures(onTap = onTap?.let { cb -> { _: Offset -> cb() } }, onDoubleTap = {
                     zoom = 1f
                     offset = Offset.Zero
                     report()
