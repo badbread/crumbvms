@@ -1219,3 +1219,103 @@ async fn boot_shim_keeps_policy_id_not_null_idempotently() {
         "boot shim run 3 must keep cameras.policy_id NOT NULL (idempotent)"
     );
 }
+
+/// Issue #693 regression: on a settled schema the boot shim must take NO
+/// ACCESS EXCLUSIVE lock on `cameras` / `recording_policies`.
+///
+/// The recorder runs the shim at boot while reconcile phase 2 is already
+/// reading cameras through `v_camera_effective_policy` (which locks `cameras`
+/// before `recording_policies`). The old shim ALTERed `recording_policies` and
+/// then `cameras` unconditionally in one transaction, so a reader holding
+/// ACCESS SHARE on `cameras` deadlocked with it and Postgres killed the reader:
+/// the orphan pass logged "looking up camera for orphan indexing" and left a
+/// real segment unindexed. Here a transaction holds exactly the reader's
+/// ACCESS SHARE locks; the shim must still finish promptly (the old shape
+/// blocked until `lock_timeout`).
+#[tokio::test]
+async fn boot_shim_takes_no_exclusive_lock_on_settled_camera_tables() {
+    let app = TestApp::new().await;
+
+    let reader = app.pool().get().await.expect("pool.get (reader)");
+    reader
+        .batch_execute("BEGIN; LOCK TABLE cameras, recording_policies IN ACCESS SHARE MODE")
+        .await
+        .expect("take the camera-read locks");
+
+    let shim = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        db::ensure_named_policies_and_groups(app.pool()),
+    )
+    .await;
+
+    reader.batch_execute("COMMIT").await.expect("release reader");
+
+    shim.expect("boot shim must not wait on a camera reader (no ACCESS EXCLUSIVE lock)")
+        .expect("boot shim");
+    assert!(
+        cameras_policy_id_is_not_null(app.pool()).await,
+        "the shim must still leave cameras.policy_id NOT NULL"
+    );
+}
+
+/// Issue #693 end-to-end: camera lookups racing the boot shim (exactly what
+/// reconcile's orphan pass does at recorder boot) must never fail. The camera
+/// is added through the API like an operator's (main stream only, default
+/// policy).
+#[tokio::test]
+async fn get_camera_never_fails_while_boot_shim_runs() {
+    let app = TestApp::new().await;
+    let admin = seed_admin(app.pool()).await;
+    let token = login(&app, &admin.username, &admin.password).await;
+    let (cam_id, _name) = create_camera_on_default(&app, &token).await;
+
+    for _ in 0..25 {
+        let shim_pool = app.pool().clone();
+        let shim =
+            tokio::spawn(async move { db::ensure_named_policies_and_groups(&shim_pool).await });
+        let read_pool = app.pool().clone();
+        let reads = tokio::spawn(async move {
+            let mut errors = Vec::new();
+            for _ in 0..5 {
+                match db::get_camera(&read_pool, cam_id).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => errors.push("camera not found".to_owned()),
+                    Err(e) => errors.push(format!("{e:#}")),
+                }
+            }
+            errors
+        });
+        shim.await.expect("shim task").expect("boot shim");
+        let errors = reads.await.expect("reader task");
+        assert!(
+            errors.is_empty(),
+            "get_camera failed while the boot shim ran: {errors:?}"
+        );
+    }
+}
+
+/// The NOT NULL guard still repairs a mixed-version boot: an old binary's shim
+/// DROPped the constraint (landmine L4); the new shim must re-add it. Uses an
+/// isolated database because it mutates the shared `cameras` column.
+#[tokio::test]
+async fn boot_shim_readds_dropped_policy_id_not_null() {
+    let Some(iso) = make_isolated_db().await else {
+        eprintln!("skipping: no CREATE DATABASE-capable test Postgres");
+        return;
+    };
+    {
+        let c = iso.pool.get().await.expect("pool.get");
+        c.batch_execute("ALTER TABLE cameras ALTER COLUMN policy_id DROP NOT NULL")
+            .await
+            .expect("simulate an old binary's shim");
+    }
+    assert!(!cameras_policy_id_is_not_null(&iso.pool).await);
+
+    db::ensure_named_policies_and_groups(&iso.pool)
+        .await
+        .expect("boot shim");
+    assert!(
+        cameras_policy_id_is_not_null(&iso.pool).await,
+        "the shim must re-add NOT NULL when it is missing and no camera is NULL"
+    );
+}
