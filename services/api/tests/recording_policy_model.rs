@@ -1248,7 +1248,10 @@ async fn boot_shim_takes_no_exclusive_lock_on_settled_camera_tables() {
     )
     .await;
 
-    reader.batch_execute("COMMIT").await.expect("release reader");
+    reader
+        .batch_execute("COMMIT")
+        .await
+        .expect("release reader");
 
     shim.expect("boot shim must not wait on a camera reader (no ACCESS EXCLUSIVE lock)")
         .expect("boot shim");
