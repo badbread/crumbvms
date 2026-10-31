@@ -987,10 +987,8 @@ fun PlaybackScreen(
                         // Filmstrip thumbnail overlay during scrubbing
                         // (hidden while the drag is inside the loaded segment: the
                         // live player is the preview then)
-                        AnimatedVisibility(
+                        FadeInWhen(
                             visible = state.scrubbing && state.scrubFrameUrl != null && !state.scrubInLoadedSegment,
-                            enter = fadeIn(tween(100)),
-                            exit = ExitTransition.None,
                         ) {
                             Box(
                                 modifier = Modifier
@@ -1025,12 +1023,10 @@ fun PlaybackScreen(
                         // filmstrip frame wherever the server has pre-generated one
                         // for the segment under the finger (see ScrubSprites.kt).
                         val spriteTile = state.scrubSprite
-                        AnimatedVisibility(
+                        FadeInWhen(
                             visible = state.scrubbing && spriteTile != null && !state.scrubInLoadedSegment,
-                            enter = fadeIn(tween(100)),
-                            exit = ExitTransition.None,
                         ) {
-                            if (spriteTile == null) return@AnimatedVisibility
+                            if (spriteTile == null) return@FadeInWhen
                             val painter = remember(spriteTile) { spriteTilePainter(spriteTile) }
                             Image(
                                 painter = painter,
@@ -1248,6 +1244,18 @@ fun PlaybackScreen(
             },
             onDismiss = { showBookmarkDialog = false },
         )
+    }
+}
+
+/**
+ * P7: scrub-preview overlays fade in over 100 ms. A top-level wrapper so the plain
+ * [AnimatedVisibility] overload is used (inside the screen's Column/Box scopes the
+ * scoped overloads would otherwise be picked up).
+ */
+@Composable
+private fun FadeInWhen(visible: Boolean, content: @Composable () -> Unit) {
+    AnimatedVisibility(visible = visible, enter = fadeIn(tween(100)), exit = ExitTransition.None) {
+        content()
     }
 }
 

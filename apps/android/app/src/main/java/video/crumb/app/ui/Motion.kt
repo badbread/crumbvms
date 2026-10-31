@@ -2,6 +2,7 @@
 
 package video.crumb.app.ui
 
+import androidx.compose.ui.unit.dp
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.EaseOutCubic
 import androidx.compose.animation.core.tween

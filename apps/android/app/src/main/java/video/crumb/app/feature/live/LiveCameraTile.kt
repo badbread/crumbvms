@@ -2,6 +2,7 @@
 
 package video.crumb.app.feature.live
 
+import androidx.compose.foundation.layout.fillMaxWidth
 import video.crumb.app.ui.theme.Spacing
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.graphics.Shadow
