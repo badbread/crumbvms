@@ -263,7 +263,7 @@ Worth knowing, no action needed:
 Every pull request merged since 0.2.0, newest first. The release integration
 (#682) landed as one merge; the pull requests it carried are listed after it.
 
-- fix(recorder): stop the boot schema shim deadlocking orphan indexing (#696)
+- fix(recorder): stop the boot policy shim deadlocking reconcile's camera lookup (#696)
 - fix(api): create /exports in the image so a new export volume is writable (#695)
 - feat(android): Simple / Advanced playback controls setting (#690)
 - feat(android): LPR tab redesign (search + filter sheet, aspect-true rows, plate profile) (#689)
