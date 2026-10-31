@@ -79,6 +79,7 @@ fun SettingsDialog(
     var ptzStyle by remember { mutableStateOf(store.ptzStyle) }
     var motionTunerOn by remember { mutableStateOf(store.motionTunerEnabled) }
     var snapshotView by remember { mutableStateOf(store.snapshotCapturesView) }
+    var advancedPlayback by remember { mutableStateOf(store.advancedPlaybackControls) }
     var haShowEntityId by remember { mutableStateOf(store.showHaEntityId) }
     var haShowDeviceType by remember { mutableStateOf(store.showHaDeviceType) }
 
@@ -331,7 +332,44 @@ fun SettingsDialog(
 
                 // ── Playback section ─────────────────────────────────────────────
                 Text(
-                    text = "Playback — snapshot captures",
+                    text = "Playback",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = TextSecondary,
+                    modifier = Modifier.padding(top = 12.dp),
+                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(end = 8.dp),
+                    ) {
+                        Text(
+                            text = "Show advanced playback controls",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = TextPrimary,
+                        )
+                        Text(
+                            text = "Off keeps the playback bar simple, with the rest under More.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextSecondary,
+                        )
+                    }
+                    Switch(
+                        checked = advancedPlayback,
+                        onCheckedChange = { checked ->
+                            advancedPlayback = checked
+                            store.advancedPlaybackControls = checked
+                        },
+                        colors = crumbSwitchColors(),
+                    )
+                }
+                Text(
+                    text = "Snapshot captures",
                     style = MaterialTheme.typography.labelMedium,
                     color = TextSecondary,
                     modifier = Modifier.padding(top = 12.dp),

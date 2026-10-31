@@ -3,6 +3,22 @@
 package video.crumb.app.feature.playback
 
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.filled.HighQuality
+import androidx.compose.material.icons.filled.SkipNext
+import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.shape.CircleShape
@@ -335,6 +351,8 @@ fun PlaybackScreen(
     // without an audio track just plays silent when this is on — no crash.
     val store = container.store
     var audioOn by remember { mutableStateOf(store.playbackAudioOn) }
+    // Simple / Advanced playback controls (Settings > Playback). Device-local.
+    var advancedControls by remember { mutableStateOf(store.advancedPlaybackControls) }
     // Drive volume from the toggle, and request audio focus ONLY while sound is on
     // (so a silent scrub-through doesn't pause the user's music — Fable MED#3).
     LaunchedEffect(player, audioOn) {
@@ -824,6 +842,7 @@ fun PlaybackScreen(
                     // like "AUTO" wrapped to two lines ("AUT"/"O"). maxLines/softWrap
                     // are a belt-and-suspenders guard against wrap when the bar is
                     // crowded. (#262)
+                    if (PlaybackControlsPolicy.appBarHasQuality(advancedControls)) {
                     HintTooltip(PlaybackQuality.label(quality)) {
                         TextButton(
                             onClick = {
@@ -839,6 +858,7 @@ fun PlaybackScreen(
                                 softWrap = false,
                             )
                         }
+                    }
                     }
                     if (state.currentSegment != null) {
                         HintTooltip(if (audioOn) "Mute audio" else "Play audio") {
@@ -1124,11 +1144,8 @@ fun PlaybackScreen(
                         quality = PlaybackQuality.next(quality)
                         store.playbackQuality = quality
                     },
-                    // Portrait can't fit every control inline (the snapshot button was
-                    // being clipped), so the SECONDARY actions (snapshot, bookmark,
-                    // jump-to-time, speed) collapse into a 3-dot overflow menu. In
-                    // landscape they ride inline on the (taller-width) transport row.
-                    useOverflowMenu = !isLandscape,
+                    advanced = advancedControls,
+                    onSetAdvanced = { advancedControls = it; store.advancedPlaybackControls = it },
                     // In/out marking lives with the other secondary actions: touch
                     // has no Shift+drag, so the bracket is placed at the playhead
                     // from here and fine-tuned by dragging its handles.
@@ -1276,16 +1293,19 @@ private fun ExportSelectionBar(
 private val ExportBarBackground = Color(0xFF2A2410)
 
 /**
- * Row of playback transport controls.
+ * Row of playback transport controls, in one of two modes (the "Show advanced
+ * playback controls" setting, see [PlaybackControlsPolicy]):
  *
- * PRIMARY controls are always inline: go-to-first, frame step back, prev-motion,
- * play/pause, next-motion, frame step forward, go-to-last.
+ * - Simple ([advanced] = false): speed chip, previous motion, play/pause, next
+ *   motion, a Live pill and More. More opens a bottom sheet of labelled tiles holding
+ *   everything else, so nothing is removed, just one tap away.
+ * - Advanced ([advanced] = true): every control visible. Landscape is one grouped
+ *   row with thin dividers; portrait is a navigation row plus a row of labelled
+ *   tools (mute and quality stay in the app bar there).
  *
- * SECONDARY actions (speed, jump-to-time, snapshot, bookmark) either ride inline
- * (landscape, where the row is wide enough) or collapse into a 3-dot overflow
- * [DropdownMenu] ([useOverflowMenu] = true, portrait) so nothing is clipped — this
- * is the N1 fix for the cut-off snapshot button in portrait.
+ * Only layout and where actions live differ; every handler is the same one.
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun PlaybackControls(
     playing: Boolean,
@@ -1302,15 +1322,14 @@ private fun PlaybackControls(
     currentPlayheadMs: Long,
     modifier: Modifier = Modifier,
     compact: Boolean = false,
-    useOverflowMenu: Boolean = false,
+    advanced: Boolean = true,
+    onSetAdvanced: (Boolean) -> Unit = {},
     onSnapshot: (() -> Unit)? = null,
     onBookmark: (() -> Unit)? = null,
-    // Audio toggle rides inline on the landscape transport row (in portrait it
-    // lives in the top app bar instead). null hides it.
+    // Landscape has no app bar, so the audio toggle and quality selector ride on
+    // the bar there (Advanced) or in the More sheet (Simple). null hides them.
     audioOn: Boolean = false,
     onToggleAudio: (() -> Unit)? = null,
-    // Quality selector (Auto/Full/Data saver) rides inline on the landscape row
-    // too. null hides it (portrait uses the app bar chip).
     quality: String = PlaybackQuality.AUTO,
     onCycleQuality: (() -> Unit)? = null,
     // Export in/out marking. Touch has no Shift+drag, so the bracket is placed at
@@ -1322,20 +1341,17 @@ private fun PlaybackControls(
     onClearSelection: (() -> Unit)? = null,
     onExport: (() -> Unit)? = null,
 ) {
-    // Landscape is vertically cramped, so the transport runs a notch smaller there
-    // (this is what "shrinks the play/pause bar"). Portrait keeps its roomier sizes.
+    val landscape = compact
+    // Landscape is vertically cramped, so the transport runs a notch smaller there.
     val ctlSize = if (compact) 30.dp else 38.dp
     val ctlIcon = if (compact) 18.dp else 22.dp
     val playSize = if (compact) 38.dp else 50.dp
     val playIcon = if (compact) 22.dp else 28.dp
 
-    // Shared launcher for the date+time "jump to" picker (used inline AND from the
-    // overflow menu). Opens the reliable Material3 date→time dialog rendered below
-    // (replaces the old native spinner DatePickerDialog, whose date step never
-    // advanced to the time step on modern Android — "only picks date").
+    // Shared launcher for the date+time "jump to" picker (Material3 date then time
+    // dialog), used from the Advanced bar and from the Simple More sheet.
     var showJump by remember { mutableStateOf(false) }
     val launchJumpPicker: () -> Unit = { showJump = true }
-
     if (showJump) {
         JumpToDateTimeDialog(
             initialMs = currentPlayheadMs,
@@ -1347,229 +1363,184 @@ private fun PlaybackControls(
         )
     }
 
-    Row(
-        modifier = modifier,
-        horizontalArrangement = Arrangement.Center,
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        // ── PRIMARY transport (always inline) ────────────────────────────────────
-        // Go to first (earliest footage)
-        SmallControl(Icons.Default.FirstPage, "Go to first recording", ctlSize, ctlIcon, onGotoFirst)
-        // Frame step back
-        SmallControl(Icons.Default.NavigateBefore, "Step back one frame", ctlSize, ctlIcon, onStepBack)
-        // Previous motion — chevron + running-person so it reads "jump to MOTION".
-        MotionJumpControl(forward = false, size = ctlSize, iconSize = ctlIcon, onClick = onPrevMotion)
+    // Simple mode: the Frame step tile pins the step buttons on the bar until play
+    // is pressed (stepping is a paused-video action, so pressing play drops them).
+    var stepPinned by remember { mutableStateOf(false) }
+    val playPause: () -> Unit = {
+        if (!playing) stepPinned = false
+        onPlayPause()
+    }
+    var sheetOpen by remember { mutableStateOf(false) }
+    var markMenuOpen by remember { mutableStateOf(false) }
+    var switchMenuOpen by remember { mutableStateOf(false) }
 
-        Spacer(Modifier.width(2.dp))
+    val hasMark = onMarkIn != null || onMarkOut != null
+    val markTint = if (onClearSelection != null) {
+        TimelineColors.exportHandle
+    } else {
+        MaterialTheme.colorScheme.onSurface
+    }
+    val markMenu: @Composable () -> Unit = {
+        DropdownMenu(expanded = markMenuOpen, onDismissRequest = { markMenuOpen = false }) {
+            ExportMarkMenuItems(
+                onMarkIn = onMarkIn,
+                onMarkOut = onMarkOut,
+                onClearSelection = onClearSelection,
+                onExport = onExport,
+                onChosen = { markMenuOpen = false; sheetOpen = false },
+            )
+        }
+    }
 
-        // Play / Pause
-        HintTooltip(if (playing) "Pause" else "Play") {
-            IconButton(
-                onClick = onPlayPause,
-                modifier = Modifier
-                    .size(playSize)
-                    .background(color = MaterialTheme.colorScheme.primary, shape = CircleShape),
-            ) {
-                Icon(
-                    imageVector = if (playing) Icons.Default.Pause else Icons.Default.PlayArrow,
-                    contentDescription = if (playing) "Pause" else "Play",
-                    tint = MaterialTheme.colorScheme.onPrimary,
-                    modifier = Modifier.size(playIcon),
-                )
+    if (!advanced) {
+        // ── SIMPLE bar ──────────────────────────────────────────────────────────
+        val barSize = if (compact) 40.dp else 44.dp
+        Row(
+            modifier = modifier,
+            horizontalArrangement = Arrangement.Center,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            SpeedChip(speed, onSetSpeed)
+            Spacer(Modifier.width(2.dp))
+            if (stepPinned) {
+                SmallControl(Icons.Default.NavigateBefore, "Step back one frame", barSize, ctlIcon, onStepBack)
             }
+            MotionJumpControl(forward = false, size = ctlSize, iconSize = ctlIcon, onClick = onPrevMotion)
+            PlayPauseButton(playing, playSize, playIcon, playPause)
+            MotionJumpControl(forward = true, size = ctlSize, iconSize = ctlIcon, onClick = onNextMotion)
+            if (stepPinned) {
+                SmallControl(Icons.Default.NavigateNext, "Step forward one frame", barSize, ctlIcon, onStepFwd)
+            }
+            LivePill(onGotoLast)
+            SmallControl(Icons.Default.MoreVert, "More controls", barSize, ctlIcon) { sheetOpen = true }
         }
 
-        Spacer(Modifier.width(2.dp))
-
-        // Next motion — running-person + chevron (mirror of previous-motion).
-        MotionJumpControl(forward = true, size = ctlSize, iconSize = ctlIcon, onClick = onNextMotion)
-        // Frame step forward
-        SmallControl(Icons.Default.NavigateNext, "Step forward one frame", ctlSize, ctlIcon, onStepFwd)
-        // Go to last (latest footage)
-        SmallControl(Icons.Default.LastPage, "Go to last recording", ctlSize, ctlIcon, onGotoLast)
-
-        Spacer(Modifier.width(6.dp))
-
-        if (useOverflowMenu) {
-            // ── SECONDARY actions in a 3-dot overflow menu (portrait) ─────────────
-            // Keeps the row inside the screen width — the snapshot button was being
-            // clipped when all of these rode inline. Menu items carry text labels.
-            Box {
-                var menuOpen by remember { mutableStateOf(false) }
-                HintTooltip("More controls") {
-                    IconButton(onClick = { menuOpen = true }, modifier = Modifier.size(ctlSize)) {
-                        Icon(
-                            Icons.Default.MoreVert,
-                            contentDescription = "More controls",
-                            tint = MaterialTheme.colorScheme.onSurface,
-                            modifier = Modifier.size(ctlIcon),
-                        )
-                    }
+        if (sheetOpen) {
+            ModalBottomSheet(
+                onDismissRequest = { sheetOpen = false },
+                sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+                containerColor = NavySurface,
+            ) {
+                val tiles = mutableListOf<@Composable (Modifier) -> Unit>()
+                tiles += { m -> SheetTile(m, Icons.Default.Schedule, "Jump to time") { sheetOpen = false; launchJumpPicker() } }
+                onSnapshot?.let { cb ->
+                    tiles += { m -> SheetTile(m, Icons.Default.PhotoCamera, "Snapshot") { sheetOpen = false; cb() } }
                 }
-                DropdownMenu(
-                    expanded = menuOpen,
-                    onDismissRequest = { menuOpen = false },
-                ) {
-                    onSnapshot?.let { cb ->
-                        DropdownMenuItem(
-                            text = { Text("Snapshot") },
-                            leadingIcon = { Icon(Icons.Default.PhotoCamera, contentDescription = null) },
-                            onClick = { menuOpen = false; cb() },
-                        )
-                    }
-                    onBookmark?.let { cb ->
-                        DropdownMenuItem(
-                            text = { Text("Add bookmark") },
-                            leadingIcon = { Icon(Icons.Default.BookmarkAdd, contentDescription = null) },
-                            onClick = { menuOpen = false; cb() },
-                        )
-                    }
-                    DropdownMenuItem(
-                        text = { Text("Jump to date & time") },
-                        leadingIcon = { Icon(Icons.Default.Schedule, contentDescription = null) },
-                        onClick = { menuOpen = false; launchJumpPicker() },
-                    )
-                    ExportMarkMenuItems(
-                        onMarkIn = onMarkIn,
-                        onMarkOut = onMarkOut,
-                        onClearSelection = onClearSelection,
-                        onExport = onExport,
-                        onChosen = { menuOpen = false },
-                    )
-                    // Speed — a small inline radio-ish list inside the menu (each speed
-                    // is its own item; the current one is bold/accented).
-                    Box1pxMenuDivider()
-                    Text(
-                        text = "Playback speed",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = TextSecondary,
-                        modifier = Modifier.padding(start = 12.dp, top = 6.dp, bottom = 2.dp),
-                    )
-                    listOf(8f, 4f, 2f, 1f, 0.5f).forEach { s ->
-                        val isCurrent = s == speed
-                        DropdownMenuItem(
-                            text = {
-                                Text(
-                                    speedLabel(s),
-                                    fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal,
-                                    color = if (isCurrent) MaterialTheme.colorScheme.primary
-                                            else MaterialTheme.colorScheme.onSurface,
-                                )
-                            },
-                            onClick = { onSetSpeed(s); menuOpen = false },
-                        )
-                    }
+                onBookmark?.let { cb ->
+                    tiles += { m -> SheetTile(m, Icons.Default.BookmarkAdd, "Bookmark") { sheetOpen = false; cb() } }
                 }
-            }
-        } else {
-            // ── SECONDARY actions inline (landscape — the row is wide enough) ──────
-            // Speed picker — tap to EXPAND a menu of speeds and pick one (instead of
-            // cycling). The transport bar sits at the bottom of the screen, so the
-            // menu opens UPWARD; fastest is at the top so scanning up = faster.
-            Box {
-                var speedMenuOpen by remember { mutableStateOf(false) }
-                HintTooltip("Playback speed") {
-                    FilledTonalButton(
-                        onClick = { speedMenuOpen = true },
-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 10.dp, end = 4.dp),
-                        colors = ButtonDefaults.filledTonalButtonColors(
-                            containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                            contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                        ),
-                    ) {
-                        Text(speedLabel(speed), style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
-                        Icon(Icons.Default.ArrowDropUp, contentDescription = "Pick speed", modifier = Modifier.size(18.dp))
-                    }
-                }
-                DropdownMenu(
-                    expanded = speedMenuOpen,
-                    onDismissRequest = { speedMenuOpen = false },
-                ) {
-                    listOf(8f, 4f, 2f, 1f, 0.5f).forEach { s ->
-                        val isCurrent = s == speed
-                        DropdownMenuItem(
-                            text = {
-                                Text(
-                                    speedLabel(s),
-                                    fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal,
-                                    color = if (isCurrent) MaterialTheme.colorScheme.primary
-                                            else MaterialTheme.colorScheme.onSurface,
-                                )
-                            },
-                            onClick = { onSetSpeed(s); speedMenuOpen = false },
-                        )
-                    }
-                }
-            }
-
-            // Jump-to-date-and-time button — DatePicker → TimePicker.
-            SmallControl(Icons.Default.Schedule, "Jump to date & time", ctlSize, ctlIcon, launchJumpPicker)
-
-            // Export in/out marking — its own small menu here (landscape hides the
-            // 3-dot overflow that carries these items in portrait).
-            if (onMarkIn != null || onMarkOut != null) {
-                Box {
-                    var markMenuOpen by remember { mutableStateOf(false) }
-                    HintTooltip("Mark for export") {
-                        IconButton(
-                            onClick = { markMenuOpen = true },
-                            modifier = Modifier.size(ctlSize),
-                        ) {
-                            Icon(
-                                Icons.Default.ContentCut,
-                                contentDescription = "Mark for export",
-                                tint = if (onClearSelection != null) {
-                                    TimelineColors.exportHandle
-                                } else {
-                                    MaterialTheme.colorScheme.onSurface
-                                },
-                                modifier = Modifier.size(ctlIcon),
-                            )
+                if (hasMark) {
+                    tiles += { m ->
+                        Box(m) {
+                            SheetTile(Modifier.fillMaxWidth(), Icons.Default.ContentCut, "Clip", tint = markTint) {
+                                markMenuOpen = true
+                            }
+                            markMenu()
                         }
                     }
-                    DropdownMenu(
-                        expanded = markMenuOpen,
-                        onDismissRequest = { markMenuOpen = false },
-                    ) {
-                        ExportMarkMenuItems(
-                            onMarkIn = onMarkIn,
-                            onMarkOut = onMarkOut,
-                            onClearSelection = onClearSelection,
-                            onExport = onExport,
-                            onChosen = { markMenuOpen = false },
-                        )
-                    }
                 }
-            }
-
-            // Snapshot + Bookmark share this transport row in landscape (the app bar
-            // is hidden there). In portrait they live in the overflow menu above.
-            if (onSnapshot != null || onBookmark != null || onToggleAudio != null || onCycleQuality != null) {
-                Spacer(Modifier.width(6.dp))
-                onSnapshot?.let {
-                    SmallControl(Icons.Default.PhotoCamera, "Snapshot", ctlSize, ctlIcon, it)
-                }
-                onBookmark?.let {
-                    SmallControl(Icons.Default.BookmarkAdd, "Add bookmark", ctlSize, ctlIcon, it)
-                }
-                // Quality selector (Auto/Full/Data saver) — a compact text chip
-                // matching the portrait app-bar control.
                 onCycleQuality?.let { cycle ->
-                    HintTooltip(PlaybackQuality.label(quality)) {
-                        IconButton(onClick = cycle, modifier = Modifier.size(ctlSize)) {
-                            Text(
-                                // Compact label — a fixed 30dp box truncates "AUTO"
-                                // to "AUT"; shortCompact renders "A" for Auto instead.
-                                text = PlaybackQuality.shortCompact(quality),
-                                color = if (quality == PlaybackQuality.AUTO) Color.White else TealAccent,
-                                maxLines = 1,
-                                softWrap = false,
-                            )
+                    tiles += { m ->
+                        SheetTile(m, Icons.Default.HighQuality, "Quality", sub = PlaybackQuality.label(quality)) { cycle() }
+                    }
+                }
+                tiles += { m -> SheetTile(m, Icons.Default.FirstPage, "Go to first") { sheetOpen = false; onGotoFirst() } }
+                tiles += { m ->
+                    SheetTile(m, Icons.Default.SkipNext, "Frame step", active = stepPinned) {
+                        stepPinned = !stepPinned
+                        sheetOpen = false
+                    }
+                }
+                if (landscape) {
+                    onToggleAudio?.let { toggle ->
+                        tiles += { m ->
+                            SheetTile(
+                                m,
+                                if (audioOn) Icons.Default.VolumeUp else Icons.Default.VolumeOff,
+                                if (audioOn) "Mute" else "Sound on",
+                                active = audioOn,
+                            ) { toggle() }
                         }
                     }
                 }
-                // Audio on/off — same row as Snapshot/Bookmark in landscape (teal
-                // when on), instead of a float that lands over the video.
+                val perRow = if (landscape) 5 else 4
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState())
+                        .padding(horizontal = 12.dp),
+                ) {
+                    tiles.chunked(perRow).forEach { rowTiles ->
+                        Row(Modifier.fillMaxWidth()) {
+                            rowTiles.forEach { t -> t(Modifier.weight(1f)) }
+                            repeat(perRow - rowTiles.size) { Spacer(Modifier.weight(1f)) }
+                        }
+                    }
+                    Box(Modifier.fillMaxWidth().padding(vertical = 8.dp), contentAlignment = Alignment.Center) {
+                        TextButton(
+                            onClick = { sheetOpen = false; onSetAdvanced(true) },
+                            modifier = Modifier.heightIn(min = 48.dp),
+                        ) {
+                            Icon(Icons.Default.Tune, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text("Switch to advanced controls")
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                }
+            }
+        }
+        return
+    }
+
+    // ── ADVANCED bar ────────────────────────────────────────────────────────────
+    // Long-pressing a gap on the bar offers the way back to Simple. The menu is
+    // anchored in the same Box so it opens next to the bar.
+    Box(
+        modifier = modifier.pointerInput(Unit) {
+            detectTapGestures(onLongPress = { switchMenuOpen = true })
+        },
+    ) {
+        if (landscape) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                SmallControl(Icons.Default.FirstPage, "Go to first recording", ctlSize, ctlIcon, onGotoFirst)
+                SmallControl(Icons.Default.NavigateBefore, "Step back one frame", ctlSize, ctlIcon, onStepBack)
+                MotionJumpControl(forward = false, size = ctlSize, iconSize = ctlIcon, onClick = onPrevMotion)
+                Spacer(Modifier.width(2.dp))
+                PlayPauseButton(playing, playSize, playIcon, onPlayPause)
+                Spacer(Modifier.width(2.dp))
+                MotionJumpControl(forward = true, size = ctlSize, iconSize = ctlIcon, onClick = onNextMotion)
+                SmallControl(Icons.Default.NavigateNext, "Step forward one frame", ctlSize, ctlIcon, onStepFwd)
+                SmallControl(Icons.Default.LastPage, "Go to last recording", ctlSize, ctlIcon, onGotoLast)
+
+                BarDivider()
+                SpeedChip(speed, onSetSpeed)
+                SmallControl(Icons.Default.Schedule, "Jump to date and time", ctlSize, ctlIcon, launchJumpPicker)
+
+                if (hasMark || onSnapshot != null || onBookmark != null) BarDivider()
+                if (hasMark) {
+                    Box {
+                        HintTooltip("Mark for export") {
+                            IconButton(onClick = { markMenuOpen = true }, modifier = Modifier.size(ctlSize)) {
+                                Icon(
+                                    Icons.Default.ContentCut,
+                                    contentDescription = "Mark for export",
+                                    tint = markTint,
+                                    modifier = Modifier.size(ctlIcon),
+                                )
+                            }
+                        }
+                        markMenu()
+                    }
+                }
+                onSnapshot?.let { SmallControl(Icons.Default.PhotoCamera, "Snapshot", ctlSize, ctlIcon, it) }
+                onBookmark?.let { SmallControl(Icons.Default.BookmarkAdd, "Add bookmark", ctlSize, ctlIcon, it) }
+
+                if (onToggleAudio != null || onCycleQuality != null) BarDivider()
                 onToggleAudio?.let { toggle ->
                     HintTooltip(if (audioOn) "Mute audio" else "Play audio") {
                         IconButton(onClick = toggle, modifier = Modifier.size(ctlSize)) {
@@ -1582,9 +1553,253 @@ private fun PlaybackControls(
                         }
                     }
                 }
+                onCycleQuality?.let { cycle ->
+                    HintTooltip(PlaybackQuality.label(quality)) {
+                        IconButton(onClick = cycle, modifier = Modifier.size(ctlSize)) {
+                            Text(
+                                // A fixed box truncates "AUTO" to "AUT"; shortCompact is "A".
+                                text = PlaybackQuality.shortCompact(quality),
+                                color = if (quality == PlaybackQuality.AUTO) Color.White else TealAccent,
+                                maxLines = 1,
+                                softWrap = false,
+                            )
+                        }
+                    }
+                }
+            }
+        } else {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    SmallControl(Icons.Default.FirstPage, "Go to first recording", ctlSize, ctlIcon, onGotoFirst)
+                    SmallControl(Icons.Default.NavigateBefore, "Step back one frame", ctlSize, ctlIcon, onStepBack)
+                    MotionJumpControl(forward = false, size = ctlSize, iconSize = ctlIcon, onClick = onPrevMotion)
+                    Spacer(Modifier.width(2.dp))
+                    PlayPauseButton(playing, playSize, playIcon, onPlayPause)
+                    Spacer(Modifier.width(2.dp))
+                    MotionJumpControl(forward = true, size = ctlSize, iconSize = ctlIcon, onClick = onNextMotion)
+                    SmallControl(Icons.Default.NavigateNext, "Step forward one frame", ctlSize, ctlIcon, onStepFwd)
+                    SmallControl(Icons.Default.LastPage, "Go to last recording", ctlSize, ctlIcon, onGotoLast)
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceEvenly,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    SpeedTool(speed, onSetSpeed)
+                    LabelledTool(Icons.Default.Schedule, "Jump to date and time", "Jump", onClick = launchJumpPicker)
+                    if (hasMark) {
+                        Box {
+                            LabelledTool(Icons.Default.ContentCut, "Mark for export", "Clip", tint = markTint) {
+                                markMenuOpen = true
+                            }
+                            markMenu()
+                        }
+                    }
+                    onSnapshot?.let { LabelledTool(Icons.Default.PhotoCamera, "Snapshot", "Snapshot", onClick = it) }
+                    onBookmark?.let { LabelledTool(Icons.Default.BookmarkAdd, "Add bookmark", "Bookmark", onClick = it) }
+                }
+            }
+        }
+        DropdownMenu(expanded = switchMenuOpen, onDismissRequest = { switchMenuOpen = false }) {
+            DropdownMenuItem(
+                text = { Text("Switch to simple controls") },
+                leadingIcon = { Icon(Icons.Default.Tune, contentDescription = null) },
+                onClick = { switchMenuOpen = false; onSetAdvanced(false) },
+            )
+        }
+    }
+}
+
+/** Round play/pause button shared by every transport layout. */
+@Composable
+private fun PlayPauseButton(playing: Boolean, size: Dp, iconSize: Dp, onClick: () -> Unit) {
+    HintTooltip(if (playing) "Pause" else "Play") {
+        IconButton(
+            onClick = onClick,
+            modifier = Modifier
+                .size(size)
+                .background(color = MaterialTheme.colorScheme.primary, shape = CircleShape),
+        ) {
+            Icon(
+                imageVector = if (playing) Icons.Default.Pause else Icons.Default.PlayArrow,
+                contentDescription = if (playing) "Pause" else "Play",
+                tint = MaterialTheme.colorScheme.onPrimary,
+                modifier = Modifier.size(iconSize),
+            )
+        }
+    }
+}
+
+/**
+ * Speed picker chip ("1x"). Tap to expand a menu of speeds; the transport bar sits
+ * at the bottom of the screen so the menu opens upward, fastest at the top.
+ */
+@Composable
+private fun SpeedChip(speed: Float, onSetSpeed: (Float) -> Unit) {
+    Box {
+        var open by remember { mutableStateOf(false) }
+        HintTooltip("Playback speed") {
+            FilledTonalButton(
+                onClick = { open = true },
+                contentPadding = PaddingValues(start = 10.dp, end = 4.dp),
+                colors = ButtonDefaults.filledTonalButtonColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                    contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                ),
+            ) {
+                Text(speedLabel(speed), style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+                Icon(Icons.Default.ArrowDropUp, contentDescription = "Pick speed", modifier = Modifier.size(18.dp))
+            }
+        }
+        SpeedMenu(open, speed, onSetSpeed) { open = false }
+    }
+}
+
+@Composable
+private fun SpeedMenu(open: Boolean, speed: Float, onSetSpeed: (Float) -> Unit, onClose: () -> Unit) {
+    DropdownMenu(expanded = open, onDismissRequest = onClose) {
+        listOf(8f, 4f, 2f, 1f, 0.5f).forEach { s ->
+            val isCurrent = s == speed
+            DropdownMenuItem(
+                text = {
+                    Text(
+                        speedLabel(s),
+                        fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal,
+                        color = if (isCurrent) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurface,
+                    )
+                },
+                onClick = { onSetSpeed(s); onClose() },
+            )
+        }
+    }
+}
+
+/** Labelled speed tool for the Advanced portrait tools row (current speed as the glyph). */
+@Composable
+private fun SpeedTool(speed: Float, onSetSpeed: (Float) -> Unit) {
+    Box {
+        var open by remember { mutableStateOf(false) }
+        LabelledTool(null, "Playback speed", "Speed", glyph = speedLabel(speed)) { open = true }
+        SpeedMenu(open, speed, onSetSpeed) { open = false }
+    }
+}
+
+/** Icon (or short text glyph) with a one-word label under it, 48dp minimum touch target. */
+@Composable
+private fun LabelledTool(
+    icon: androidx.compose.ui.graphics.vector.ImageVector?,
+    desc: String,
+    label: String,
+    glyph: String? = null,
+    tint: Color = MaterialTheme.colorScheme.onSurface,
+    onClick: () -> Unit,
+) {
+    HintTooltip(desc) {
+        Column(
+            modifier = Modifier
+                .heightIn(min = 48.dp)
+                .widthIn(min = 56.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .clickable(role = Role.Button, onClick = onClick)
+                .semantics { contentDescription = desc }
+                .padding(horizontal = 6.dp, vertical = 4.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            if (icon != null) {
+                Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(22.dp))
+            } else {
+                Text(
+                    glyph.orEmpty(),
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = tint,
+                    modifier = Modifier.height(22.dp),
+                )
+            }
+            Text(label, style = MaterialTheme.typography.labelSmall, color = TextSecondary, maxLines = 1)
+        }
+    }
+}
+
+/** The "Live" pill: jumps to the latest footage. 48dp tall hit area around a small pill. */
+@Composable
+private fun LivePill(onClick: () -> Unit) {
+    HintTooltip("Go to latest recording") {
+        Box(
+            modifier = Modifier
+                .heightIn(min = 48.dp)
+                .clip(CircleShape)
+                .clickable(role = Role.Button, onClick = onClick)
+                .semantics { contentDescription = "Go to latest recording" }
+                .padding(horizontal = 4.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Row(
+                modifier = Modifier
+                    .background(MaterialTheme.colorScheme.surfaceVariant, CircleShape)
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(Modifier.size(7.dp).background(TealAccent, CircleShape))
+                Spacer(Modifier.width(6.dp))
+                Text("Live", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurface)
             }
         }
     }
+}
+
+/** One tile in the Simple More sheet: icon over a short label, optional state line. */
+@Composable
+private fun SheetTile(
+    modifier: Modifier,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    sub: String? = null,
+    active: Boolean = false,
+    tint: Color = MaterialTheme.colorScheme.onSurface,
+    onClick: () -> Unit,
+) {
+    Column(
+        modifier = modifier
+            .heightIn(min = 72.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(role = Role.Button, onClick = onClick)
+            .padding(vertical = 8.dp, horizontal = 2.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Icon(
+            icon,
+            contentDescription = null,
+            tint = if (active) TealAccent else tint,
+            modifier = Modifier.size(24.dp),
+        )
+        Spacer(Modifier.height(4.dp))
+        Text(
+            label,
+            style = MaterialTheme.typography.labelMedium,
+            color = if (active) TealAccent else MaterialTheme.colorScheme.onSurface,
+            textAlign = TextAlign.Center,
+            maxLines = 1,
+        )
+        if (sub != null) {
+            Text(sub, style = MaterialTheme.typography.labelSmall, color = TextSecondary, maxLines = 1)
+        }
+    }
+}
+
+/** Thin vertical divider between control groups on the Advanced landscape bar. */
+@Composable
+private fun BarDivider() {
+    Spacer(Modifier.width(6.dp))
+    Box(Modifier.width(1.dp).height(20.dp).background(TextSecondary.copy(alpha = 0.35f)))
+    Spacer(Modifier.width(6.dp))
 }
 
 /**
@@ -1632,18 +1847,6 @@ private fun ExportMarkMenuItems(
             onClick = { onChosen(); cb() },
         )
     }
-}
-
-/** A thin divider used inside the transport overflow DropdownMenu. */
-@Composable
-private fun Box1pxMenuDivider() {
-    Spacer(
-        Modifier
-            .fillMaxWidth()
-            .padding(top = 4.dp)
-            .height(1.dp)
-            .background(NavyDeep),
-    )
 }
 
 /**
