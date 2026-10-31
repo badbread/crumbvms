@@ -82,6 +82,15 @@ missing disk. None of that is visible on a good day, which is the point.
   export now counts as finished, and the file keeps the name the server gave it
   (#620).
 
+### Your camera order, in every app
+
+- **Choose the order cameras are listed in.** In the console, Cameras now has
+  a **Reorder** button: drag cameras into place (or use the arrows) and save.
+  Windows, Android, iPhone and Mac, and the console all list cameras in that
+  order, and connected apps pick it up on their own. New cameras go at the
+  end, and **Reset to name order** goes back to the default (#698,
+  migration 0085).
+
 ### Desktop
 
 - **Fullscreen keeps the wall playing.** Entering fullscreen used to leave tiles
@@ -199,7 +208,7 @@ missing disk. None of that is visible on a good day, which is the point.
 
 An in-place upgrade from the v0.2.0 published images was tested end to end, and
 so was rolling back. `.env` needs no changes: every new key is optional. The
-four new migrations applied once each on first boot, footage came through
+five new migrations applied once each on first boot, footage came through
 byte-identical, recording carried on, and devices that were signed in stayed
 signed in. Upgrade the server before the clients; a 0.3.0 desktop's "Open in
 browser" needs a 0.3.0 server.
@@ -279,6 +288,7 @@ Worth knowing, no action needed:
 Every pull request merged since 0.2.0, newest first. The release integration
 (#682) landed as one merge; the pull requests it carried are listed after it.
 
+- feat: admin-set camera display order (drag to reorder in the console) (#698)
 - feat(android): hide the Playback controls in landscape (tap the video, auto-hide while playing) (#697)
 - fix(recorder): stop the boot policy shim deadlocking reconcile's camera lookup (#696)
 - feat(android): light polish pass (motion, spacing, cleaner pages) (#691)
