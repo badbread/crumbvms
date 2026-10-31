@@ -103,6 +103,7 @@ missing disk. None of that is visible on a good day, which is the point.
 - Options to overlay the tile info bar on the video (#642) and to hide the
   live-wall performance stats (#653). Grid card actions stay clickable with hover
   zoom on (#686), and the date picker header no longer wraps (#648).
+- The Clips tile-size button shows the size you are on (#650).
 
 ### Android
 
@@ -118,6 +119,16 @@ missing disk. None of that is visible on a good day, which is the point.
   (#615).
 - Fixed two crashes from the same cause: the app closing at launch, and
   Playback closing when you switched camera in landscape (#684, #688).
+- **A light polish pass:** smoother tab and camera transitions, a consistent
+  spacing and type scale, quieter hints, plain-language clip kinds and
+  durations, and sign-in errors shown under the field. Navigation and controls
+  are unchanged (#691).
+
+### macOS
+
+- **Exports download the new way.** The Mac app sends its credential in a header
+  instead of the download link, which a 0.3.0 server requires. Update the Mac
+  app along with the server (#625).
 
 ### Home Assistant and notifications
 
@@ -264,7 +275,9 @@ Every pull request merged since 0.2.0, newest first. The release integration
 (#682) landed as one merge; the pull requests it carried are listed after it.
 
 - fix(recorder): stop the boot policy shim deadlocking reconcile's camera lookup (#696)
+- feat(android): light polish pass (motion, spacing, cleaner pages) (#691)
 - fix(api): create /exports in the image so a new export volume is writable (#695)
+- Desktop Clips: tile-size button shows the current size (#650)
 - feat(android): Simple / Advanced playback controls setting (#690)
 - feat(android): LPR tab redesign (search + filter sheet, aspect-true rows, plate profile) (#689)
 - fix(android): run Playback's first startCamera after every field exists (#688)
