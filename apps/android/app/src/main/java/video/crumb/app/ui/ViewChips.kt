@@ -6,6 +6,12 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.unit.dp
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -42,8 +48,37 @@ fun ViewChipsRow(
     /** Selected-chip accent: the tab colour of the screen hosting the chips (L2). */
     accent: Color = TealAccent,
 ) {
+    val scroll = rememberScrollState()
     Row(
-        modifier = modifier.horizontalScroll(rememberScrollState()),
+        modifier = modifier
+            // Fade whichever edge has more chips beyond it, so a chip cut off at the
+            // edge reads as "scroll for more" rather than as clipped text.
+            .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+            .drawWithContent {
+                drawContent()
+                val fade = 24.dp.toPx()
+                if (scroll.canScrollForward) {
+                    drawRect(
+                        Brush.horizontalGradient(
+                            listOf(Color.Black, Color.Transparent),
+                            startX = size.width - fade,
+                            endX = size.width,
+                        ),
+                        blendMode = BlendMode.DstIn,
+                    )
+                }
+                if (scroll.canScrollBackward) {
+                    drawRect(
+                        Brush.horizontalGradient(
+                            listOf(Color.Transparent, Color.Black),
+                            startX = 0f,
+                            endX = fade,
+                        ),
+                        blendMode = BlendMode.DstIn,
+                    )
+                }
+            }
+            .horizontalScroll(scroll),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(Spacing.s),
     ) {
