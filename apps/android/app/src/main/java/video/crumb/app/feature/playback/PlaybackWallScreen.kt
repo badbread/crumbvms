@@ -506,6 +506,18 @@ fun PlaybackWallScreen(
                     // G10: keep the transport clear of the display cutout in landscape.
                     .windowInsetsPadding(WindowInsets.displayCutout.only(WindowInsetsSides.Horizontal)),
             ) {
+                // W3: first-run hint on its own centred line, so it is never cut off
+                // by the time chip; gone for good once a camera has been opened.
+                if (PlaybackWallHint.shouldShow(hintSeen)) {
+                    Text(
+                        text = PlaybackWallHint.TEXT,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
+                        maxLines = 1,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth().padding(top = Spacing.xs),
+                    )
+                }
                 Row(
                     modifier = Modifier.fillMaxWidth()
                         .padding(horizontal = Spacing.l, vertical = if (isLandscape) 0.dp else Spacing.xs),
@@ -518,18 +530,7 @@ fun PlaybackWallScreen(
                         label = "Latest",
                         accent = TimelineColors.playhead,
                     )
-                    // W3: quieter, shorter, and gone after the first camera is opened.
-                    if (PlaybackWallHint.shouldShow(hintSeen)) {
-                        Text(
-                            text = PlaybackWallHint.TEXT,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
-                            maxLines = 1,
-                            modifier = Modifier.weight(1f).padding(horizontal = Spacing.m),
-                        )
-                    } else {
-                        Spacer(Modifier.weight(1f))
-                    }
+                    Spacer(Modifier.weight(1f))
                     // W4: the time readout rides on this row, mono, in a small chip.
                     Text(
                         text = Time.dateTimeCompact(Instant.ofEpochMilli(cursorMs)),
