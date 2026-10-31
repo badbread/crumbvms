@@ -93,6 +93,12 @@ The choice is stored on the phone, so each device can differ.
 Phones that had the app before this option existed start in Advanced, so nothing
 moves on update. The camera wall view in Playback is the same in both modes.
 
+In landscape, tap the video to hide the controls and give the footage the whole
+screen; tap again to bring them back. While a recording plays, the controls also
+hide by themselves after a few seconds without a touch. They stay up while paused,
+while you scrub, and while a menu is open. With the controls hidden, the time
+still shows in the corner.
+
 ## Verifying the download (optional but recommended)
 
 The APK is signed with the project's release keystore in CI, but it isn't
