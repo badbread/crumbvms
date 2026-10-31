@@ -22,7 +22,7 @@ scripts/backup-db.sh
 # In .env, pin the version you want (the image prefix already defaults to
 # the public ghcr.io/badbread/crumbvms, so leave CRUMB_IMAGE_PREFIX alone
 # unless you run a fork on a different registry):
-#   CRUMB_VERSION=v0.2.0
+#   CRUMB_VERSION=v0.3.0
 
 docker compose pull
 docker compose up -d
