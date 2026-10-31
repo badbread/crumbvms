@@ -7,6 +7,12 @@
 
 package video.crumb.app.feature.plates
 
+import video.crumb.app.ui.staggerIn
+import video.crumb.app.ui.StateMessage
+import video.crumb.app.ui.SkeletonRows
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.foundation.lazy.itemsIndexed
 import android.content.res.Configuration
 import android.os.Build
 import android.widget.Toast
@@ -378,26 +384,30 @@ fun PlatesScreen(
                 ActiveFilterStrip(chips = chips, onClear = { vm.clearFilter(it) })
                 Box(Modifier.fillMaxSize()) {
                     when {
-                        state.loading && state.plates.isEmpty() ->
-                            CircularProgressIndicator(Modifier.align(Alignment.Center), color = LprAccent)
-                        state.error != null ->
-                            Text(
-                                "Couldn't load plates: ${state.error}",
-                                Modifier.align(Alignment.Center).padding(24.dp),
-                                color = MaterialTheme.colorScheme.error,
-                            )
-                        state.plates.isEmpty() ->
-                            Text(
-                                "No plate reads in this window.",
-                                Modifier.align(Alignment.Center).padding(24.dp),
-                                color = TextSecondary,
-                            )
-                        rows.isEmpty() ->
-                            Text(
-                                "Only regulars in this window. Turn off Hide regulars in Filters to see them.",
-                                Modifier.align(Alignment.Center).padding(24.dp),
-                                color = TextSecondary,
-                            )
+                        // R2: row-shaped shimmers while the first page loads.
+                        state.loading && state.plates.isEmpty() -> SkeletonRows(count = 7)
+                        state.error != null -> StateMessage(
+                            icon = Icons.Filled.ErrorOutline,
+                            title = "Can't load plates",
+                            body = state.error,
+                            actionLabel = "Retry",
+                            onAction = { vm.refresh() },
+                            accent = LprAccent,
+                            modifier = Modifier.align(Alignment.Center),
+                        )
+                        state.plates.isEmpty() -> StateMessage(
+                            icon = Icons.Filled.Search,
+                            title = "No plate reads in this window",
+                            accent = LprAccent,
+                            modifier = Modifier.align(Alignment.Center),
+                        )
+                        rows.isEmpty() -> StateMessage(
+                            icon = Icons.Filled.Search,
+                            title = "Only regulars in this window",
+                            body = "Turn off Hide regulars in Filters to see them.",
+                            accent = LprAccent,
+                            modifier = Modifier.align(Alignment.Center),
+                        )
                         else -> {
                             val footer = if (state.plates.size < state.total) {
                                 "Showing the latest ${state.plates.size} of ${state.total} reads. Narrow the time range to see older ones."
@@ -714,7 +724,7 @@ private fun PlatesListView(
         }
     }
     LazyColumn(Modifier.fillMaxSize(), state = listState) {
-        items(entries, key = { it.key }) { e ->
+        itemsIndexed(entries, key = { _, e -> e.key }) { index, e ->
             when (e) {
                 is ListEntry.Header -> PlateDayHeader(e.label)
                 is ListEntry.Row -> PlateListRow(
@@ -723,6 +733,8 @@ private fun PlatesListView(
                     timeLabel = e.timeLabel,
                     onClick = { onOpen(e.data) },
                     onLongClick = { onPeek(e.data) },
+                    // R1: rows stagger in on first load; reorders animate in place.
+                    modifier = Modifier.animateItem().staggerIn(index),
                 )
             }
         }

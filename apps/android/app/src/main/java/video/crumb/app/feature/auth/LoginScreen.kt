@@ -2,6 +2,18 @@
 
 package video.crumb.app.feature.auth
 
+import video.crumb.app.ui.theme.Spacing
+import video.crumb.app.ui.theme.NavySurfaceVariant
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.animation.togetherWith
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -142,9 +154,10 @@ private fun LoginContent(
                 .widthIn(max = 400.dp)
                 .fillMaxWidth()
                 .verticalScroll(rememberScrollState())
-                .padding(horizontal = 32.dp, vertical = 48.dp),
+                // I2: 8 dp grid. 56 dp above the wordmark, 24 dp below the button.
+                .padding(start = Spacing.xl, end = Spacing.xl, top = 56.dp, bottom = Spacing.xl),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center,
+            verticalArrangement = Arrangement.spacedBy(Spacing.l),
         ) {
 
             // ── Brand header ─────────────────────────────────────────────────
@@ -154,7 +167,6 @@ private fun LoginContent(
                 color = TextPrimary,
                 textAlign = TextAlign.Center,
             )
-            Spacer(modifier = Modifier.height(6.dp))
             Text(
                 text = "Self-hosted video management",
                 style = MaterialTheme.typography.bodyMedium,
@@ -162,14 +174,16 @@ private fun LoginContent(
                 textAlign = TextAlign.Center,
             )
 
-            Spacer(modifier = Modifier.height(40.dp))
+            // 32 dp from the wordmark block to the first field (16 from the column gap).
+            Spacer(modifier = Modifier.height(Spacing.l))
 
             // ── Server URL field ─────────────────────────────────────────────
             CrumbTextField(
                 value = uiState.serverUrl,
                 onValueChange = onServerUrlChange,
-                label = "Server URL",
-                placeholder = "http://192.0.2.10:8080",
+                label = "Server address",
+                placeholder = "Host name or IP, with port",
+                errorText = uiState.error.takeIf { uiState.errorField == LoginErrorField.SERVER },
                 keyboardOptions = KeyboardOptions(
                     keyboardType = KeyboardType.Uri,
                     imeAction = ImeAction.Next,
@@ -181,25 +195,19 @@ private fun LoginContent(
             )
 
             // ── Auto-discover server ─────────────────────────────────────────
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.End,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                if (uiState.discovering) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(16.dp),
-                        color = BlueAccent,
-                        strokeWidth = 2.dp,
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = "Scanning network…",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = TextSecondary,
-                    )
-                } else {
-                    TextButton(onClick = onDiscover, enabled = !uiState.loading) {
+            // I3: a linear indicator under the field while the scan runs, and the
+            // results expand in below it instead of jumping the form.
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    TextButton(
+                        onClick = onDiscover,
+                        enabled = !uiState.loading && !uiState.discovering,
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    ) {
                         Text(
                             text = "Find my server",
                             style = MaterialTheme.typography.labelLarge,
@@ -207,37 +215,65 @@ private fun LoginContent(
                         )
                     }
                 }
-            }
+                AnimatedVisibility(
+                    visible = uiState.discovering,
+                    enter = expandVertically(tween(250)) + fadeIn(tween(250)),
+                    exit = shrinkVertically(tween(200)) + fadeOut(tween(200)),
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(Spacing.s)) {
+                        LinearProgressIndicator(
+                            modifier = Modifier.fillMaxWidth(),
+                            color = BlueAccent,
+                            trackColor = NavySurfaceVariant,
+                        )
+                        Text(
+                            text = "Looking for servers on this network",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextSecondary,
+                        )
+                    }
+                }
 
-            if (uiState.discoverMessage != null) {
-                Text(
-                    text = uiState.discoverMessage,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = TextSecondary,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            }
-
-            // Multiple hits → a tappable list; a single hit auto-fills the field.
-            if (uiState.discovered.size > 1) {
-                Spacer(modifier = Modifier.height(8.dp))
-                uiState.discovered.forEach { server ->
+                // The last result line (found / none found). Kept while it changes.
+                AnimatedVisibility(
+                    visible = uiState.discoverMessage != null && !uiState.discovering,
+                    enter = expandVertically(tween(250)) + fadeIn(tween(250)),
+                    exit = shrinkVertically(tween(200)) + fadeOut(tween(200)),
+                ) {
                     Text(
-                        text = server.url + (server.version?.let { "  ·  v$it" } ?: ""),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = TextPrimary,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable(enabled = !uiState.loading) { onSelectDiscovered(server.url) }
-                            .padding(vertical = 10.dp),
+                        text = uiState.discoverMessage.orEmpty(),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextSecondary,
+                        modifier = Modifier.fillMaxWidth().padding(top = Spacing.xs),
                     )
+                }
+
+                // Multiple hits: a tappable list; a single hit auto-fills the field.
+                AnimatedVisibility(
+                    visible = uiState.discovered.size > 1,
+                    enter = expandVertically(tween(250)) + fadeIn(tween(250)),
+                    exit = shrinkVertically(tween(200)) + fadeOut(tween(200)),
+                ) {
+                    Column {
+                        uiState.discovered.forEach { server ->
+                            Text(
+                                text = server.url + (server.version?.let { "  \u00B7  v$it" } ?: ""),
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = TextPrimary,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(min = 48.dp)
+                                    .clickable(enabled = !uiState.loading) { onSelectDiscovered(server.url) }
+                                    .padding(vertical = Spacing.m),
+                            )
+                        }
+                    }
                 }
             }
 
             // Scan a specific subnet — for a server on a different VLAN than the phone.
             if (!uiState.discovering) {
                 if (uiState.showRangeScan) {
-                    Spacer(modifier = Modifier.height(8.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
@@ -259,6 +295,7 @@ private fun LoginContent(
                         Button(
                             onClick = onScanRange,
                             enabled = !uiState.loading && uiState.discoverRange.isNotBlank(),
+                            modifier = Modifier.height(48.dp),
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = BlueAccent,
                                 contentColor = TextPrimary,
@@ -268,9 +305,13 @@ private fun LoginContent(
                         }
                     }
                 } else {
-                    TextButton(onClick = onShowRange, enabled = !uiState.loading) {
+                    TextButton(
+                        onClick = onShowRange,
+                        enabled = !uiState.loading,
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    ) {
                         Text(
-                            text = "Scan a specific subnet…",
+                            text = "Scan a specific subnet",
                             style = MaterialTheme.typography.bodySmall,
                             color = TextSecondary,
                         )
@@ -278,13 +319,12 @@ private fun LoginContent(
                 }
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
-
             // ── Username field ───────────────────────────────────────────────
             CrumbTextField(
                 value = uiState.username,
                 onValueChange = onUsernameChange,
                 label = "Username",
+                errorText = uiState.error.takeIf { uiState.errorField == LoginErrorField.CREDENTIALS },
                 keyboardOptions = KeyboardOptions(
                     keyboardType = KeyboardType.Text,
                     imeAction = ImeAction.Next,
@@ -295,13 +335,12 @@ private fun LoginContent(
                 enabled = !uiState.loading,
             )
 
-            Spacer(modifier = Modifier.height(16.dp))
-
             // ── Password field ───────────────────────────────────────────────
             CrumbTextField(
                 value = uiState.password,
                 onValueChange = onPasswordChange,
                 label = "Password",
+                isError = uiState.errorField == LoginErrorField.CREDENTIALS && uiState.error != null,
                 keyboardOptions = KeyboardOptions(
                     keyboardType = KeyboardType.Password,
                     imeAction = ImeAction.Done,
@@ -335,14 +374,13 @@ private fun LoginContent(
                 },
             )
 
-            Spacer(modifier = Modifier.height(20.dp))
-
             // ── Keep-me-signed-in toggle ──────────────────────────────────────
             // ON by default (save-login). Requests a long-lived token so the
             // session survives restarts and doesn't expire after the default window.
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .heightIn(min = 48.dp)
                     .clickable(
                         indication = null,
                         interactionSource = remember { MutableInteractionSource() },
@@ -369,15 +407,13 @@ private fun LoginContent(
                 )
             }
 
-            Spacer(modifier = Modifier.height(24.dp))
-
             // ── Sign-in button ───────────────────────────────────────────────
             Button(
                 onClick = onSignIn,
                 enabled = !uiState.loading,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(52.dp),
+                    .height(48.dp),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = BlueAccent,
                     contentColor = TextPrimary,
@@ -385,23 +421,29 @@ private fun LoginContent(
                     disabledContentColor = TextPrimary.copy(alpha = 0.5f),
                 ),
             ) {
-                if (uiState.loading) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(22.dp),
-                        color = TextPrimary,
-                        strokeWidth = 2.5.dp,
-                    )
-                } else {
-                    Text(
-                        text = "Sign in",
-                        style = MaterialTheme.typography.labelLarge,
-                    )
+                // I5: the label and the inline 24 dp progress swap with a short fade.
+                AnimatedContent(
+                    targetState = uiState.loading,
+                    transitionSpec = { fadeIn(tween(150)) togetherWith fadeOut(tween(150)) },
+                    label = "signInContent",
+                ) { loading ->
+                    if (loading) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(24.dp),
+                            color = TextPrimary,
+                            strokeWidth = 2.5.dp,
+                        )
+                    } else {
+                        Text(
+                            text = "Sign in",
+                            style = MaterialTheme.typography.labelLarge,
+                        )
+                    }
                 }
             }
 
             // ── Error message ────────────────────────────────────────────────
-            if (uiState.error != null) {
-                Spacer(modifier = Modifier.height(20.dp))
+            if (uiState.error != null && uiState.errorField == LoginErrorField.GENERAL) {
                 Text(
                     text = uiState.error,
                     style = MaterialTheme.typography.bodyMedium,
@@ -436,6 +478,9 @@ private fun CrumbTextField(
     keyboardActions: KeyboardActions = KeyboardActions.Default,
     visualTransformation: VisualTransformation = VisualTransformation.None,
     trailingIcon: (@Composable () -> Unit)? = null,
+    /** I4: the error for this field, shown as supporting text with a red outline. */
+    errorText: String? = null,
+    isError: Boolean = errorText != null,
 ) {
     OutlinedTextField(
         value = value,
@@ -450,6 +495,8 @@ private fun CrumbTextField(
             { Text(text = placeholder, color = TextSecondary) }
         } else null,
         trailingIcon = trailingIcon,
+        isError = isError,
+        supportingText = errorText?.let { msg -> { Text(msg) } },
         enabled = enabled,
         singleLine = singleLine,
         keyboardOptions = keyboardOptions,
@@ -467,6 +514,11 @@ private fun CrumbTextField(
             focusedTextColor = TextPrimary,
             unfocusedTextColor = TextPrimary,
             cursorColor = BlueAccent,
+            errorBorderColor = DangerRed,
+            errorLabelColor = DangerRed,
+            errorSupportingTextColor = DangerRed,
+            errorContainerColor = NavySurface,
+            errorCursorColor = DangerRed,
         ),
         modifier = modifier.fillMaxWidth(),
     )

@@ -247,18 +247,18 @@ private fun HistoryPane(profile: PlateProfileState, cameraNames: Map<String, Str
     var daySel by remember(profile.plate) { mutableStateOf<Int?>(null) }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(bottom = 16.dp)) {
-        ChartCard(title = "Hour of day, all reads", caption = hourSel?.let { hourBarCaption(it, hours[it]) } ?: "Tap a bar") {
+        ChartCard(title = hourChartTitle(stats.total), caption = hourSel?.let { hourBarCaption(it, hours[it], stats.total) } ?: "Tap a bar") {
             BarChart(
                 values = hours,
                 selected = hourSel,
                 mark = markHour,
                 onSelect = { hourSel = it },
                 chartHeight = 76.dp,
-                describe = { hourBarCaption(it, hours[it]) },
+                describe = { hourBarCaption(it, hours[it], stats.total) },
             )
             AxisRow(listOf("12 am", "6 am", "12 pm", "6 pm", "11 pm"))
             Text(
-                "Amber mark: the hour of the selected read.",
+                "Each bar adds up that hour across every day the plate was seen. Amber: the hour of this read.",
                 color = TextSecondary,
                 fontSize = 11.5.sp,
                 modifier = Modifier.padding(top = 6.dp),

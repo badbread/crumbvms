@@ -7,6 +7,7 @@
 
 package video.crumb.app.feature.plates
 
+import video.crumb.app.ui.CrumbFilterChip
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -222,24 +223,14 @@ fun ActiveFilterStrip(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         chips.forEach { chip ->
-            InputChip(
+            // R3: the same chip component as Clips (28 dp variant), with a close icon.
+            CrumbFilterChip(
                 selected = true,
                 onClick = { onClear(chip.kind) },
-                label = { Text(chip.label, fontSize = 12.5.sp, maxLines = 1) },
-                trailingIcon = {
-                    Icon(
-                        Icons.Filled.Close,
-                        contentDescription = "Clear ${chip.label}",
-                        modifier = Modifier.size(InputChipDefaults.AvatarSize - 4.dp),
-                    )
-                },
-                colors = InputChipDefaults.inputChipColors(
-                    selectedContainerColor = LprAccentChip,
-                    selectedLabelColor = LprAccentHot,
-                    selectedTrailingIconColor = LprAccentHot,
-                ),
-                border = null,
-                shape = RoundedCornerShape(8.dp),
+                label = chip.label,
+                accent = LprAccent,
+                compact = true,
+                dismissible = true,
             )
         }
     }

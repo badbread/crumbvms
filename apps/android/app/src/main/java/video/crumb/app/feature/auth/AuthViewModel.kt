@@ -35,6 +35,8 @@ data class AuthUiState(
     val password: String = "",
     val loading: Boolean = false,
     val error: String? = null,
+    /** Which field [error] belongs to (I4). */
+    val errorField: LoginErrorField = LoginErrorField.GENERAL,
     val rememberMe: Boolean = true,
     val discovering: Boolean = false,
     val discovered: List<DiscoveredServer> = emptyList(),
@@ -137,7 +139,7 @@ class AuthViewModel(private val repo: CrumbRepository) : ViewModel() {
                     else -> it.copy(
                         discovering = false,
                         discovered = found,
-                        discoverMessage = "Found ${found.size} servers — tap one to use it.",
+                        discoverMessage = "Found ${found.size} servers. Tap one to use it.",
                     )
                 }
             }
@@ -197,10 +199,12 @@ class AuthViewModel(private val repo: CrumbRepository) : ViewModel() {
                     _loginSuccess.send(Unit)
                 },
                 onFailure = { throwable ->
+                    val failure = classifyLoginError(throwable)
                     _uiState.update {
                         it.copy(
                             loading = false,
-                            error = throwable.toUserMessage(),
+                            error = failure.message,
+                            errorField = failure.field,
                         )
                     }
                 },

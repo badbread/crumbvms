@@ -580,7 +580,7 @@ private fun JobStatusSection(
                         color = MaterialTheme.colorScheme.onSurface,
                     )
                     Text(
-                        text = if (job != null) "${job.progressPct}%" else "—",
+                        text = if (job != null) "${job.progressPct}%" else "",
                         style = MaterialTheme.typography.labelLarge,
                         color = TextSecondary,
                     )
