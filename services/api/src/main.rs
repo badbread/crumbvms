@@ -828,7 +828,7 @@ async fn main() -> anyhow::Result<()> {
         let export_dir = std::path::PathBuf::from(&cfg.export_dir);
         tokio::spawn(async move {
             if let Err(e) = check_export_dir_writable(&export_dir).await {
-                error!(
+                tracing::error!(
                     export_dir = %export_dir.display(),
                     error = %e,
                     "EXPORT_DIR is not writable: exports, clips and scrub previews will fail. \
