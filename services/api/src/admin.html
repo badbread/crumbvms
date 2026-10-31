@@ -184,6 +184,11 @@ body.embedded .topbar{display:none;}
 .rp-back{display:inline-flex;align-items:center;gap:5px;font-size:12.5px;color:var(--dim);background:none;border:none;min-height:0;padding:2px 0;margin-bottom:4px;cursor:pointer;font-weight:500;}
 .rp-back:hover{color:var(--accent);background:none;border:none;}
 table.list-tbl tbody tr{cursor:pointer;}
+table.list-tbl.reordering tbody tr{cursor:grab;}
+table.list-tbl.reordering tbody tr.drag-over td{box-shadow:inset 0 2px 0 var(--accent);}
+.reorder-grip{color:var(--dim2);font-size:15px;line-height:1;user-select:none;}
+.reorder-btns{display:inline-flex;gap:4px;}
+.reorder-btns button{padding:1px 8px;font-size:12px;min-height:0;}
 .lt-name{display:flex;align-items:center;gap:11px;min-width:0;}
 .lt-name .lt-ico{width:20px;color:var(--dim2);display:flex;flex-shrink:0;justify-content:center;}
 .lt-name .lt-main{font-weight:600;overflow:hidden;text-overflow:ellipsis;}
@@ -4154,23 +4159,115 @@ function renderWelcome() {
   </div>`;
 }
 
+/* Camera display order (migration 0085). CAMS arrives in the order every
+   client shows (GET /config/cameras), so the list renders it as-is. "Reorder"
+   switches the table into an edit mode: drag a row, or use the up/down buttons
+   (keyboard and touch), then Save sends the whole order to
+   PUT /config/camera-order. CAM_REORDER holds the pending order (camera ids)
+   while editing, null otherwise. */
+let CAM_REORDER = null;
+let CAM_DRAG = null;
+function camReorderIds() {
+  // Keep the pending order in step with CAMS (a camera added or deleted while
+  // editing): drop ids that are gone, append new cameras at the end.
+  const live = new Set(CAMS.map(c => c.id));
+  const ids = CAM_REORDER.filter(id => live.has(id));
+  CAMS.forEach(c => { if (!ids.includes(c.id)) ids.push(c.id); });
+  CAM_REORDER = ids;
+  return ids;
+}
+function startCamReorder() { CAM_REORDER = CAMS.map(c => c.id); renderCamerasRoot(); }
+function cancelCamReorder() { CAM_REORDER = null; CAM_DRAG = null; renderCamerasRoot(); }
+function moveCam(i, d) {
+  const ids = camReorderIds(), j = i + d;
+  if (j < 0 || j >= ids.length) return;
+  [ids[i], ids[j]] = [ids[j], ids[i]];
+  renderCamerasRoot();
+  const btn = document.querySelector(`[data-reorder-row="${j}"] .reorder-btns button:${d < 0 ? 'first-child' : 'last-child'}`);
+  if (btn && !btn.disabled) btn.focus();
+}
+function camDragStart(e, i) {
+  CAM_DRAG = i;
+  e.dataTransfer.effectAllowed = 'move';
+  e.dataTransfer.setData('text/plain', String(i));
+}
+function camDragOver(e, row) {
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+  document.querySelectorAll('tr.drag-over').forEach(r => { if (r !== row) r.classList.remove('drag-over'); });
+  row.classList.add('drag-over');
+}
+function camDrop(e, i) {
+  e.preventDefault();
+  const from = CAM_DRAG;
+  CAM_DRAG = null;
+  if (from == null || from === i) { renderCamerasRoot(); return; }
+  const ids = camReorderIds();
+  const [moved] = ids.splice(from, 1);
+  ids.splice(i, 0, moved);
+  renderCamerasRoot();
+}
+async function saveCamReorder() {
+  try {
+    await api('/config/camera-order', { method: 'PUT', body: JSON.stringify({ camera_ids: camReorderIds() }) });
+    CAM_REORDER = null;
+    await ensureCams();
+    renderCamerasRoot();
+    toast('Camera order saved. Every app shows the new order.');
+  } catch (e) {
+    toast('Could not save the camera order: ' + e.message, 'err');
+  }
+}
+async function resetCamOrder() {
+  if (!confirm('Put every camera back in name order?')) return;
+  try {
+    await api('/config/camera-order', { method: 'PUT', body: JSON.stringify({ camera_ids: [] }) });
+    CAM_REORDER = null;
+    await ensureCams();
+    renderCamerasRoot();
+    toast('Cameras are back in name order.');
+  } catch (e) {
+    toast('Could not reset the camera order: ' + e.message, 'err');
+  }
+}
+
 function renderCamerasRoot() {
-  const byName = (a,b)=>(a.name||'').toLowerCase().localeCompare((b.name||'').toLowerCase());
   const total = CAMS.length, rec = CAMS.filter(c => c.enabled).length;
   const groupCount = (GROUPS||[]).length;
   const ungrouped = CAMS.filter(c => !groupOfCamera(c.id)).length;
-  const camBody = CAMS.slice().sort(byName).map(c => {
+  const reordering = CAM_REORDER !== null;
+  const byId = new Map(CAMS.map(c => [c.id, c]));
+  const ordered = reordering ? camReorderIds().map(id => byId.get(id)) : CAMS;
+  const camBody = ordered.map((c, i) => {
     const pol = profileById(c.policy_id);
     const model = (c.model || c.make) ? esc(c.model || c.make) : '<span style="color:var(--dim2)">—</span>';
     const type = esc(c.camera_type || 'other');
     const status = c.enabled ? '<span class="pill ok">Recording</span>' : '<span class="pill">Disabled</span>';
+    const nameCell = `<div class="lt-name"><span class="lt-ico">${icon(camIcon(c),18)}</span><div><div class="lt-main">${esc(c.name)}</div><div class="lt-sub">${type}</div></div></div>`;
+    if (reordering) {
+      return `<tr data-reorder-row="${i}" draggable="true" ondragstart="camDragStart(event,${i})" ondragover="camDragOver(event,this)" ondrop="camDrop(event,${i})" ondragend="CAM_DRAG=null;this.classList.remove('drag-over')">
+      <td><div style="display:flex;align-items:center;gap:10px"><span class="reorder-grip" aria-hidden="true">⠿</span>${nameCell}</div></td>
+      <td colspan="2" style="color:var(--dim2)">${i + 1} of ${ordered.length}</td>
+      <td><span class="reorder-btns">
+        <button class="ghost xs" title="Move up" aria-label="Move ${esc(c.name)} up" ${i === 0 ? 'disabled' : ''} onclick="moveCam(${i},-1)">↑</button>
+        <button class="ghost xs" title="Move down" aria-label="Move ${esc(c.name)} down" ${i === ordered.length - 1 ? 'disabled' : ''} onclick="moveCam(${i},1)">↓</button>
+      </span></td>
+    </tr>`;
+    }
     return `<tr onclick="select('camera','${c.id}')">
-      <td><div class="lt-name"><span class="lt-ico">${icon(camIcon(c),18)}</span><div><div class="lt-main">${esc(c.name)}</div><div class="lt-sub">${type}</div></div></div></td>
+      <td>${nameCell}</td>
       <td>${pol ? esc(pol.name || 'Default') : '<span style="color:var(--dim2)">—</span>'}</td>
       <td>${model}</td>
       <td>${status}</td>
     </tr>`;
   }).join('') || `<tr><td colspan="4" style="color:var(--dim2);padding:20px;text-align:center">No cameras yet — click “Add camera” to get started.</td></tr>`;
+  const orderActions = reordering
+    ? `<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+        <button class="ghost sm" onclick="resetCamOrder()" title="Forget the custom order and sort by name">Reset to name order</button>
+        <button class="ghost sm" onclick="cancelCamReorder()">Cancel</button>
+        <button class="primary sm" onclick="saveCamReorder()">Save order</button>
+      </div>`
+    : (CAMS.length > 1 ? `<button class="ghost sm" onclick="startCamReorder()" title="Choose the order every app shows your cameras in">Reorder</button>` : '');
 
   const tile = (ic, k, v) => `<div class="stat-tile"><div class="st-k">${icon(ic,14)} ${k}</div><div class="st-v">${v}</div></div>`;
 
@@ -4194,11 +4291,15 @@ function renderCamerasRoot() {
       ${tile('profiles','Policies',(allProfiles()||[]).length)}
     </div>
     <div class="card" style="padding:0">
-      <div class="card-header" style="padding:13px 16px 12px;margin:0;border-bottom:1px solid var(--border)">
-        <div class="card-title">All cameras</div>
+      <div class="card-header" style="padding:13px 16px 12px;margin:0;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
+        <div>
+          <div class="card-title">All cameras</div>
+          ${reordering ? '<div style="color:var(--dim2);font-size:12px;margin-top:3px">Drag cameras, or use the arrows, into the order every app shows them in. New cameras go at the end.</div>' : ''}
+        </div>
+        ${orderActions}
       </div>
       <div class="table-wrap">
-        <table class="list-tbl"><thead><tr><th>Camera</th><th>Policy</th><th>Model</th><th>Recording</th></tr></thead>
+        <table class="list-tbl${reordering ? ' reordering' : ''}"><thead><tr><th>Camera</th>${reordering ? '<th colspan="2">Position</th><th>Move</th>' : '<th>Policy</th><th>Model</th><th>Recording</th>'}</tr></thead>
         <tbody>${camBody}</tbody></table>
       </div>
     </div>`;

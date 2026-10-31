@@ -8,6 +8,29 @@ revisit.
 
 ---
 
+## 2026-10-31, Camera display order: one admin-set order on the server, not a per-user sort in each client
+
+**Decision.** Cameras get a nullable `cameras.display_order` (migration 0085). An admin drags cameras into order in the web
+console (Cameras, "Reorder"), which sends the whole list to `PUT /config/camera-order` (AdminUser). `GET /cameras`,
+`GET /config/cameras` and `/status` return cameras in that order through `db::list_cameras_for_display`: placed cameras by
+position, then unplaced ones in natural name order. Clients already show the server list as-is, so the only client changes are
+removing the few spots that re-sorted by name (Android Clips and LPR camera filters, the desktop playback legend). The order is
+folded into `config_version`, so connected clients re-fetch on their own.
+
+**Rejected.** A per-user sort setting in each client (name, custom, group, recent motion): three separate implementations and a
+per-user store, for a need the owner described as one fleet-wide order. Admin default plus per-user override: the same cost on top
+of this one. Putting the column into `v_camera_effective_policy` / `Camera`: that view feeds the recorder, and the order is display
+only, so it is read in a separate query and `db::list_cameras_all` (which the recorder's retention sweep calls) is unchanged.
+
+**Trade-offs accepted.** One order for everyone; a viewer who wants a different arrangement uses a saved view. Unplaced cameras
+(new ones) land after the placed ones rather than in their name position among them. Saving rewrites every row's position in one
+statement, which is fine at fleet sizes Crumb targets.
+
+**Revisit when.** Users ask for a personal order that differs from the admin's (add a per-user override on top, keep this as the
+default); ordering by group is wanted (sort by group, then position).
+
+---
+
 ## 2026-10-30, Android LPR tab redesign: phone-native (search bar + one filter sheet, two-line rows, pinned-video profile), not the desktop plate desk shrunk
 
 **Decision.** The Android LPR tab is rebuilt around the answers `0A 1A 2A 3B` from the owner's mockup round (the mockup page itself is not in the repo): registration-blue accent shared with desktop (0A);

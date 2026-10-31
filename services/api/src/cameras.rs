@@ -106,9 +106,10 @@ async fn list_visible_cameras(
     user: AuthUser,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<ViewerCameraDto>>, ApiError> {
-    let all = db::list_cameras_all(state.pool())
+    // Admin display order (migration 0085); every client shows this list as-is.
+    let all = db::list_cameras_for_display(state.pool())
         .await
-        .context("list_cameras_all")?;
+        .context("list_cameras_for_display")?;
     let oldest = db::oldest_segment_start_by_camera(state.pool())
         .await
         .context("oldest_segment_start_by_camera")?;
@@ -130,7 +131,7 @@ async fn list_visible_cameras(
             served_by: c.served_by,
             created_at: c.created_at,
             oldest_footage_ts: oldest.get(&c.id).copied(),
-            // `list_cameras_all` reads `v_camera_effective_policy`, so this is
+            // `list_cameras_for_display` reads `v_camera_effective_policy`, so this is
             // already the resolved own -> group -> default policy.
             recording_mode: c.policy.mode.as_str(),
         })

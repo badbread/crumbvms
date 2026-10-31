@@ -2894,9 +2894,10 @@ fn segment_from_row(row: &tokio_postgres::Row) -> Result<Segment> {
 /// in natural name order (see [`camera_name_order`]).
 ///
 /// Used by the config CRUD routes which must list every camera, not just active ones,
-/// and by `GET /cameras`, whose order every client shows as-is (camera pickers, the
-/// auto-built "All Cameras" grid). It had no ORDER BY, so cameras came back in heap
-/// order: roughly creation order, reshuffled by later edits.
+/// and by the recorder (retention sweep, resource stats). The lists clients show
+/// come from [`list_cameras_for_display`], which applies the admin's order on top.
+/// It had no ORDER BY, so cameras came back in heap order: roughly creation
+/// order, reshuffled by later edits.
 pub async fn list_cameras_all(pool: &Pool) -> Result<Vec<Camera>> {
     let client = get_conn(pool).await?;
     let rows = client
@@ -2909,6 +2910,72 @@ pub async fn list_cameras_all(pool: &Pool) -> Result<Vec<Camera>> {
         .collect::<Result<Vec<_>>>()?;
     cameras.sort_by(|a, b| camera_name_order(&a.name, &b.name).then(a.id.cmp(&b.id)));
     Ok(cameras)
+}
+
+/// [`list_cameras_all`] in the admin's display order (see
+/// [`sort_cameras_for_display`]). This is the order `GET /cameras` and
+/// `GET /config/cameras` return, and every client shows it as-is (camera
+/// pickers, the auto-built "All Cameras" grid). API only: the recorder keeps
+/// [`list_cameras_all`], so the display order can never reach a recording path.
+pub async fn list_cameras_for_display(pool: &Pool) -> Result<Vec<Camera>> {
+    let mut cameras = list_cameras_all(pool).await?;
+    let client = get_conn(pool).await?;
+    // Read apart from CAMERA_SELECT_SQL so the recorder's effective-policy view
+    // (and `Camera`) stay untouched: the order is display-only (migration 0085).
+    let placed: std::collections::HashMap<Uuid, i32> = client
+        .query(
+            "SELECT id, display_order FROM cameras WHERE display_order IS NOT NULL",
+            &[],
+        )
+        .await
+        .context("list_cameras_for_display")?
+        .iter()
+        .map(|r| (r.get("id"), r.get("display_order")))
+        .collect();
+    sort_cameras_for_display(&mut cameras, &placed);
+    Ok(cameras)
+}
+
+/// Display order for cameras: the ones an admin placed (`cameras.display_order`,
+/// migration 0085) first, by that position; then every unplaced camera in
+/// natural name order (see [`camera_name_order`]). Ties break on id so the order
+/// is total and stable across calls.
+pub fn sort_cameras_for_display(
+    cameras: &mut [Camera],
+    placed: &std::collections::HashMap<Uuid, i32>,
+) {
+    cameras.sort_by(|a, b| {
+        match (placed.get(&a.id), placed.get(&b.id)) {
+            (Some(x), Some(y)) => x.cmp(y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => camera_name_order(&a.name, &b.name),
+        }
+        .then(a.id.cmp(&b.id))
+    });
+}
+
+/// Store the admin's camera display order (migration 0085): `ids[0]` shows
+/// first. Every camera not in `ids` (including ids of cameras that no longer
+/// exist, which are simply ignored) is reset to unplaced, so it follows the
+/// placed ones in name order; an empty slice restores plain name order. One
+/// statement, so a concurrent reader never sees half an order.
+pub async fn set_camera_display_order(pool: &Pool, ids: &[Uuid]) -> Result<()> {
+    let client = get_conn(pool).await?;
+    client
+        .execute(
+            r"
+            UPDATE cameras c SET display_order = (
+                SELECT u.ord::int
+                FROM unnest($1::uuid[]) WITH ORDINALITY AS u(id, ord)
+                WHERE u.id = c.id
+            )
+            ",
+            &[&ids],
+        )
+        .await
+        .context("set_camera_display_order")?;
+    Ok(())
 }
 
 /// Natural, case-insensitive order for camera names: runs of digits compare by
@@ -3035,9 +3102,11 @@ pub async fn config_version(pool: &Pool) -> Result<String> {
                 v.p_mode || '~' || v.p_record_stream || '~' || v.p_live_retention_hours::text || '~' ||
                 v.p_archive_enabled::text || '~' || COALESCE(v.p_archive_retention_hours::text,'') || '~' ||
                 COALESCE(v.p_live_storage_id::text,'') || '~' || COALESCE(v.p_archive_storage_id::text,'') || '~' ||
-                v.p_motion_sensitivity || '~' || COALESCE(v.p_motion_threshold::text,'')
+                v.p_motion_sensitivity || '~' || COALESCE(v.p_motion_threshold::text,'') || '~' ||
+                COALESCE(c.display_order::text,'')
             , '|' ORDER BY v.c_id)), '') AS version
             FROM v_camera_effective_policy v
+            LEFT JOIN cameras c ON c.id = v.c_id
             ",
             &[],
         )
@@ -12728,6 +12797,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
     (
         "0084_plate_aliases.sql",
         include_str!("../../../db/migrations/0084_plate_aliases.sql"),
+    ),
+    (
+        "0085_camera_display_order.sql",
+        include_str!("../../../db/migrations/0085_camera_display_order.sql"),
     ),
 ];
 
