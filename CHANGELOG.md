@@ -9,6 +9,324 @@ landed on `main`.
 Crumb is **alpha**. Versions before 1.0 make no compatibility promises, read the
 [Alpha Tester Terms](docs/ALPHA-TESTER-TERMS.md) before you rely on it.
 
+## [0.3.0] - Unreleased
+
+0.2.0 was about Home Assistant. 0.3.0 is about the two things you do most once
+footage exists: finding a moment and getting it out. Scrubbing a timeline now
+answers as fast as you can drag, with one-second preview frames on desktop and
+Android. The License plate page was rebuilt on desktop and Android around a
+plate's whole history rather than a flat list of reads, including correcting a
+plate the reader got wrong. Exports got readable file names, a real size
+estimate, and on Android a proper in/out workflow straight from playback.
+
+The other half of the cycle was a security and correctness sweep of the server.
+Every place a login token could end up in a URL is gone, a removed or edited
+account now loses its signed-in devices immediately, `/metrics` needs a
+credential, media work can no longer queue without limit, and the recorder's
+eviction, retention, and reconcile were made safe on a full, read-only, or
+missing disk. None of that is visible on a good day, which is the point.
+
+### Scrubbing that keeps up
+
+- **One-second scrub previews.** The pre-generation worker now also builds a
+  strip of one-per-second frames for each recorded segment (#665), and desktop
+  (#666) and Android (#667) show them while you drag, so the picture under your
+  finger matches the time under your finger. This rides the existing
+  `THUMB_PREGEN_ENABLED` switch, which stays off by default and is now documented
+  as the scrubbing knob with its measured cost (#668).
+- **Desktop scrubbing is instant.** Seeks are coalesced, decoded frames are
+  cached and prefetched, the next segment is pre-opened while you dwell, and
+  panes you are not looking at are parked (#655). The panes also stopped
+  rebuilding at tick and drag rate (#661), the picture no longer jumps a second
+  or two after you let go (#646), and motion and Home Assistant markers fill in
+  while playing instead of staying blank (#647).
+- **Android scrubbing is faster.** Seeks start sooner, the scrub overlay
+  prefetches without flicker (#656), and dragging inside the segment that is
+  already loaded seeks it live (#660).
+- **The server does less per scrub.** On-demand scrub thumbnails decode only the
+  keyframe (#657), recorded spans are merged in SQL rather than in Rust (#663),
+  and `/play/` resolves are cached for a minute on desktop and Android (#662).
+
+### License plates, redesigned
+
+- **Desktop.** The Plates page became a plate desk: a ledger list that can group
+  by plate, one density control, a contact-sheet grid, and a plate profile that
+  leads with the video clip, with interactive charts and the plate's visits
+  beside it on a wide screen (#659, #670, #671). A Hide regulars toggle takes the
+  cars you see every day off the list (#672). The profile player has Crumb's own
+  clip controls, wheel zoom, and a bookmark button (#674, #677), and the page got
+  a registration-blue accent, a one-row filter bar, and a name line on each card
+  (#678, #669, #681).
+- **Android.** The License plate tab was redesigned for a phone rather than
+  shrunk from the desktop: search with a filter sheet, rows that keep the crop's
+  real shape, and a plate profile with the same history and time-of-day charts
+  (#689).
+- **Correct a misread plate.** When the reader gets a character wrong, you can
+  now tell Crumb which plate it really was, and the read is filed under the
+  right plate from then on (#675, migration 0084).
+- New plate stats endpoints back the profiles (#659, migration 0083).
+
+### Exports you can hand to someone
+
+- **Readable file names, zip or separate files, and a real size estimate**
+  before you start (#645).
+- **Desktop:** the export folder picker can make a new folder, refresh, and open
+  the result in Explorer (#641), and an export clip can be duplicated for another
+  camera angle (#649).
+- **Android:** exports were redesigned around in and out marks on the playback
+  timeline, so you can export straight from playback (#617, #621). A cancelled
+  export now counts as finished, and the file keeps the name the server gave it
+  (#620).
+
+### Desktop
+
+- **Fullscreen keeps the wall playing.** Entering fullscreen used to leave tiles
+  stuck on spinners (#680); every live player now survives fullscreen toggles,
+  including F11 and Esc, and transitions are serialized so rapid toggling cannot
+  wedge the window.
+- **Motion and interaction design** across maximize, tabs, panels, and live
+  states (#664).
+- **The window remembers its size, position, and maximized state** (#658).
+- **Snapshot button on Playback**, with readable snapshot names (#643).
+- **Clip editor:** real playback, a trim timeline, and local times; Playback
+  keeps its position when you switch tabs (#644).
+- **Bookmarks:** markers are drawn on the playback timeline (#618). A bookmark
+  whose footage retention has since deleted is flagged as such, playback
+  explains a no-footage window, and deletes are confirmed with undo (#654).
+- **Recovery:** a tile whose first stream load fails keeps retrying, a stored
+  session resumes by itself when the server comes back, and signing out cleans
+  up (#635).
+- Options to overlay the tile info bar on the video (#642) and to hide the
+  live-wall performance stats (#653). Grid card actions stay clickable with hover
+  zoom on (#686), and the date picker header no longer wraps (#648).
+
+### Android
+
+- **Simple or advanced playback controls.** A new setting picks between a short
+  control set and the full one; existing installs keep the advanced set they
+  already had (#690).
+- **Live reconnects are sturdier.** Tiles re-fetch their stream addresses after
+  repeated failures, and a LAN with no Internet keeps reconnecting instead of
+  giving up (#633).
+- **Clips can be filtered by camera**, and the choice is remembered (#685).
+- Swipe-to-switch camera works from the no-footage, loading, and error states
+  (#676), and a zoomed-in camera no longer goes black in picture-in-picture
+  (#615).
+- Fixed two crashes from the same cause: the app closing at launch, and
+  Playback closing when you switched camera in landscape (#684, #688).
+
+### Home Assistant and notifications
+
+- **Badges can trigger Home Assistant automations** (#610).
+- **Notification times are shown in the reader's local time** on Discord and
+  Slack, and in the server's zone elsewhere, instead of UTC (#629).
+- Unchecking Enabled when creating a notification channel is now honoured
+  (#611).
+
+### Recorder correctness
+
+- **Full or missing disks no longer wedge retention.** An archive tier below the
+  free-space floor rolls its oldest unprotected footage over, and when archive
+  moves fail for a systemic reason (full, read-only, refused) the live tier's
+  eviction keeps working instead of stopping (#640).
+- **Reconcile stays inside each storage's own root**, leaves folders it did not
+  create alone instead of quarantining them, bounds its memory, and storage path
+  edits are guarded (#639).
+- **Motion events close when a stream stalls**, failed motion persists are
+  retried, and storage roots are confirmed from history (#637).
+- **Recording no longer depends on the api.** The recorder registers its own
+  streams in the embedded go2rtc (#636) and dials it over loopback rather than
+  back through the host's published port (#632).
+- The HD repair for a camera whose main stream a phone cannot decode now judges
+  the stream as served first, covering record-from-sub cameras and sub streams
+  too (#613).
+
+### Security
+
+- **No login token in a URL anywhere.** Export downloads take the
+  Authorization header only, and the desktop's "Open in browser" hands the
+  console a single-use code instead of the session token (#625). Scoped media
+  tokens in `?token=` are unchanged.
+- **Account changes reach signed-in devices.** Removing a user, changing their
+  password, or changing their role ends their sessions, and camera grants apply
+  on the next request instead of the next sign-in. The console's user editor has
+  a Sign out everywhere button (#626).
+- **Login backoff keys on the account and the client**, so knowing a username is
+  no longer enough to lock its owner out, with an account-wide ceiling on top.
+  `X-Forwarded-For` is honoured only from a trusted proxy (#631).
+- **`/metrics` needs a credential**, camera source URLs come back with the
+  password masked, the database password no longer appears in a process
+  listing, and the api refuses to start on the example database password, as it
+  already did for the other placeholder secrets (#631).
+- **Response headers:** `X-Content-Type-Options` and `Referrer-Policy` on every
+  reply and a Content-Security-Policy on the console (#631).
+- **Managing notification channels is a role permission** (`manage_channels`,
+  migration 0081), and non-admin destinations are validated (#624).
+- **Media work is bounded.** A saturated media queue answers 503 with
+  `Retry-After` instead of hanging, the media routes have their own rate limit,
+  filmstrip widths are quantized, and an export is capped at 50 cameras and one
+  day per window (#627).
+- **Bookmarks and events:** protected bookmarks are capped per non-admin user,
+  plate text is withheld from event lists for users without `view_plates`, and
+  ignored plates are not stored (#638).
+- **iOS and Android hide camera content in the app switcher** (#623).
+
+### Upgrading from 0.2.0
+
+An in-place upgrade from the v0.2.0 published images was tested end to end, and
+so was rolling back. `.env` needs no changes: every new key is optional. The
+four new migrations applied once each on first boot, footage came through
+byte-identical, recording carried on, and devices that were signed in stayed
+signed in. Upgrade the server before the clients; a 0.3.0 desktop's "Open in
+browser" needs a 0.3.0 server.
+
+```bash
+git pull
+docker compose pull
+docker compose up -d
+```
+
+If you pinned `CRUMB_VERSION` in `.env`, set it to the new version before you
+pull. If you never set it, you are on `latest` and the pull is enough.
+
+Five things can need action, depending on your setup:
+
+- **You scrape `/metrics`.** It now needs a credential and answers 401 without
+  one. Set `METRICS_TOKEN` (for example `openssl rand -hex 32`) and give your
+  Prometheus job a matching `bearer_token`, or use an admin session token.
+  `/health` and `/version` stay open.
+- **You run your own reverse proxy with `TRUST_PROXY=1`.** `X-Forwarded-For`
+  is now read only from addresses in `TRUSTED_PROXIES`, which defaults to the
+  bundled Caddy. Behind nginx, Traefik, or similar, set `TRUSTED_PROXIES` to
+  that proxy's address as the api sees it, or every user behind it shares one
+  rate-limit and login-backoff key. The bundled Caddy needs nothing.
+- **Your database password is still the example value.** The api now refuses
+  to start while `DATABASE_URL`'s password is `change-me`, as it already did for
+  the other placeholder secrets. The recorder keeps recording meanwhile. Change
+  it in Postgres first (`docker compose exec postgres psql -U crumb -c "ALTER
+  USER crumb WITH PASSWORD '<new>';"`), then in both `POSTGRES_PASSWORD` and
+  `DATABASE_URL`, then `docker compose up -d`. An `.env` from
+  `scripts/setup-env.sh` already has a generated password.
+- **Exports fail with "Permission denied".** An export volume created by an
+  earlier image is owned by root, which the api cannot write, so exports, the
+  clip cache, and scrub previews all fail (#692). Fresh installs get a writable
+  volume now, and the api logs one clear error at boot when it finds the old
+  one. Fix it once with `docker compose exec -u root api chown 1001:1001
+  /exports`.
+- **Non-admin users managed notification channels.** That is now the
+  `manage_channels` role permission, which migration 0081 adds switched off for
+  every non-admin role. Grant it to the roles that should keep it. Existing
+  channels keep delivering either way.
+
+Worth knowing, no action needed:
+
+- **The macOS app 0.2.0 cannot download finished exports** from a 0.3.0
+  server, because it was the last client sending the login token in the URL.
+  Update the Mac app; until then, finished exports download from the web
+  console. The Windows and Android apps are unaffected.
+- **Account changes now reach signed-in devices.** Removing a user, or changing
+  their password or role, signs out their devices at once.
+- **Limits that did not exist before:** one export covers at most a day per
+  camera (`EXPORT_MAX_RANGE_SECONDS`) and 50 cameras; a protected bookmark's
+  window is capped at one hour in total, so a 60 minutes before plus 60 after
+  request is scaled to 30 and 30; non-admin users can hold 50 active protected
+  bookmarks (`BOOKMARK_MAX_PROTECTED_PER_USER`). A busy media queue now answers
+  "retry" instead of hanging.
+- **Notification channels no longer follow redirects.** A channel saved as
+  `http://` for a server that redirects to `https://` needs its address updated.
+- **Notification text uses the server's time zone.** Compose defaults `TZ` to
+  UTC; `scripts/setup-env.sh` sets your host's zone.
+- **If you changed `rtsp.listen` in `go2rtc/go2rtc.yaml`,** set
+  `CRUMB_GO2RTC_LOOPBACK_PORT` to match. The recorder now dials its embedded
+  go2rtc over loopback on 8554 unless told otherwise.
+- **The console can no longer be framed by another site** (for example a Home
+  Assistant iframe panel). The desktop app is unaffected.
+- **First boot can take a little longer** on a large events table while
+  migrations 0082 and 0083 build their indexes.
+- **Take a database backup first** ([docs/BACKUP.md](docs/BACKUP.md)), as with
+  any upgrade.
+- **Rolling back was rehearsed**: pinning `CRUMB_VERSION=v0.2.0` and
+  `docker compose up -d` brought 0.2.0 up healthy on the 0.3.0 schema, serving
+  the same footage. The new migrations are additive. You lose the new features,
+  not the footage, and `/metrics` is open again.
+
+### All merged changes
+
+Every pull request merged since 0.2.0, newest first. The release integration
+(#682) landed as one merge; the pull requests it carried are listed after it.
+
+- feat(android): Simple / Advanced playback controls setting (#690)
+- feat(android): LPR tab redesign (search + filter sheet, aspect-true rows, plate profile) (#689)
+- fix(android): run Playback's first startCamera after every field exists (#688)
+- fix(desktop): grid card actions stay clickable with hover zoom on (#686)
+- Release integration: everything for the next release (#682)
+  - feat(android): filter the Clips tab by camera (#685)
+  - fix(android): crash on launch, LiveViewModel init order (#684)
+  - fix(desktop): LPR shortcuts, fullscreen exit, profile and chip layout (stacked on #678) (#681)
+  - fix(desktop): live wall stuck on spinners after entering fullscreen (#680)
+  - feat(desktop): LPR tab redesign: registration blue, one-row filter bar, name line on cards (#678)
+  - feat(desktop): wheel zoom and bookmark button on the LPR clip players (#677)
+  - fix(android): swipe-to-switch camera works from no-footage/loading/error states (#676)
+  - LPR: correct a misread plate (plate aliases) (#675)
+  - feat(desktop): Crumb clip controls for the plate profile player (#674)
+  - feat(desktop): Hide regulars toggle for the Plates tab (#672)
+  - feat(desktop): interactive LPR profile charts + visits beside the video on wide screens (stacked on #670) (#671)
+  - feat(desktop): plate profile leads with the video clip (#670)
+  - fix(desktop): LPR page polish: crops fill their slots, clearer toolbar and profile (#669)
+  - Scrub previews: keep THUMB_PREGEN_ENABLED off, document it as the scrubbing knob (with measured cost), cap the worker's backlog (#668)
+  - android(playback): 1 s scrub previews from per-segment sprite strips (#667)
+  - desktop(playback): 1 s scrub previews from per-segment sprite strips (#666)
+  - api: per-segment scrub sprite strips (1 s scrub previews), made by the pre-generation worker (#665)
+  - Desktop: motion and interaction design (maximize, tabs, panels, live states) (#664)
+  - api(timeline): merge recorded spans in SQL (gaps-and-islands) instead of in Rust (#663)
+  - perf(playback): cache /play/ resolves for 60 s on desktop and Android (#662)
+  - desktop(playback): stop rebuilding the panes at tick and drag rate (#661)
+  - android(playback): seek the loaded segment live while dragging inside it (#660)
+  - Desktop: remember the window's size, position and maximized state (#658)
+  - api(filmstrip): decode only the keyframe for on-demand scrub thumbnails (#657)
+  - android(playback): faster seek start, pre-generated scrub width, flicker-free prefetching scrub overlay (#656)
+  - desktop(playback): instant scrubbing: coalesced seeks, frame cache + prefetch, dwell pre-open, parked hidden panes (#655)
+  - Bookmarks: flag footage deleted by retention, explain no-footage in playback, confirm and undo deletes (#654)
+  - Desktop: setting to hide the live-wall performance stats (#653)
+  - Return cameras in natural name order (#652)
+  - Desktop export: duplicate a clip for another camera angle (#649)
+  - Desktop: date picker header wrapped the day onto a second line (#648)
+  - Desktop playback: motion/HA markers stayed blank while playing (#647)
+  - Desktop playback: picture jumped a second or two after a scrub (#646)
+  - Export: readable file names, zip or separate files, real size estimate (#645)
+  - Desktop clip editor: real playback, trim timeline, local times; keep Playback position across tabs (#644)
+  - Desktop: snapshot button on Playback, readable snapshot names (#643)
+  - Desktop: option to overlay the tile info bar on the video (#642)
+  - Desktop export folder picker: New folder, Refresh, Open in Explorer (#641)
+  - feat(android): export redesign, in/out marks on the timeline + export from playback (#617) (#621)
+  - fix(android): treat cancelled exports as terminal; honor server output filename (#620)
+  - ci: Flutter desktop analyze/test job + Android unit tests (#679)
+  - Keep every live-wall player across fullscreen toggles and serialize fullscreen transitions (no PR of its own)
+- LPR page redesign: plate desk, ledger list, plate profile, contact-sheet grid (#659)
+- Desktop: retry failed stream loads, resume stored session while server is down, clean up on sign-out (#635)
+- fix(android): re-fetch live stream URLs on repeated failures and keep reconnecting on a LAN without Internet (#633)
+- Bookmark limits, plate redaction in events, cached storage usage, events ts index (#638)
+- fix(recorder): make eviction and retention safe under full or missing disks (#640)
+- Keep reconcile inside each storage's own root, bound its memory, and guard storage path edits (#639)
+- fix(recorder): close motion events on stall, retry failed motion persists, confirm storage roots from history (#637)
+- fix(recorder): register recording streams in the embedded go2rtc without the api (#636)
+- Recorder dials its embedded go2rtc over loopback instead of back through the host (#632)
+- Make notification channel management a permission and validate destinations (#624)
+- Response headers, login backoff keying, metrics auth, and secret handling (#631)
+- Bound media request queues, filmstrip cache keys, and export job sizes (#627)
+- Use the authorization header for export downloads and a one-time code for browser handoff (#625)
+- Keep sessions in step with user account changes (#626)
+- Hide camera content in the app switcher on iOS and Android (#623)
+- ci: stop setup-android requesting the removed legacy tools package (#634)
+- fix(desktop): draw bookmark markers on the playback timeline (#618)
+- Render notification times in local time instead of UTC (#629)
+- feat(android): export redesign, in/out marks on the timeline + export from playback (#617)
+- fix(android): reset digital zoom on entering PiP so the window isn't black (#615)
+- fix(api): served-first fmtp verdict for _mainv and _subv (#613)
+- docs(decisions): record HA climate/thermostat control as out of scope (#612)
+- fix(api): honor the Enabled checkbox on notification-channel create (#611)
+- feat(ha): trigger Home Assistant automations from the badge (#610)
+
 ## [0.2.0] - 2026-08-09
 
 Where 0.1.1 hardened what was already there, 0.2.0 finishes a feature that had
@@ -835,7 +1153,8 @@ wizard with generated secrets, LAN-only by default; and native desktop
 (then Tauri), Android, and web-admin clients. Runs entirely on your own hardware,
 no cloud, no account, no telemetry.
 
-[Unreleased]: https://github.com/badbread/crumbvms/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/badbread/crumbvms/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/badbread/crumbvms/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/badbread/crumbvms/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/badbread/crumbvms/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/badbread/crumbvms/compare/v0.0.1...v0.1.0
