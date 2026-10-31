@@ -20,6 +20,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
+import video.crumb.app.ui.theme.LprAccent
 import video.crumb.app.ui.theme.TealAccent
 import video.crumb.app.ui.theme.TextSecondary
 import video.crumb.app.ui.theme.TimelineColors
@@ -35,7 +36,7 @@ enum class CrumbMode { LIVE, PLAYBACK, CLIPS, PLATES }
  * - Live: teal (the app accent)
  * - Playback: amber (the timeline playhead hue, matching the desktop client)
  * - Clips: purple
- * - Plates: red (matches the `license_plate` detection-icon color elsewhere)
+ * - Plates (LPR): registration blue, the same accent the desktop LPR tab uses
  *
  * Tabs can be hidden via [showPlayback] / [showClips] / [showPlates] for roles
  * that lack those capabilities — callers read from [SecureStore.capabilities]
@@ -76,7 +77,7 @@ fun CrumbModeTabs(
             ModeTab("Clips", selected == CrumbMode.CLIPS, Color(0xFFB07CD8), onClips)
         }
         if (showPlates) {
-            ModeTab("LPR", selected == CrumbMode.PLATES, TimelineColors.eventPlate, onPlates)
+            ModeTab("LPR", selected == CrumbMode.PLATES, LprAccent, onPlates)
         }
     }
 }

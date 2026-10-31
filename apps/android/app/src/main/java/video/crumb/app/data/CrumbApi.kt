@@ -286,6 +286,39 @@ interface CrumbApi {
     @DELETE("lpr/watchlist/{id}")
     suspend fun deleteWatchlist(@Path("id") id: String): Response<Unit>
 
+    // ── plate history, names and corrections (plate desk) ───────────────────────
+    /**
+     * Per-plate history (totals, 7/30-day counts, camera split, hour-of-day and
+     * 30-day buckets) for at most 200 plates. `view_plates`-gated and
+     * camera-scoped like [plates]. A 404/405 means an older server.
+     */
+    @POST("lpr/plates/stats")
+    suspend fun plateStats(@Body body: PlateStatsRequest): PlateStatsResponse
+
+    /** Set or edit a plate's human-readable name. **Admin-only** (403 otherwise). */
+    @PUT("lpr/plate-labels")
+    suspend fun putPlateLabel(@Body body: PlateLabelRequest): Response<Unit>
+
+    /** Clear a plate's name (404 when it has none). **Admin-only**. */
+    @DELETE("lpr/plate-labels/{plate}")
+    suspend fun deletePlateLabel(@Path("plate") plate: String): Response<Unit>
+
+    /** Plate corrections; [canonical] narrows to the known misreads of one plate. */
+    @GET("lpr/plate-aliases")
+    suspend fun plateAliases(@Query("canonical") canonical: String? = null): List<PlateAliasDto>
+
+    /** Record that the request's alias is a misread of its canonical plate. **Admin-only**. */
+    @POST("lpr/plate-aliases")
+    suspend fun createPlateAlias(@Body body: PlateAliasRequest): PlateAliasCreated
+
+    /** Undo a correction (204; 404 when none). **Admin-only**. */
+    @DELETE("lpr/plate-aliases/{alias}")
+    suspend fun deletePlateAlias(@Path("alias") alias: String): Response<Unit>
+
+    /** Likely real plates for a misread, plus how many reads a correction would move. */
+    @GET("lpr/plate-alias-suggestions")
+    suspend fun plateAliasSuggestions(@Query("plate") plate: String): PlateSuggestionsResponse
+
     // ── LPR config (admin-only) ──────────────────────────────────────────────────
     /** Platform LPR settings (enable flag, retention, watchlist fuzziness).
      *  **Admin-only** — a non-admin caller gets HTTP 403. */

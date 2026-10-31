@@ -8,6 +8,34 @@ revisit.
 
 ---
 
+## 2026-10-30, Android LPR tab redesign: phone-native (search bar + one filter sheet, two-line rows, pinned-video profile), not the desktop plate desk shrunk
+
+**Decision.** The Android LPR tab is rebuilt around the answers `0A 1A 2A 3B` from the owner's mockup round (the mockup page itself is not in the repo): registration-blue accent shared with desktop (0A);
+ONE search bar with a filter icon (count badge) that opens a single bottom sheet holding cameras, time range, "ends at", match mode,
+view (List / Gallery / Grouped), Hide regulars and Merge duplicates, plus a chip strip that only exists while a filter is off its
+default, landscape riding inline in the top bar like Clips (1A); 72 dp two-line rows with an aspect-true crop, no row icons, a
+marquee for long names that never moves the plate, long-press peek for the actions (2A); a distinct full-screen plate profile with
+the video pinned and Visits / History / Details tabs (3B). No server change: every surface uses `GET /plates`, `POST /lpr/plates/stats`,
+`/lpr/plate-labels`, `/lpr/plate-aliases` (+ suggestions), `/lpr/watchlist`, and the existing scoped-token `/play` + segment path.
+
+**Rejected.** 0B (keep plate-red): reads as an alarm and differs from desktop. 1B (chip row) and 1C (bottom bar): taller, and 1C makes
+LPR look like a different app. 2B (name on its own line + overflow dots): taller rows and a column of dots; kept as the fallback if
+long-press proves too hidden. 2C (grouped by plate as the default): hides the chronological feed, offered as a view instead. 3A (one
+scrolling page) and 3C (drag sheet): 3A scrolls the video away when a visit is picked, 3C is fussy to build and buries the charts.
+The desktop header tiles, split bar, density switch, ledger columns, radial clock, six-fact grid, Benchmark button and the Timeline
+view were deliberately NOT ported.
+
+**Trade-offs accepted.** Long-press is invisible until learned (mitigated: every action is also in the profile menu). Whether Hide
+regulars is on is told by the badge and the chip strip, not a visible toggle. Hide regulars and the NEW tag depend on the stats
+endpoint, so an older server simply shows neither. The old "LPR thumbnail image" (plate crop vs full image) setting is removed: the
+list is always the crop and the gallery always shows the frame with the crop inset. The "regular" rule is the desktop one
+(`!isNew && seen_30d >= regular_min_reads_30d`, watchlisted plates never hidden).
+
+**Revisit when.** Testers cannot find the long-press actions (switch to 2B); the second tab strip in the profile feels like too much
+structure (fall back to 3A); two blues in the tab row confuse people (nudge Live's steel blue, not LPR).
+
+---
+
 ## 2026-10-29, LPR plate corrections: an admin-managed alias table resolved on the server; raw reads are never rewritten
 
 **Context.** Plate OCR sometimes misreads one character, so one car shows up

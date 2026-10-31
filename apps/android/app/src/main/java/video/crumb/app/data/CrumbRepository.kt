@@ -30,6 +30,9 @@ import javax.net.ssl.SSLHandshakeException
  */
 private const val MAX_INTENSITY_BATCH = 64
 
+/** Max plates per `POST /lpr/plates/stats` call, the server's cap. */
+private const val MAX_PLATE_STATS_BATCH = 200
+
 /**
  * Like [runCatching] but re-throws [CancellationException] instead of capturing
  * it as a `Result.failure`.
@@ -631,6 +634,64 @@ class CrumbRepository(private val container: AppContainer) {
             // server error would report a false success while the entry survives.
             // 404 means already gone → treat as success.
             val r = api.deleteWatchlist(id)
+            if (!r.isSuccessful && r.code() != 404) throw HttpException(r)
+            Unit
+        }
+
+    // ── plate history, names and corrections (plate desk) ───────────────────────
+    /**
+     * History for [plates] (deduplicated, batched to the server's 200-plate cap).
+     * Returns the stats keyed by plate plus the server's "regular" threshold.
+     * Fails with an HTTP 404/405 on a server that predates the endpoint; callers
+     * treat that as "no history" rather than an error.
+     */
+    suspend fun plateStats(plates: Collection<String>): Result<PlateStatsBundle> =
+        runCatchingCancellable {
+            val wanted = plates.filter { it.isNotBlank() }.distinct()
+            val byPlate = HashMap<String, PlateStatsDto>()
+            var regularMin = DEFAULT_REGULAR_MIN_READS_30D
+            var tz = ""
+            for (batch in wanted.chunked(MAX_PLATE_STATS_BATCH)) {
+                val resp = api.plateStats(PlateStatsRequest(batch))
+                regularMin = resp.regularMinReads30d
+                if (resp.tz.isNotBlank()) tz = resp.tz
+                resp.plates.forEach { byPlate[it.plate] = it }
+            }
+            PlateStatsBundle(byPlate, regularMin, tz)
+        }
+
+    /** Set (or edit) a plate's name. **Admin-only** server-side (403 for non-admin). */
+    suspend fun setPlateLabel(plate: String, label: String): Result<Unit> =
+        runCatchingCancellable {
+            val r = api.putPlateLabel(PlateLabelRequest(plate.trim(), label.trim()))
+            if (!r.isSuccessful) throw HttpException(r)
+            Unit
+        }
+
+    /** Clear a plate's name; a 404 (no name) counts as success. **Admin-only**. */
+    suspend fun clearPlateLabel(plate: String): Result<Unit> =
+        runCatchingCancellable {
+            val r = api.deletePlateLabel(plate.trim())
+            if (!r.isSuccessful && r.code() != 404) throw HttpException(r)
+            Unit
+        }
+
+    /** Known misreads of [canonical] (or every correction when null). */
+    suspend fun plateAliases(canonical: String? = null): Result<List<PlateAliasDto>> =
+        runCatchingCancellable { api.plateAliases(canonical?.trim()?.ifBlank { null }) }
+
+    /** Likely real plates for the misread [plate]. */
+    suspend fun plateAliasSuggestions(plate: String): Result<PlateSuggestionsResponse> =
+        runCatchingCancellable { api.plateAliasSuggestions(plate.trim()) }
+
+    /** Record that [alias] is a misread of [canonical]. **Admin-only** (403 for non-admin). */
+    suspend fun createPlateAlias(alias: String, canonical: String): Result<PlateAliasCreated> =
+        runCatchingCancellable { api.createPlateAlias(PlateAliasRequest(alias.trim(), canonical.trim())) }
+
+    /** Undo a correction by its misread string; a 404 counts as success. **Admin-only**. */
+    suspend fun deletePlateAlias(alias: String): Result<Unit> =
+        runCatchingCancellable {
+            val r = api.deletePlateAlias(alias.trim())
             if (!r.isSuccessful && r.code() != 404) throw HttpException(r)
             Unit
         }

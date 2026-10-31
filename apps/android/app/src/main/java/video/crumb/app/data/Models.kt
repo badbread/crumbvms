@@ -707,6 +707,112 @@ data class LprConfigUpdate(
     @SerialName("watchlist_fuzz") val watchlistFuzz: Float,
 )
 
+// ─── plate history, names and corrections (plate desk) ───────────────────────
+
+/** `POST /lpr/plates/stats` body. Camera narrowing is optional (omitted = every camera the caller can see). */
+@Serializable
+data class PlateStatsRequest(
+    val plates: List<String>,
+)
+
+/** Reads of one plate on one camera. */
+@Serializable
+data class PlateCameraCount(
+    @SerialName("camera_id") val cameraId: String,
+    val n: Int = 0,
+)
+
+/**
+ * One plate's history from `POST /lpr/plates/stats`. [hours] (24) and [days30]
+ * (30, oldest first, last = the server's today) are bucketed in the server's
+ * time zone. Mirrors the desktop `PlateStats`
+ * (`apps/desktop-flutter/lib/api/plate_desk_api.dart`).
+ */
+@Serializable
+data class PlateStatsDto(
+    val plate: String = "",
+    val total: Int = 0,
+    @SerialName("seen_7d") val seen7d: Int = 0,
+    @SerialName("seen_30d") val seen30d: Int = 0,
+    @SerialName("first_seen") val firstSeen: String? = null,
+    @SerialName("last_seen") val lastSeen: String? = null,
+    @SerialName("prev_seen") val prevSeen: String? = null,
+    val cameras: List<PlateCameraCount> = emptyList(),
+    val hours: List<Int> = emptyList(),
+    val days30: List<Int> = emptyList(),
+)
+
+/** `POST /lpr/plates/stats` response envelope. */
+@Serializable
+data class PlateStatsResponse(
+    val tz: String = "",
+    @SerialName("regular_min_reads_30d") val regularMinReads30d: Int = DEFAULT_REGULAR_MIN_READS_30D,
+    val plates: List<PlateStatsDto> = emptyList(),
+)
+
+/** The server's default "regular" threshold, used until a stats response says otherwise. */
+const val DEFAULT_REGULAR_MIN_READS_30D: Int = 5
+
+/** Plate history keyed by normalized plate, plus the threshold and zone the server used. */
+data class PlateStatsBundle(
+    val byPlate: Map<String, PlateStatsDto>,
+    val regularMinReads30d: Int = DEFAULT_REGULAR_MIN_READS_30D,
+    /** IANA zone the hour and day buckets are in; blank = unknown. */
+    val tz: String = "",
+)
+
+/** `PUT /lpr/plate-labels` body (admin-only). A blank [label] is a 400; clear with DELETE. */
+@Serializable
+data class PlateLabelRequest(
+    val plate: String,
+    val label: String,
+)
+
+/** One correction: reads of [aliasPlate] count as [canonicalPlate] (`/lpr/plate-aliases`). */
+@Serializable
+data class PlateAliasDto(
+    @SerialName("alias_plate") val aliasPlate: String = "",
+    @SerialName("canonical_plate") val canonicalPlate: String = "",
+    @SerialName("created_by") val createdBy: String? = null,
+    @SerialName("created_at") val createdAt: String? = null,
+    val reads: Int = 0,
+)
+
+/** `POST /lpr/plate-aliases` body (admin-only). */
+@Serializable
+data class PlateAliasRequest(
+    val alias: String,
+    val canonical: String,
+)
+
+/** `POST /lpr/plate-aliases` response. */
+@Serializable
+data class PlateAliasCreated(
+    val alias: PlateAliasDto = PlateAliasDto(),
+    val moved: List<String> = emptyList(),
+)
+
+/** One likely real plate for a misread. */
+@Serializable
+data class PlateSuggestionDto(
+    val plate: String = "",
+    val reads: Int = 0,
+    val distance: Int = 0,
+    @SerialName("display_name") val displayName: String? = null,
+)
+
+/** `GET /lpr/plate-alias-suggestions` response. */
+@Serializable
+data class PlateSuggestionsResponse(
+    val plate: String = "",
+    @SerialName("canonical_plate") val canonicalPlate: String = "",
+    /** Reads a correction would move: this plate's own plus its misreads'. */
+    val reads: Int = 0,
+    /** Misreads that point at [plate] and would move with it. */
+    val aliases: List<String> = emptyList(),
+    val suggestions: List<PlateSuggestionDto> = emptyList(),
+)
+
 // ─── saved views (server-side, per-user; the same /views the desktop/web use) ──
 
 /**

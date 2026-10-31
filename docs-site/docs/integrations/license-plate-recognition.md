@@ -152,7 +152,9 @@ from then on both count as the real plate in every client: searches, history,
 today's totals, names and watchlist alerts. The original reads are kept, so a
 correction can be undone at any time. On the desktop it is **Correct plate...**
 in a plate's profile or row menu, see
-[Correcting a misread plate](./plates-page.md#correcting-a-misread-plate). The
+[Correcting a misread plate](./plates-page.md#correcting-a-misread-plate). On
+Android it is **Correct plate** in a plate's press-and-hold actions or on its
+Details tab. The
 API is `GET`/`POST /lpr/plate-aliases` and `DELETE /lpr/plate-aliases/:alias`
 (reading needs **View license plates**, changing is admin-only).
 
