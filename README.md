@@ -39,7 +39,7 @@
 It is a side project. One maintainer, built on my own time, running at home in production
 today: eleven cameras, multiple storage volumes, recording day in and day out for months.
 **It is about 90% of where I want v1 to be. The first minor release (v0.1.0) shipped in July
-2026, v0.2.0 followed in August, and the work continues toward v1.** The recorder, the Windows desktop client, and the Android app are the polished daily
+2026, v0.2.0 followed in August, v0.3.0 in November, and the work continues toward v1.** The recorder, the Windows desktop client, and the Android app are the polished daily
 drivers. The macOS app works but sits behind Android and Windows until demand says otherwise,
 and the iOS app is built and actively developed but not yet distributable (Apple wants a paid
 developer account, see [License](#license)). Both macOS and iOS get kept up to date, they just

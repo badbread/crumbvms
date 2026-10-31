@@ -195,7 +195,7 @@ CI, registry wired and public: `.github/workflows/ci.yml` runs fmt/clippy/build/
 
 Desktop (two real gaps): `apps/desktop/src-tauri/tauri.conf.json` has `bundle.active:true, targets:"all"` (will produce NSIS+MSI on Windows) but NO `bundle.windows` signing block. CRITICAL: the app loads `libmpv-2.dll` from next-to-the-exe at runtime, and that DLL is not in the repo and not in `bundle.resources`, an installer built today ships an app that can't play video. No desktop bundle has been built here. CI does not build the desktop.
 
-Android, signed releases shipped: the release buildType has R8 `isMinifyEnabled=true` + `isShrinkResources=true` + proguard, and a conditional `signingConfigs{}` that activates when a keystore is available (`app/build.gradle.kts`), never breaking a plain debug build when it isn't. `.github/workflows/android-release.yml` builds `assembleRelease` on a version tag, signs it from a base64 keystore CI secret, verifies the signature, and uploads the signed APK plus its SHA-256 checksum to the GitHub Release. Versioning is no longer hardcoded: `apps/android/version.properties` drives `versionCode`/`versionName` and is bumped as part of the release-prep commit (currently `VERSION_CODE=5`, `VERSION_NAME=0.2.0`).
+Android, signed releases shipped: the release buildType has R8 `isMinifyEnabled=true` + `isShrinkResources=true` + proguard, and a conditional `signingConfigs{}` that activates when a keystore is available (`app/build.gradle.kts`), never breaking a plain debug build when it isn't. `.github/workflows/android-release.yml` builds `assembleRelease` on a version tag, signs it from a base64 keystore CI secret, verifies the signature, and uploads the signed APK plus its SHA-256 checksum to the GitHub Release. Versioning is no longer hardcoded: `apps/android/version.properties` drives `versionCode`/`versionName` and is bumped as part of the release-prep commit (currently `VERSION_CODE=6`, `VERSION_NAME=0.3.0`).
 
 #### Where we are going
 
@@ -214,7 +214,7 @@ Phase 0, Decisions (prereqs) (S)
 Phase 1, Backend deploy-by-pull (M)
 
 - [x] Set CI repo/org var `REGISTRY`, packages PUBLIC (shipped as `ghcr.io/badbread/crumbvms`, not the originally proposed `crumbvms` org) (S)
-- [x] Cut the first git tag; CI pushes recorder/api images (past v0.1.0, currently at 0.2.0) (S)
+- [x] Cut the first git tag; CI pushes recorder/api images (past v0.1.0, currently at 0.3.0) (S)
 - [x] Verify the stock `docker compose pull && docker compose up -d` path from a clean machine with NO registry auth (S)
 - [ ] Pin third-party images (postgres:16-alpine, eclipse-mosquitto:2, alexxit/go2rtc) by digest in the shipped compose, still by tag, not digest (S)
 
