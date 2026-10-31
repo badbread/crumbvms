@@ -2,6 +2,19 @@
 
 package video.crumb.app.feature.live
 
+import video.crumb.app.ui.theme.Spacing
+import video.crumb.app.ui.nav.TileOrigin
+import video.crumb.app.ui.StateMessage
+import video.crumb.app.ui.SkeletonTileGrid
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.findRootCoordinates
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.material.icons.filled.ViewModule
+import androidx.compose.material.icons.filled.VideocamOff
+import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.foundation.layout.height
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.Crossfade
 import android.content.res.Configuration
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -406,7 +419,7 @@ fun LiveScreen(
                     shareImageUri(activityContext, saved.shareUri)
                 }
             } else {
-                snackbarHostState.showSnackbar("Snapshot failed — frame unavailable")
+                snackbarHostState.showSnackbar("Snapshot failed. Frame unavailable.")
             }
         }
     }
@@ -551,9 +564,12 @@ fun LiveScreen(
                 // to the end. Hidden in fullscreen kiosk mode.
                 if (!wallFullscreen) {
                     Row(
+                        // L4: 48 dp row on the grid, 16 dp start / 8 dp end so the icon
+                        // column lines up with the overflow icon in the bar above.
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 8.dp, vertical = 2.dp),
+                            .height(48.dp)
+                            .padding(start = Spacing.l, end = Spacing.s),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         ViewChipsRow(
@@ -599,149 +615,146 @@ fun LiveScreen(
                 }
 
                 Box(modifier = Modifier.fillMaxSize()) {
-                    when {
-                        // ── Loading ─────────────────────────────────────────────────
-                        // Under a weak/flaky link the initial load retries (issue
-                        // #176); once it runs long, a "still trying…" hint appears
-                        // under the spinner so the wall is never a silent spinner.
-                        state.loading -> {
-                            Column(
-                                modifier = Modifier.align(Alignment.Center).padding(24.dp),
-                                horizontalAlignment = Alignment.CenterHorizontally,
-                                verticalArrangement = Arrangement.spacedBy(14.dp),
-                            ) {
-                                CircularProgressIndicator(color = TealAccent)
+                    // L8 / G4: shimmer tiles in the final grid positions while loading,
+                    // crossfading (300 ms) to the real wall. Under a weak/flaky link the
+                    // initial load retries (issue #176); once it runs long, a "still
+                    // trying" hint appears under the skeleton so it is never silent.
+                    Crossfade(
+                        targetState = state.loading,
+                        animationSpec = tween(300),
+                        label = "wallLoading",
+                        modifier = Modifier.fillMaxSize(),
+                    ) { loading ->
+                        if (loading) {
+                            Box(Modifier.fillMaxSize()) {
+                                SkeletonTileGrid(cols = minOf(layout.cols, maxCols))
                                 state.connecting?.let { msg ->
                                     Text(
                                         text = msg,
+                                        style = MaterialTheme.typography.bodySmall,
                                         color = Color.White.copy(alpha = 0.72f),
-                                        fontSize = 13.sp,
                                         textAlign = TextAlign.Center,
+                                        modifier = Modifier
+                                            .align(Alignment.BottomCenter)
+                                            .padding(Spacing.l),
                                     )
                                 }
                             }
-                        }
-
-                        // ── Viewer restricted (403) ──────────────────────────────────
-                        state.isViewerRestricted -> {
-                            ViewerRestrictedState(
-                                modifier = Modifier.align(Alignment.Center),
-                                onRetry = { vm.retry() },
-                            )
-                        }
-
-                        // ── Non-403 error ────────────────────────────────────────────
-                        state.error != null -> {
-                            ErrorState(
-                                message = state.error!!,
-                                modifier = Modifier.align(Alignment.Center),
-                                onRetry = { vm.retry() },
-                            )
-                        }
-
-                        // ── Empty (no cameras) ───────────────────────────────────────
-                        state.cameras.isEmpty() -> {
-                            EmptyState(
-                                modifier = Modifier.align(Alignment.Center),
-                                onRetry = { vm.retry() },
-                            )
-                        }
-
-                        // ── "All Cameras" suppressed, no saved view to fall back to ──
-                        // (cameras exist, "Show All Cameras" is off, and there's nothing
-                        // in [views] yet for the auto-adopt effect above to pick).
-                        suppressingAllCameras && views.isEmpty() -> {
-                            Column(
-                                modifier = Modifier.align(Alignment.Center).padding(32.dp),
-                                horizontalAlignment = Alignment.CenterHorizontally,
-                                verticalArrangement = Arrangement.spacedBy(8.dp),
-                            ) {
-                                Text(
-                                    text = "No saved views yet.",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = TextSecondary,
+                        } else Box(Modifier.fillMaxSize()) {
+                        when {
+                            // ── Viewer restricted (403) ──────────────────────────────────
+                            state.isViewerRestricted -> {
+                                ViewerRestrictedState(
+                                    modifier = Modifier.align(Alignment.Center),
+                                    onRetry = { vm.retry() },
                                 )
-                                Text(
-                                    text = "\"Show All Cameras\" is off in Settings — " +
-                                        "create a view, or turn it back on.",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = TextSecondary,
-                                )
-                                TextButton(onClick = { editorTarget = ViewEditorTarget.New }) {
-                                    Text("Create a view", color = TealAccent)
-                                }
-                                TextButton(onClick = { showSettings = true }) {
-                                    Text("Open Settings", color = TealAccent)
-                                }
                             }
-                        }
 
-                        // ── Active view filtered to zero available cameras ───────────
-                        // (cameras exist, but none of this view's are present/enabled).
-                        shownCameras.isEmpty() -> {
-                            Column(
-                                modifier = Modifier.align(Alignment.Center).padding(32.dp),
-                                horizontalAlignment = Alignment.CenterHorizontally,
-                                verticalArrangement = Arrangement.spacedBy(8.dp),
-                            ) {
-                                Text(
-                                    text = "This view has no available cameras.",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = TextSecondary,
+                            // ── Non-403 error ────────────────────────────────────────────
+                            state.error != null -> {
+                                ErrorState(
+                                    message = state.error!!,
+                                    modifier = Modifier.align(Alignment.Center),
+                                    onRetry = { vm.retry() },
                                 )
-                                TextButton(onClick = { setActive(null) }) {
-                                    Text("Show all cameras", color = TealAccent)
-                                }
-                                activeView?.let { av ->
-                                    TextButton(onClick = { editorTarget = ViewEditorTarget.Edit(av) }) {
-                                        Text("Edit view", color = TealAccent)
+                            }
+
+                            // ── Empty (no cameras) ───────────────────────────────────────
+                            state.cameras.isEmpty() -> {
+                                EmptyState(
+                                    modifier = Modifier.align(Alignment.Center),
+                                    onRetry = { vm.retry() },
+                                )
+                            }
+
+                            // ── "All Cameras" suppressed, no saved view to fall back to ──
+                            // (cameras exist, "Show All Cameras" is off, and there's nothing
+                            // in [views] yet for the auto-adopt effect above to pick).
+                            suppressingAllCameras && views.isEmpty() -> {
+                                StateMessage(
+                                    icon = Icons.Default.ViewModule,
+                                    title = "No saved views yet",
+                                    body = "\"Show All cameras\" is off in Settings. " +
+                                        "Create a view, or turn it back on.",
+                                    actionLabel = "Create a view",
+                                    onAction = { editorTarget = ViewEditorTarget.New },
+                                    modifier = Modifier.align(Alignment.Center),
+                                )
+                            }
+
+                            // ── Active view filtered to zero available cameras ───────────
+                            // (cameras exist, but none of this view's are present/enabled).
+                            shownCameras.isEmpty() -> {
+                                StateMessage(
+                                    icon = Icons.Default.VideocamOff,
+                                    title = "This view has no available cameras",
+                                    actionLabel = "Show all cameras",
+                                    onAction = { setActive(null) },
+                                    modifier = Modifier.align(Alignment.Center),
+                                )
+                            }
+
+                            // ── Camera grid ──────────────────────────────────────────────
+                            else -> {
+                                LazyVerticalGrid(
+                                    columns = GridCells.Fixed(minOf(layout.cols, maxCols)),
+                                    state = gridState,
+                                    // L5: 8 dp gutter, 4 dp gap between tiles (G7).
+                                    contentPadding = PaddingValues(Spacing.s),
+                                    horizontalArrangement = Arrangement.spacedBy(Spacing.xs),
+                                    verticalArrangement = Arrangement.spacedBy(Spacing.xs),
+                                    modifier = Modifier.fillMaxSize(),
+                                ) {
+                                    items(shownCameras, key = { it.id }) { cam ->
+                                        LiveCameraTile(
+                                            camera = cam,
+                                            streams = state.streams[cam.id],
+                                            onRefreshStreams = { vm.refreshStreams(cam.id) },
+                                            onClick = { onTileClick(cam.id) },
+                                            mediaUrls = mediaUrls,
+                                            motion = motionCams.contains(cam.id),
+                                            // REC dot = actually recording NOW, straight from
+                                            // /status (`recording` = a segment was indexed in
+                                            // the last ~12s). The recorder only indexes segments
+                                            // while a motion-mode camera is actively recording
+                                            // motion, so this is already false when such a camera
+                                            // is idle — no need to second-guess via the policy
+                                            // mode (which reflects config, not live state).
+                                            recording = recordingCams.contains(cam.id),
+                                            detections = detectionCams[cam.id] ?: emptyList(),
+                                            lowBandwidthMode = lowBandwidthMode,
+                                            // Stage-2 backpressure: this tile has been
+                                            // shed to a still to relieve decode pressure.
+                                            autoShed = adaptiveWallQuality &&
+                                                !lowBandwidthMode && shedIds.contains(cam.id),
+                                            onStall = { vm.reportTileStall(cam.id) },
+                                            onDroppedFrames = { dropped, elapsedMs ->
+                                                decodeMonitor.reportDroppedVideoFrames(dropped, elapsedMs)
+                                            },
+                                            modifier = Modifier
+                                                // Placement-only animation: no alpha on a
+                                                // SurfaceView tile, so video never blanks.
+                                                .animateItem(fadeInSpec = null, fadeOutSpec = null)
+                                                .fillMaxWidth()
+                                                .aspectRatio(16f / 9f)
+                                                // Remember where this tile sits so the
+                                                // camera can grow out of it (L6).
+                                                .onGloballyPositioned { c ->
+                                                    val root = c.findRootCoordinates().size
+                                                    if (root.width > 0 && root.height > 0) {
+                                                        val b = c.boundsInRoot()
+                                                        TileOrigin.record(
+                                                            cam.id,
+                                                            b.center.x / root.width,
+                                                            b.center.y / root.height,
+                                                        )
+                                                    }
+                                                },
+                                        )
                                     }
                                 }
                             }
                         }
-
-                        // ── Camera grid ──────────────────────────────────────────────
-                        else -> {
-                            LazyVerticalGrid(
-                                columns = GridCells.Fixed(minOf(layout.cols, maxCols)),
-                                state = gridState,
-                                contentPadding = PaddingValues(8.dp),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                verticalArrangement = Arrangement.spacedBy(8.dp),
-                                modifier = Modifier.fillMaxSize(),
-                            ) {
-                                items(shownCameras, key = { it.id }) { cam ->
-                                    LiveCameraTile(
-                                        camera = cam,
-                                        streams = state.streams[cam.id],
-                                        onRefreshStreams = { vm.refreshStreams(cam.id) },
-                                        onClick = { onTileClick(cam.id) },
-                                        mediaUrls = mediaUrls,
-                                        motion = motionCams.contains(cam.id),
-                                        // REC dot = actually recording NOW, straight from
-                                        // /status (`recording` = a segment was indexed in
-                                        // the last ~12s). The recorder only indexes segments
-                                        // while a motion-mode camera is actively recording
-                                        // motion, so this is already false when such a camera
-                                        // is idle — no need to second-guess via the policy
-                                        // mode (which reflects config, not live state).
-                                        recording = recordingCams.contains(cam.id),
-                                        detections = detectionCams[cam.id] ?: emptyList(),
-                                        lowBandwidthMode = lowBandwidthMode,
-                                        // Stage-2 backpressure: this tile has been
-                                        // shed to a still to relieve decode pressure.
-                                        autoShed = adaptiveWallQuality &&
-                                            !lowBandwidthMode && shedIds.contains(cam.id),
-                                        onStall = { vm.reportTileStall(cam.id) },
-                                        onDroppedFrames = { dropped, elapsedMs ->
-                                            decodeMonitor.reportDroppedVideoFrames(dropped, elapsedMs)
-                                        },
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .aspectRatio(16f / 9f),
-                                    )
-                                }
-                            }
                         }
                     }
 
@@ -1026,20 +1039,14 @@ private fun ViewerRestrictedState(
     modifier: Modifier = Modifier,
     onRetry: () -> Unit,
 ) {
-    Column(
-        modifier = modifier.padding(32.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        Text(
-            text = "You don't have access to any cameras.",
-            style = MaterialTheme.typography.bodyMedium,
-            color = TextSecondary,
-        )
-        TextButton(onClick = onRetry) {
-            Text("Retry", color = TealAccent)
-        }
-    }
+    StateMessage(
+        icon = Icons.Default.VideocamOff,
+        title = "No cameras for this account",
+        body = "Ask an admin to grant access to a camera.",
+        actionLabel = "Retry",
+        onAction = onRetry,
+        modifier = modifier,
+    )
 }
 
 @Composable
@@ -1048,20 +1055,14 @@ private fun ErrorState(
     modifier: Modifier = Modifier,
     onRetry: () -> Unit,
 ) {
-    Column(
-        modifier = modifier.padding(32.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        Text(
-            text = message,
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.error,
-        )
-        TextButton(onClick = onRetry) {
-            Text("Retry", color = TealAccent)
-        }
-    }
+    StateMessage(
+        icon = Icons.Default.ErrorOutline,
+        title = "Can't load cameras",
+        body = message,
+        actionLabel = "Retry",
+        onAction = onRetry,
+        modifier = modifier,
+    )
 }
 
 @Composable
@@ -1069,18 +1070,11 @@ private fun EmptyState(
     modifier: Modifier = Modifier,
     onRetry: () -> Unit,
 ) {
-    Column(
-        modifier = modifier.padding(32.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        Text(
-            text = "No cameras available",
-            style = MaterialTheme.typography.bodyMedium,
-            color = TextSecondary,
-        )
-        TextButton(onClick = onRetry) {
-            Text("Refresh", color = TealAccent)
-        }
-    }
+    StateMessage(
+        icon = Icons.Default.VideocamOff,
+        title = "No cameras available",
+        actionLabel = "Refresh",
+        onAction = onRetry,
+        modifier = modifier,
+    )
 }
