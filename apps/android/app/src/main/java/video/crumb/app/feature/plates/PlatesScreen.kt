@@ -7,64 +7,56 @@
 
 package video.crumb.app.feature.plates
 
+import android.content.res.Configuration
 import android.os.Build
+import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.items as gridItems
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Block
-import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.CreditCard
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.Event
-import androidx.compose.material.icons.filled.ExpandLess
-import androidx.compose.material.icons.filled.ExpandMore
-import androidx.compose.material.icons.filled.GridView
-import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.NotificationsOff
 import androidx.compose.material.icons.filled.PictureAsPdf
-import androidx.compose.material.icons.filled.PlaylistAdd
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Star
-import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.Visibility
-import androidx.compose.material.icons.filled.ViewAgenda
-import androidx.compose.material.icons.filled.ViewList
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -73,6 +65,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SnackbarDuration
@@ -97,6 +90,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -104,8 +98,8 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -116,7 +110,6 @@ import coil.imageLoader
 import coil.request.ImageRequest
 import kotlinx.coroutines.launch
 import androidx.compose.ui.layout.ContentScale
-import video.crumb.app.data.CameraDto
 import video.crumb.app.data.MediaUrls
 import video.crumb.app.data.PlateRead
 import video.crumb.app.data.PlateWatchlistEntry
@@ -127,22 +120,34 @@ import video.crumb.app.ui.CrumbMode
 import video.crumb.app.ui.CrumbModeTabs
 import video.crumb.app.ui.JumpToDateTimeDialog
 import video.crumb.app.ui.Time
+import video.crumb.app.ui.theme.LprAccent
+import video.crumb.app.ui.theme.LprAccentHot
 import video.crumb.app.ui.theme.NavyDeep
-import video.crumb.app.ui.theme.TealAccent
 import video.crumb.app.ui.theme.TextSecondary
-import video.crumb.app.ui.theme.TimelineColors
 import java.io.File
+import java.time.Instant
 import kotlin.math.roundToInt
 
+/** One entry in the list view: a day header or a read row. */
+private sealed interface ListEntry {
+    val key: String
+
+    data class Header(val label: String) : ListEntry {
+        override val key: String get() = "h:$label"
+    }
+
+    data class Row(val data: PlateRowData, val timeLabel: String) : ListEntry {
+        override val key: String get() = "r:${data.read.id}"
+    }
+}
+
 /**
- * The Plates tab: a newest-first browser of license-plate reads (LPR).
+ * The Plates tab (LPR): a newest-first browser of license-plate reads.
  *
- * Mirrors the desktop client's Plates tab
- * (`apps/desktop-flutter/lib/ui/plates/plates_screen.dart`): a filter bar
- * (plate search + exact/contains/fuzzy match toggle, camera multi-select, time
- * range) over a list of reads. Each row shows the plate, the sibling
- * detection-event snapshot, camera name, local timestamp, and a confidence
- * chip; tapping a row jumps to Playback at that read's moment on that camera.
+ * Mirrors the desktop client's Plates tab (`apps/desktop-flutter/lib/ui/plates/`)
+ * but laid out for a phone: a search bar and ONE filter sheet (no control rows),
+ * calm two-line rows with an aspect-true plate crop, long-press for actions, and
+ * a full-screen plate profile (video, visits, history, details) on tap.
  *
  * Callers gate entry on `SecureStore.platesEnabled` — this screen does not
  * re-check it, so it should never be reachable when that flag is false.
@@ -160,6 +165,7 @@ fun PlatesScreen(
         factory = viewModelFactory { initializer { PlatesViewModel(container.repository) } },
     )
     val state by vm.state.collectAsStateWithLifecycle()
+    val profile by vm.profile.collectAsStateWithLifecycle()
     val mediaUrls = remember { container.mediaUrls() }
     val store = container.store
     val caps = store.capabilities
@@ -167,13 +173,18 @@ fun PlatesScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val clipboard = LocalClipboardManager.current
+    val isLandscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
 
-    var showCameraPicker by remember { mutableStateOf(false) }
+    var showFilters by remember { mutableStateOf(false) }
     var showJump by remember { mutableStateOf(false) }
     var showWatchlist by remember { mutableStateOf(false) }
     // The plate a "quick add to watchlist" was tapped for — opens a small chooser
     // asking watch (alert) vs ignore (drop) before adding. Null = chooser closed.
     var addKindForPlate by remember { mutableStateOf<String?>(null) }
+    // The row whose long-press peek is open.
+    var peek by remember { mutableStateOf<PlateRowData?>(null) }
+    // (plate, current name) while the Name / Rename dialog is open.
+    var renameFor by remember { mutableStateOf<Pair<String, String?>?>(null) }
     // The single plate a report is being built for (opens the builder dialog), plus
     // an in-flight guard so the dialog can show a spinner + block re-taps.
     var reportFor by remember { mutableStateOf<PlateRead?>(null) }
@@ -181,142 +192,331 @@ fun PlatesScreen(
     // The just-generated report PDF (app-private cache file). Non-null opens the
     // post-generate actions sheet: Open (view now) / Save to Downloads / Share.
     var reportActionsFile by remember { mutableStateOf<File?>(null) }
+    // Platform-wide bookmarks toggle (server /status.bookmarks_enabled): hide the
+    // profile's bookmark control when the admin disabled bookmarks. Defaults on.
+    var bookmarksEnabled by remember { mutableStateOf(true) }
+    LaunchedEffect(Unit) {
+        container.repository.status().onSuccess { bookmarksEnabled = it.bookmarksEnabled }
+    }
     val snackbarHostState = remember { SnackbarHostState() }
+    // Hoisted so the list keeps its scroll position while a profile is open over it.
+    val listState = rememberLazyListState()
+    val gridState = rememberLazyGridState()
+
+    // System back closes the profile first, then leaves the screen as usual.
+    BackHandler(enabled = profile != null) { vm.closeProfile() }
 
     // Surface the ViewModel's one-shot messages (add/remove result, admin-only
-    // 403 notice) in a snackbar, then clear so it doesn't re-show on recomposition.
+    // 403 notice, correction + Undo) in a snackbar, then clear so it doesn't
+    // re-show on recomposition.
     LaunchedEffect(state.message) {
         val msg = state.message
         if (msg != null) {
-            snackbarHostState.showSnackbar(msg)
+            val undo = state.messageUndoAlias
+            val result = snackbarHostState.showSnackbar(
+                message = msg,
+                actionLabel = if (undo != null) "Undo" else null,
+                duration = if (undo != null) SnackbarDuration.Long else SnackbarDuration.Short,
+            )
             vm.consumeMessage()
+            if (result == SnackbarResult.ActionPerformed && undo != null) vm.undoCorrection(undo)
         }
+    }
+
+    val camNames = remember(state.cameras) { state.cameras.associate { it.id to it.name } }
+
+    // Put the RAW plate on the clipboard (see plateCopyText) and confirm it,
+    // except where the platform already confirms for us.
+    val onCopy: (PlateRead) -> Unit = { p ->
+        val text = plateCopyText(p)
+        if (text == null) {
+            scope.launch { snackbarHostState.showSnackbar("This read has no plate text to copy.") }
+        } else {
+            clipboard.setText(AnnotatedString(text))
+            if (!systemConfirmsClipboardWrite(Build.VERSION.SDK_INT)) {
+                scope.launch { snackbarHostState.showSnackbar("Copied $text") }
+            }
+        }
+    }
+    val openInPlayback: (PlateRead) -> Unit = { p ->
+        val ms = runCatching { Time.parseToMillis(p.ts) }.getOrNull()
+        if (ms != null) onOpenPlateAt(p.cameraId, ms)
+    }
+
+    // Derived list data: Hide regulars, then Merge duplicates, then row decoration.
+    val visibleReads = remember(state.plates, state.hideRegulars, state.stats, state.regularMinReads, state.watchlist) {
+        state.visibleReads()
+    }
+    val watchedSet = state.watchedPlates
+    val nowMs = remember(state.plates) { System.currentTimeMillis() }
+    fun decorate(read: PlateRead, count: Int): PlateRowData {
+        val st = state.stats[read.plate]
+        return PlateRowData(
+            read = read,
+            cameraName = camNames[read.cameraId] ?: "Unknown camera",
+            watched = read.plate in watchedSet,
+            rail = plateRail(read.plate in watchedSet, st, state.regularMinReads),
+            isNew = st?.isNewPlate() == true,
+            passCount = count,
+        )
+    }
+    val rows: List<PlateRowData> = remember(visibleReads, state.mergeDuplicates, state.viewMode, state.stats, state.watchlist, camNames, state.regularMinReads) {
+        if (state.viewMode == PlatesViewMode.GROUPED) {
+            groupByPlate(visibleReads).map { decorate(it.latest, it.count) }
+        } else if (state.mergeDuplicates) {
+            collapsePlateReads(visibleReads).map { decorate(it.representative, it.count) }
+        } else {
+            visibleReads.map { decorate(it, 1) }
+        }
+    }
+
+    val chips = activeFilterChips(
+        cameraNames = camNames,
+        selected = state.selectedCameraIds,
+        hours = state.hours,
+        anchorEndMs = state.anchorEndMs,
+        anchorLabel = state.anchorEndMs?.let { runCatching { Time.dateTime(Instant.ofEpochMilli(it)) }.getOrNull() },
+        match = state.match,
+        hideRegulars = state.hideRegulars,
+        rangeLabel = ::rangeLabel,
+    )
+
+    val searchBar: @Composable (Modifier, Boolean) -> Unit = { mod, compact ->
+        PlatesSearchBar(
+            query = state.query,
+            onQueryChange = { vm.setQuery(it) },
+            onSubmit = { vm.submitSearch() },
+            activeFilters = activeFilterCount(chips),
+            onOpenFilters = { showFilters = true },
+            onWatchlist = { showWatchlist = true; vm.loadWatchlist(); vm.loadLprConfig() },
+            onRefresh = { vm.refresh() },
+            modifier = mod,
+            compact = compact,
+        )
     }
 
     Scaffold(
         containerColor = NavyDeep,
         snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
-            TopAppBar(
-                title = {
-                    CrumbModeTabs(
-                        selected = CrumbMode.PLATES,
-                        onLive = onOpenLive,
-                        onPlayback = onOpenPlayback,
-                        onClips = onOpenClips,
-                        onPlates = {},
-                        showPlayback = caps.playback || store.isAdmin,
-                        showClips = caps.clips || store.isAdmin,
-                        showPlates = true,
-                    )
-                },
-                actions = {
-                    // Per-plate reports are the primary export path now — each plate row
-                    // has its own "Report" action that opens the builder dialog. (The old
-                    // bulk "Export PDF" toolbar button was removed in favor of it.)
-                    IconButton(onClick = { showWatchlist = true; vm.loadWatchlist(); vm.loadLprConfig() }) {
-                        Icon(Icons.Filled.Star, contentDescription = "Plate watchlist")
-                    }
-                    IconButton(onClick = { vm.refresh() }) {
-                        Icon(Icons.Filled.Refresh, contentDescription = "Refresh")
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = NavyDeep),
-            )
+            // The profile is its own full screen with its own top bar.
+            if (profile == null) {
+                TopAppBar(
+                    title = {
+                        // In LANDSCAPE the phone is short, so — like Clips — the search and
+                        // filter controls ride inline in the top bar next to the mode tabs.
+                        if (isLandscape) {
+                            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                                PlatesModeTabs(onOpenLive, onOpenPlayback, onOpenClips, caps.playback || store.isAdmin, caps.clips || store.isAdmin)
+                                Box(
+                                    Modifier
+                                        .padding(horizontal = 10.dp)
+                                        .width(1.dp)
+                                        .height(24.dp)
+                                        .background(Color(0xFF2E313A)),
+                                )
+                                searchBar(Modifier.weight(1f).padding(end = 8.dp), true)
+                            }
+                        } else {
+                            PlatesModeTabs(onOpenLive, onOpenPlayback, onOpenClips, caps.playback || store.isAdmin, caps.clips || store.isAdmin)
+                        }
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(containerColor = NavyDeep),
+                )
+            }
         },
     ) { pad ->
-        Column(Modifier.padding(pad).fillMaxSize()) {
-            PlatesFilterBar(
-                state = state,
-                onQueryChange = { vm.setQuery(it) },
-                onSubmitSearch = { vm.submitSearch() },
-                onMatchChange = { vm.setMatch(it) },
-                onHoursChange = { vm.setHours(it) },
-                onPickCameras = { showCameraPicker = true },
-                onPickWhen = { showJump = true },
-                onResetToNow = { vm.setAnchorEnd(null) },
-                modifier = Modifier.fillMaxWidth(),
-            )
-            PlatesViewSwitcher(
-                mode = state.viewMode,
-                onSelect = { vm.setViewMode(it) },
-                modifier = Modifier.fillMaxWidth(),
-            )
-            HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
-            Box(Modifier.fillMaxSize()) {
-                when {
-                    state.loading && state.plates.isEmpty() ->
-                        CircularProgressIndicator(Modifier.align(Alignment.Center), color = TealAccent)
-                    state.error != null ->
-                        Text(
-                            "Couldn't load plates: ${state.error}",
-                            Modifier.align(Alignment.Center).padding(24.dp),
-                            color = MaterialTheme.colorScheme.error,
-                        )
-                    state.plates.isEmpty() ->
-                        Text(
-                            "No plate reads in this window.",
-                            Modifier.align(Alignment.Center),
-                            color = TextSecondary,
-                        )
-                    else -> {
-                        val byId = state.cameras.associateBy { it.id }
-                        val onOpen: (PlateRead) -> Unit = { p ->
-                            val ms = runCatching { Time.parseToMillis(p.ts) }.getOrNull()
-                            if (ms != null) onOpenPlateAt(p.cameraId, ms)
-                        }
-                        val cameraName: (PlateRead) -> String = { byId[it.cameraId]?.name ?: "(unknown camera)" }
-                        // Put the RAW plate on the clipboard (see plateCopyText) and confirm
-                        // it, except where the platform already confirms for us.
-                        val onCopy: (PlateRead) -> Unit = { p ->
-                            val text = plateCopyText(p)
-                            if (text == null) {
-                                scope.launch { snackbarHostState.showSnackbar("This read has no plate text to copy.") }
-                            } else {
-                                clipboard.setText(AnnotatedString(text))
-                                if (!systemConfirmsClipboardWrite(Build.VERSION.SDK_INT)) {
-                                    scope.launch { snackbarHostState.showSnackbar("Copied $text") }
-                                }
+        val p = profile
+        if (p != null) {
+            PlateProfileScreen(
+                profile = p,
+                cameraNames = camNames,
+                repo = container.repository,
+                mediaUrls = mediaUrls,
+                isAdmin = isAdmin,
+                watchEntry = state.watchlist.firstOrNull { it.plate == p.plate },
+                regularMinReads = state.regularMinReads,
+                statsTz = state.statsTz,
+                bookmarksEnabled = bookmarksEnabled,
+                actions = PlateProfileActions(
+                    onBack = { vm.closeProfile() },
+                    onSelectVisit = { vm.selectProfileRead(it) },
+                    onToggleWatch = {
+                        val existing = state.watchlist.firstOrNull { it.plate == p.plate && !it.isIgnore }
+                        if (existing != null) vm.removeFromWatchlist(existing.id) else vm.addToWatchlist(p.plate, kind = WATCHLIST_KIND_WATCH)
+                    },
+                    onCopy = { onCopy(p.selected) },
+                    onRename = { renameFor = p.plate to p.displayName },
+                    onCorrect = { vm.openCorrection(p.plate) },
+                    onReport = { reportFor = it },
+                    onOpenPlayback = openInPlayback,
+                    onUndoAlias = { vm.undoCorrection(it) },
+                    onAddBookmark = { cameraId, atMs, desc, days, pre, post ->
+                        scope.launch {
+                            container.repository.addBookmark(
+                                cameraId,
+                                Time.iso(Instant.ofEpochMilli(atMs)),
+                                desc,
+                                protectDays = days,
+                                protectPreSeconds = pre,
+                                protectPostSeconds = post,
+                            ).onSuccess {
+                                Toast.makeText(context, "Bookmark added", Toast.LENGTH_SHORT).show()
+                            }.onFailure {
+                                snackbarHostState.showSnackbar("Couldn't add bookmark")
                             }
                         }
-                        when (state.viewMode) {
-                            PlatesViewMode.LIST -> PlatesListView(
-                                plates = state.plates,
-                                cameraName = cameraName,
-                                mediaUrls = mediaUrls,
-                                onOpen = onOpen,
-                                isAdmin = isAdmin,
-                                onAddToWatchlist = { addKindForPlate = it },
-                                onReport = { reportFor = it },
-                                onCopy = onCopy,
+                    },
+                ),
+                modifier = Modifier.padding(pad),
+            )
+        } else {
+            Column(Modifier.padding(pad).fillMaxSize()) {
+                if (!isLandscape) {
+                    searchBar(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 8.dp), false)
+                }
+                ActiveFilterStrip(chips = chips, onClear = { vm.clearFilter(it) })
+                Box(Modifier.fillMaxSize()) {
+                    when {
+                        state.loading && state.plates.isEmpty() ->
+                            CircularProgressIndicator(Modifier.align(Alignment.Center), color = LprAccent)
+                        state.error != null ->
+                            Text(
+                                "Couldn't load plates: ${state.error}",
+                                Modifier.align(Alignment.Center).padding(24.dp),
+                                color = MaterialTheme.colorScheme.error,
                             )
-                            PlatesViewMode.GALLERY -> PlatesGalleryView(
-                                plates = state.plates,
-                                cameraName = cameraName,
-                                mediaUrls = mediaUrls,
-                                onOpen = onOpen,
-                                onReport = { reportFor = it },
-                                onCopy = onCopy,
+                        state.plates.isEmpty() ->
+                            Text(
+                                "No plate reads in this window.",
+                                Modifier.align(Alignment.Center).padding(24.dp),
+                                color = TextSecondary,
                             )
-                            PlatesViewMode.GROUPED -> PlatesGroupedView(
-                                plates = state.plates,
-                                cameraName = cameraName,
-                                mediaUrls = mediaUrls,
-                                onOpen = onOpen,
-                                onCopy = onCopy,
+                        rows.isEmpty() ->
+                            Text(
+                                "Only regulars in this window. Turn off Hide regulars in Filters to see them.",
+                                Modifier.align(Alignment.Center).padding(24.dp),
+                                color = TextSecondary,
                             )
-                            PlatesViewMode.TIMELINE -> PlatesTimelineView(
-                                plates = state.plates,
-                                cameraName = cameraName,
-                                mediaUrls = mediaUrls,
-                                onOpen = onOpen,
-                                onCopy = onCopy,
-                            )
+                        else -> {
+                            val footer = if (state.plates.size < state.total) {
+                                "Showing the latest ${state.plates.size} of ${state.total} reads. Narrow the time range to see older ones."
+                            } else {
+                                null
+                            }
+                            when (state.viewMode) {
+                                PlatesViewMode.LIST -> PlatesListView(
+                                    rows = rows,
+                                    nowMs = nowMs,
+                                    mediaUrls = mediaUrls,
+                                    footer = footer,
+                                    listState = listState,
+                                    onOpen = { vm.openProfile(it.read) },
+                                    onPeek = { peek = it },
+                                )
+                                PlatesViewMode.GALLERY -> PlatesGalleryView(
+                                    rows = rows,
+                                    nowMs = nowMs,
+                                    mediaUrls = mediaUrls,
+                                    footer = footer,
+                                    gridState = gridState,
+                                    onOpen = { vm.openProfile(it.read) },
+                                    onPeek = { peek = it },
+                                )
+                                PlatesViewMode.GROUPED -> PlatesGroupedView(
+                                    rows = rows,
+                                    nowMs = nowMs,
+                                    mediaUrls = mediaUrls,
+                                    footer = footer,
+                                    listState = listState,
+                                    onOpen = { vm.openProfile(it.read) },
+                                    onPeek = { peek = it },
+                                )
+                            }
                         }
                     }
                 }
             }
         }
+    }
+
+    // ── sheets and dialogs ────────────────────────────────────────────────────
+
+    if (showFilters) {
+        val hidden = state.plates.size - visibleReads.size
+        PlatesFilterSheet(
+            sheet = PlatesFilterSheetState(
+                cameras = state.cameras.sortedBy { it.name.lowercase() }.map { it.id to it.name },
+                selectedCameraIds = state.selectedCameraIds,
+                hours = state.hours,
+                anchorEndMs = state.anchorEndMs,
+                anchorLabel = state.anchorEndMs?.let { runCatching { Time.dateTime(Instant.ofEpochMilli(it)) }.getOrNull() },
+                match = state.match,
+                viewMode = state.viewMode,
+                hideRegulars = state.hideRegulars,
+                mergeDuplicates = state.mergeDuplicates,
+                anyActive = chips.isNotEmpty(),
+                footer = if (state.loading) "" else feedSummary(visibleReads.size, state.plates.size, state.total, hidden),
+                watchlistCount = state.watchlist.size,
+            ),
+            onCameras = { vm.setSelectedCameras(it) },
+            onHours = { vm.setHours(it) },
+            onPickEndsAt = { showJump = true },
+            onResetEndsAt = { vm.setAnchorEnd(null) },
+            onMatch = { vm.setMatch(it) },
+            onViewMode = { vm.setViewMode(it) },
+            onHideRegulars = { vm.setHideRegulars(it) },
+            onMergeDuplicates = { vm.setMergeDuplicates(it) },
+            onReset = { vm.resetFilters() },
+            onWatchlist = {
+                showFilters = false
+                showWatchlist = true
+                vm.loadWatchlist()
+                vm.loadLprConfig()
+            },
+            onDismiss = { showFilters = false },
+        )
+    }
+    if (showJump) {
+        JumpToDateTimeDialog(
+            initialMs = state.anchorEndMs ?: System.currentTimeMillis(),
+            onDismiss = { showJump = false },
+            onPicked = { ms -> vm.setAnchorEnd(ms); showJump = false },
+        )
+    }
+
+    peek?.let { item ->
+        PlatePeek(
+            item = item,
+            mediaUrls = mediaUrls,
+            timeLabel = rowTimeLabel(Time.parseToMillis(item.read.ts), System.currentTimeMillis()),
+            isAdmin = isAdmin,
+            onCopy = { onCopy(item.read) },
+            onWatch = {
+                if (item.watched) vm.removePlateFromWatchlist(item.read.plate) else addKindForPlate = item.read.plate
+            },
+            onCorrect = { vm.openCorrection(item.read.plate) },
+            onReport = { reportFor = item.read },
+            onPlayback = { openInPlayback(item.read) },
+            onDismiss = { peek = null },
+        )
+    }
+
+    state.correction?.let { ui ->
+        PlateCorrectionSheet(
+            ui = ui,
+            onSubmit = { vm.submitCorrection(it) },
+            onDismiss = { vm.closeCorrection() },
+        )
+    }
+
+    renameFor?.let { (plate, current) ->
+        RenamePlateDialog(
+            plate = plate,
+            current = current,
+            onSave = { name -> vm.renamePlate(plate, name); renameFor = null },
+            onDismiss = { renameFor = null },
+        )
     }
 
     addKindForPlate?.let { plate ->
@@ -346,21 +546,6 @@ fun PlatesScreen(
             },
         )
     }
-    if (showCameraPicker) {
-        CameraPickerDialog(
-            cameras = state.cameras,
-            selected = state.selectedCameraIds,
-            onApply = { ids -> vm.setSelectedCameras(ids); showCameraPicker = false },
-            onDismiss = { showCameraPicker = false },
-        )
-    }
-    if (showJump) {
-        JumpToDateTimeDialog(
-            initialMs = state.anchorEndMs ?: System.currentTimeMillis(),
-            onDismiss = { showJump = false },
-            onPicked = { ms -> vm.setAnchorEnd(ms); showJump = false },
-        )
-    }
     if (showWatchlist) {
         WatchlistDialog(
             state = state,
@@ -381,7 +566,7 @@ fun PlatesScreen(
                 if (generatingReport) return@PlateReportDialog
                 generatingReport = true
                 val repo = container.repository
-                val camNames = state.cameras.associate { it.id to it.name }
+                val camNamesForReport = state.cameras.associate { it.id to it.name }
                 val allCamIds = state.cameras.map { it.id }
                 val loader = context.imageLoader
                 scope.launch {
@@ -407,7 +592,7 @@ fun PlatesScreen(
                     }
                     val input = PlateReportInput(
                         read = reportRead,
-                        cameraNames = camNames,
+                        cameraNames = camNamesForReport,
                         zoneId = zoneId,
                         includeDossier = includeDossier,
                         watchMatch = watchMatch,
@@ -480,509 +665,178 @@ fun PlatesScreen(
     }
 }
 
-// ─── view switcher ──────────────────────────────────────────────────────────
-
-/** The four-way render-mode toggle (List / Gallery / Grouped / Timeline). */
+/** The shared mode-tab row with LPR selected. */
 @Composable
-private fun PlatesViewSwitcher(
-    mode: PlatesViewMode,
-    onSelect: (PlatesViewMode) -> Unit,
-    modifier: Modifier = Modifier,
+private fun PlatesModeTabs(
+    onOpenLive: () -> Unit,
+    onOpenPlayback: () -> Unit,
+    onOpenClips: () -> Unit,
+    showPlayback: Boolean,
+    showClips: Boolean,
 ) {
-    Row(
-        modifier = modifier
-            .horizontalScroll(rememberScrollState())
-            .padding(horizontal = 8.dp, vertical = 4.dp),
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        val chips = listOf(
-            Triple(PlatesViewMode.LIST, "List", Icons.Filled.ViewList),
-            Triple(PlatesViewMode.GALLERY, "Gallery", Icons.Filled.GridView),
-            Triple(PlatesViewMode.GROUPED, "Grouped", Icons.Filled.Layers),
-            Triple(PlatesViewMode.TIMELINE, "Timeline", Icons.Filled.ViewAgenda),
-        )
-        chips.forEach { (m, label, icon) ->
-            FilterChip(
-                selected = mode == m,
-                onClick = { onSelect(m) },
-                leadingIcon = { Icon(icon, contentDescription = null, modifier = Modifier.size(16.dp)) },
-                label = { Text(label) },
-            )
-        }
-    }
+    CrumbModeTabs(
+        selected = CrumbMode.PLATES,
+        onLive = onOpenLive,
+        onPlayback = onOpenPlayback,
+        onClips = onOpenClips,
+        onPlates = {},
+        showPlayback = showPlayback,
+        showClips = showClips,
+        showPlates = true,
+    )
 }
 
-// ─── reads views (list / gallery / grouped / timeline) ──────────────────────
+// ─── reads views (list / gallery / grouped) ─────────────────────────────────
 
-/** Dense one-line rows — the original Plates view. */
+/** Two-line rows under date headers. */
 @Composable
 private fun PlatesListView(
-    plates: List<PlateRead>,
-    cameraName: (PlateRead) -> String,
+    rows: List<PlateRowData>,
+    nowMs: Long,
     mediaUrls: MediaUrls,
-    onOpen: (PlateRead) -> Unit,
-    isAdmin: Boolean,
-    onAddToWatchlist: (String) -> Unit,
-    onReport: (PlateRead) -> Unit,
-    onCopy: (PlateRead) -> Unit,
+    footer: String?,
+    listState: LazyListState,
+    onOpen: (PlateRowData) -> Unit,
+    onPeek: (PlateRowData) -> Unit,
 ) {
-    LazyColumn(Modifier.fillMaxSize()) {
-        items(plates, key = { it.id }) { p ->
-            PlateRow(
-                read = p,
-                cameraName = cameraName(p),
-                mediaUrls = mediaUrls,
-                onClick = { onOpen(p) },
-                onReport = { onReport(p) },
-                onCopy = { onCopy(p) },
-                // Only admins can manage the watchlist; viewers still see the read-only
-                // list via the toolbar. A 403 is handled defensively in the ViewModel
-                // regardless (stale role → friendly notice).
-                showAddToWatchlist = isAdmin && p.plate.isNotBlank(),
-                onAddToWatchlist = { onAddToWatchlist(p.plate) },
-            )
-            HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
+    val entries = remember(rows, nowMs) {
+        buildList {
+            var day: java.time.LocalDate? = null
+            rows.forEach { r ->
+                val ms = Time.parseToMillis(r.read.ts)
+                val d = dayKey(ms)
+                if (d != day) {
+                    day = d
+                    add(ListEntry.Header(dayLabel(ms, nowMs)))
+                }
+                add(ListEntry.Row(r, rowTimeLabel(ms, nowMs)))
+            }
         }
+    }
+    LazyColumn(Modifier.fillMaxSize(), state = listState) {
+        items(entries, key = { it.key }) { e ->
+            when (e) {
+                is ListEntry.Header -> PlateDayHeader(e.label)
+                is ListEntry.Row -> PlateListRow(
+                    item = e.data,
+                    mediaUrls = mediaUrls,
+                    timeLabel = e.timeLabel,
+                    onClick = { onOpen(e.data) },
+                    onLongClick = { onPeek(e.data) },
+                )
+            }
+        }
+        footer?.let { item { ListFooter(it) } }
     }
 }
 
-/** A grid of snapshot cards: thumbnail, plate, camera, time, confidence. */
+/** Two-column cards: the frame with the aspect-true crop inset. */
 @Composable
 private fun PlatesGalleryView(
-    plates: List<PlateRead>,
-    cameraName: (PlateRead) -> String,
+    rows: List<PlateRowData>,
+    nowMs: Long,
     mediaUrls: MediaUrls,
-    onOpen: (PlateRead) -> Unit,
-    onReport: (PlateRead) -> Unit,
-    onCopy: (PlateRead) -> Unit,
+    footer: String?,
+    gridState: LazyGridState,
+    onOpen: (PlateRowData) -> Unit,
+    onPeek: (PlateRowData) -> Unit,
 ) {
     LazyVerticalGrid(
         columns = GridCells.Adaptive(minSize = 168.dp),
+        state = gridState,
         modifier = Modifier.fillMaxSize(),
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(8.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 24.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        gridItems(plates, key = { it.id }) { p ->
+        gridItems(rows, key = { it.read.id }) { r ->
             PlateGalleryCard(
-                read = p,
-                cameraName = cameraName(p),
+                item = r,
                 mediaUrls = mediaUrls,
-                onClick = { onOpen(p) },
-                onReport = { onReport(p) },
-                onCopy = { onCopy(p) },
+                timeLabel = rowTimeLabel(Time.parseToMillis(r.read.ts), nowMs),
+                onClick = { onOpen(r) },
+                onLongClick = { onPeek(r) },
             )
         }
+        footer?.let { item(span = { GridItemSpan(maxLineSpan) }) { ListFooter(it) } }
     }
 }
 
-@Composable
-private fun PlateGalleryCard(
-    read: PlateRead,
-    cameraName: String,
-    mediaUrls: MediaUrls,
-    onClick: () -> Unit,
-    onReport: () -> Unit,
-    onCopy: () -> Unit,
-) {
-    Card(
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
-    ) {
-        Column {
-            PlateThumb(
-                read = read,
-                mediaUrls = mediaUrls,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(112.dp),
-            )
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    PlateLabel(
-                        displayName = read.displayName,
-                        plate = read.plate,
-                        nameStyle = MaterialTheme.typography.titleMedium,
-                        onCopy = onCopy,
-                    )
-                    Text(
-                        text = cameraName,
-                        color = TextSecondary,
-                        style = MaterialTheme.typography.bodySmall,
-                        maxLines = 1,
-                    )
-                    Text(
-                        text = runCatching { Time.dateTime(read.ts) }.getOrDefault(read.ts),
-                        color = TextSecondary,
-                        style = MaterialTheme.typography.labelSmall,
-                        maxLines = 1,
-                    )
-                }
-                ConfidenceChip(read.confidence)
-                IconButton(onClick = onReport, modifier = Modifier.size(32.dp)) {
-                    Icon(
-                        Icons.Filled.PictureAsPdf,
-                        contentDescription = "Plate report",
-                        tint = TextSecondary,
-                        modifier = Modifier.size(18.dp),
-                    )
-                }
-            }
-        }
-    }
-}
-
-/** Collapsed by normalized plate: one expandable row per unique plate, showing
- *  sighting count, first/last seen, and the cameras involved. Grouping is done
- *  client-side over the already-fetched reads. */
+/** One row per plate, newest first, with how many reads it has in range. Tap opens the profile. */
 @Composable
 private fun PlatesGroupedView(
-    plates: List<PlateRead>,
-    cameraName: (PlateRead) -> String,
+    rows: List<PlateRowData>,
+    nowMs: Long,
     mediaUrls: MediaUrls,
-    onOpen: (PlateRead) -> Unit,
-    onCopy: (PlateRead) -> Unit,
+    footer: String?,
+    listState: LazyListState,
+    onOpen: (PlateRowData) -> Unit,
+    onPeek: (PlateRowData) -> Unit,
 ) {
-    // Group by normalized plate text (blank plates collapse under "—"). Newest
-    // sighting first within each group; groups ordered by most-recent last-seen.
-    val groups = remember(plates) { groupByPlate(plates) }
-    LazyColumn(Modifier.fillMaxSize()) {
-        items(groups, key = { it.key }) { g ->
-            PlateGroupRow(group = g, cameraName = cameraName, mediaUrls = mediaUrls, onOpen = onOpen, onCopy = onCopy)
-            HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
-        }
-    }
-}
-
-/** One collapsed plate group + its expandable sighting list. */
-@Composable
-private fun PlateGroupRow(
-    group: PlateGroup,
-    cameraName: (PlateRead) -> String,
-    mediaUrls: MediaUrls,
-    onOpen: (PlateRead) -> Unit,
-    onCopy: (PlateRead) -> Unit,
-) {
-    var expanded by remember(group.key) { mutableStateOf(false) }
-    Column(Modifier.fillMaxWidth()) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clickable { expanded = !expanded }
-                .padding(horizontal = 12.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            PlateThumb(read = group.latest, mediaUrls = mediaUrls, modifier = Modifier.size(width = 84.dp, height = 50.dp))
-            Column(Modifier.weight(1f)) {
-                PlateLabel(
-                    displayName = group.latest.displayName,
-                    plate = group.plate,
-                    nameStyle = MaterialTheme.typography.titleMedium,
-                    // The group's reads all share this plate, so any of them
-                    // resolves to the same raw string.
-                    onCopy = { onCopy(group.latest) },
-                )
-                Text(
-                    text = "${group.count} sighting${if (group.count == 1) "" else "s"} · ${group.cameraNames(cameraName)}",
-                    color = TextSecondary,
-                    style = MaterialTheme.typography.bodySmall,
-                    maxLines = 1,
-                )
-                Text(
-                    text = "First ${runCatching { Time.dateTime(group.firstSeen) }.getOrDefault(group.firstSeen)} · Last ${runCatching { Time.dateTime(group.lastSeen) }.getOrDefault(group.lastSeen)}",
-                    color = TextSecondary,
-                    style = MaterialTheme.typography.labelSmall,
-                    maxLines = 2,
-                )
-            }
-            Icon(
-                imageVector = if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
-                contentDescription = if (expanded) "Collapse" else "Expand",
-                tint = TextSecondary,
+    LazyColumn(Modifier.fillMaxSize(), state = listState) {
+        items(rows, key = { it.read.plate.ifEmpty { "(none)" } }) { r ->
+            PlateGroupListRow(
+                item = r,
+                count = r.passCount,
+                mediaUrls = mediaUrls,
+                timeLabel = rowTimeLabel(Time.parseToMillis(r.read.ts), nowMs),
+                onClick = { onOpen(r) },
+                onLongClick = { onPeek(r) },
             )
         }
-        if (expanded) {
-            group.reads.forEach { r ->
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable { onOpen(r) }
-                        .padding(start = 24.dp, end = 12.dp, top = 6.dp, bottom = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
-                    Icon(Icons.Filled.Videocam, contentDescription = null, tint = TextSecondary, modifier = Modifier.size(13.dp))
-                    Text(
-                        text = cameraName(r),
-                        color = TextSecondary,
-                        style = MaterialTheme.typography.bodySmall,
-                        maxLines = 1,
-                        modifier = Modifier.weight(1f),
-                    )
-                    Text(
-                        text = runCatching { Time.dateTime(r.ts) }.getOrDefault(r.ts),
-                        color = TextSecondary,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                    ConfidenceChip(r.confidence)
-                }
-            }
-        }
-    }
-}
-
-/** Big touch-friendly chronological rows (newest first). */
-@Composable
-private fun PlatesTimelineView(
-    plates: List<PlateRead>,
-    cameraName: (PlateRead) -> String,
-    mediaUrls: MediaUrls,
-    onOpen: (PlateRead) -> Unit,
-    onCopy: (PlateRead) -> Unit,
-) {
-    LazyColumn(
-        Modifier.fillMaxSize(),
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 8.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        items(plates, key = { it.id }) { p ->
-            Card(
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp).clickable { onOpen(p) },
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(14.dp),
-                ) {
-                    PlateThumb(read = p, mediaUrls = mediaUrls, modifier = Modifier.size(width = 132.dp, height = 78.dp))
-                    Column(Modifier.weight(1f)) {
-                        PlateLabel(
-                            displayName = p.displayName,
-                            plate = p.plate,
-                            nameStyle = MaterialTheme.typography.headlineSmall,
-                            onCopy = { onCopy(p) },
-                        )
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Filled.Videocam, contentDescription = null, tint = TextSecondary, modifier = Modifier.size(15.dp))
-                            Text(
-                                text = cameraName(p),
-                                color = TextSecondary,
-                                style = MaterialTheme.typography.bodyMedium,
-                                maxLines = 1,
-                                modifier = Modifier.padding(start = 5.dp),
-                            )
-                        }
-                        Text(
-                            text = runCatching { Time.dateTime(p.ts) }.getOrDefault(p.ts),
-                            color = TextSecondary,
-                            style = MaterialTheme.typography.bodySmall,
-                        )
-                    }
-                    ConfidenceChip(p.confidence)
-                }
-            }
-        }
-    }
-}
-
-// ─── grouped-view model (client-side over the fetched reads) ─────────────────
-
-/** One normalized-plate group: its reads (newest first) + summary stats. */
-private data class PlateGroup(
-    val plate: String,
-    val reads: List<PlateRead>,
-) {
-    val key: String get() = plate.ifEmpty { "—" }
-    val count: Int get() = reads.size
-    /** Reads are ordered newest-first, so first = latest, last = earliest. */
-    val latest: PlateRead get() = reads.first()
-    val firstSeen: String get() = reads.last().ts
-    val lastSeen: String get() = reads.first().ts
-
-    /** Comma-joined distinct camera names (capped so the summary stays one-ish line). */
-    fun cameraNames(nameOf: (PlateRead) -> String): String {
-        val names = reads.map(nameOf).distinct()
-        return if (names.size <= 2) names.joinToString(", ") else "${names.take(2).joinToString(", ")} +${names.size - 2}"
-    }
-}
-
-/** Collapse [plates] (already newest-first) by normalized plate text, ordering
- *  groups by most-recent sighting. */
-private fun groupByPlate(plates: List<PlateRead>): List<PlateGroup> =
-    plates.groupBy { it.plate }
-        .map { (plate, reads) -> PlateGroup(plate, reads) }
-        .sortedByDescending { runCatching { Time.parseToMillis(it.lastSeen) }.getOrDefault(0L) }
-
-// ─── filter bar ───────────────────────────────────────────────────────────────
-
-/** Horizontally-scrolling filter bar: search + match toggle, camera picker,
- *  range dropdown, jump-to-time, and the result count — mirrors the desktop
- *  client's filter row but laid out for a narrow phone width. */
-@Composable
-private fun PlatesFilterBar(
-    state: PlatesUiState,
-    onQueryChange: (String) -> Unit,
-    onSubmitSearch: () -> Unit,
-    onMatchChange: (String) -> Unit,
-    onHoursChange: (Long) -> Unit,
-    onPickCameras: () -> Unit,
-    onPickWhen: () -> Unit,
-    onResetToNow: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    Row(
-        modifier = modifier
-            .horizontalScroll(rememberScrollState())
-            .padding(horizontal = 8.dp, vertical = 6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        TextField(
-            value = state.query,
-            onValueChange = onQueryChange,
-            placeholder = { Text("Search plate…") },
-            singleLine = true,
-            leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
-            trailingIcon = if (state.query.isNotEmpty()) {
-                { IconButton(onClick = { onQueryChange("") }) { Icon(Icons.Filled.Clear, contentDescription = "Clear") } }
-            } else null,
-            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-            keyboardActions = KeyboardActions(onSearch = { onSubmitSearch() }),
-            modifier = Modifier.width(220.dp),
-        )
-        MatchToggle(value = state.match, onChanged = onMatchChange)
-        val camLabel = if (state.selectedCameraIds.size == state.cameras.size && state.cameras.isNotEmpty()) {
-            "All cameras"
-        } else {
-            "${state.selectedCameraIds.size} of ${state.cameras.size} cameras"
-        }
-        TextButton(onClick = onPickCameras) {
-            Icon(Icons.Filled.Videocam, contentDescription = null, modifier = Modifier.size(16.dp))
-            Text(camLabel, modifier = Modifier.padding(start = 6.dp))
-        }
-        RangeSelector(hours = state.hours, onSelect = onHoursChange)
-        TextButton(onClick = onPickWhen, enabled = state.hours != 0L) {
-            Icon(Icons.Filled.Event, contentDescription = null, modifier = Modifier.size(16.dp))
-            Text(
-                state.anchorEndMs?.let { ms ->
-                    runCatching { Time.dateTime(java.time.Instant.ofEpochMilli(ms)) }.getOrNull()
-                } ?: "Jump to…",
-                modifier = Modifier.padding(start = 6.dp),
-            )
-        }
-        if (state.anchorEndMs != null && state.hours != 0L) {
-            TextButton(onClick = onResetToNow) { Text("Now") }
-        }
-        if (!state.loading) {
-            // The feed caps at 200 loaded reads (see PlatesViewModel.load), but the
-            // server reports the full match count. When they differ, say "N of total"
-            // so the grouped/timeline stats — computed only over the LOADED reads —
-            // don't imply completeness for older reads past the cap (#147-3).
-            val loaded = state.plates.size
-            val label = if (loaded < state.total) {
-                "$loaded of ${state.total} plates"
-            } else {
-                "${state.total} plate${if (state.total == 1) "" else "s"}"
-            }
-            Text(
-                label,
-                style = MaterialTheme.typography.bodySmall,
-                color = TextSecondary,
-            )
-        }
+        footer?.let { item { ListFooter(it) } }
     }
 }
 
 @Composable
-private fun MatchToggle(value: String, onChanged: (String) -> Unit) {
-    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-        listOf("exact" to "Exact", "contains" to "Contains", "fuzzy" to "Fuzzy").forEach { (v, label) ->
-            FilterChip(
-                selected = value == v,
-                onClick = { onChanged(v) },
-                label = { Text(label) },
-            )
-        }
-    }
+private fun ListFooter(text: String) {
+    Text(
+        text,
+        color = TextSecondary,
+        style = MaterialTheme.typography.bodySmall,
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 16.dp),
+    )
 }
 
-/** Compact "Last N" range dropdown for the Plates feed window. */
-@Composable
-private fun RangeSelector(hours: Long, onSelect: (Long) -> Unit) {
-    var open by remember { mutableStateOf(false) }
-    val current = PLATES_RANGE_OPTIONS.firstOrNull { it.first == hours }?.second ?: "Last ${hours}h"
-    Box {
-        TextButton(onClick = { open = true }) { Text(current) }
-        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
-            PLATES_RANGE_OPTIONS.forEach { (h, label) ->
-                DropdownMenuItem(
-                    text = { Text(label) },
-                    onClick = { open = false; onSelect(h) },
-                )
-            }
-        }
-    }
-}
+// ─── name / rename dialog ───────────────────────────────────────────────────
 
-// ─── camera picker dialog ──────────────────────────────────────────────────────
-
-/** Camera multi-select dialog with All / None shortcuts, mirroring the desktop
- *  client's `_CameraPickerDialog`. Returns the new selection via [onApply]. */
+/** Name a plate (admin-only server-side). Saving a blank name clears it. */
 @Composable
-private fun CameraPickerDialog(
-    cameras: List<CameraDto>,
-    selected: Set<String>,
-    onApply: (Set<String>) -> Unit,
+private fun RenamePlateDialog(
+    plate: String,
+    current: String?,
+    onSave: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    var sel by remember { mutableStateOf(selected) }
+    var name by remember(plate) { mutableStateOf(current.orEmpty()) }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Cameras") },
+        title = { Text(if (current.isNullOrBlank()) "Name this plate" else "Rename plate") },
         text = {
             Column {
-                Row {
-                    TextButton(onClick = { sel = cameras.map { it.id }.toSet() }) { Text("All") }
-                    TextButton(onClick = { sel = emptySet() }) { Text("None") }
-                }
-                HorizontalDivider()
-                // A plain scrollable Column (not LazyColumn) — this dialog's text slot
-                // doesn't give a bounded max-height constraint, which LazyColumn requires.
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 320.dp)
-                        .verticalScroll(rememberScrollState()),
-                ) {
-                    cameras.forEach { cam ->
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable {
-                                    sel = if (sel.contains(cam.id)) sel - cam.id else sel + cam.id
-                                }
-                                .padding(vertical = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Checkbox(
-                                checked = sel.contains(cam.id),
-                                onCheckedChange = { on ->
-                                    sel = if (on) sel + cam.id else sel - cam.id
-                                },
-                            )
-                            Text(cam.name)
-                        }
-                    }
-                }
+                Text(plate, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold, color = TextSecondary)
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it.take(60) },
+                    label = { Text("Name") },
+                    placeholder = { Text("For example, Mom's car") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                )
+                Text(
+                    "Naming a plate does not set up alerts. Use the watchlist for that.",
+                    color = TextSecondary,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
             }
         },
-        confirmButton = { TextButton(onClick = { onApply(sel) }) { Text("Apply") } },
+        confirmButton = {
+            TextButton(onClick = { onSave(name) }, enabled = name.isNotBlank() || !current.isNullOrBlank()) {
+                Text(if (name.isBlank()) "Clear name" else "Save")
+            }
+        },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }
@@ -1016,7 +870,7 @@ private fun PlateLabel(
     if (name == null) {
         Row(modifier, verticalAlignment = Alignment.CenterVertically) {
             Text(
-                text = plate.ifEmpty { "—" },
+                text = plate.ifEmpty { "No plate" },
                 color = MaterialTheme.colorScheme.onSurface,
                 fontWeight = FontWeight.Bold,
                 fontFamily = FontFamily.Monospace,
@@ -1037,7 +891,7 @@ private fun PlateLabel(
             )
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    text = plate.ifEmpty { "—" },
+                    text = plate.ifEmpty { "No plate" },
                     color = TextSecondary,
                     fontFamily = FontFamily.Monospace,
                     style = MaterialTheme.typography.labelSmall,
@@ -1086,87 +940,6 @@ internal fun plateCopyText(read: PlateRead): String? = read.plate.trim().takeIf 
  */
 internal fun systemConfirmsClipboardWrite(sdkInt: Int): Boolean = sdkInt >= Build.VERSION_CODES.TIRAMISU
 
-// ─── plate row + lazy snapshot ─────────────────────────────────────────────────
-
-@Composable
-private fun PlateRow(
-    read: PlateRead,
-    cameraName: String,
-    mediaUrls: MediaUrls,
-    onClick: () -> Unit,
-    onReport: () -> Unit = {},
-    onCopy: (() -> Unit)? = null,
-    showAddToWatchlist: Boolean = false,
-    onAddToWatchlist: () -> Unit = {},
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        PlateThumb(read = read, mediaUrls = mediaUrls, modifier = Modifier.size(width = 92.dp, height = 56.dp))
-        Column(Modifier.weight(1f)) {
-            PlateLabel(
-                displayName = read.displayName,
-                plate = read.plate,
-                nameStyle = MaterialTheme.typography.titleMedium,
-                onCopy = onCopy,
-            )
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(
-                    Icons.Filled.Videocam,
-                    contentDescription = null,
-                    tint = TextSecondary,
-                    modifier = Modifier.size(13.dp),
-                )
-                Text(
-                    text = cameraName,
-                    color = TextSecondary,
-                    style = MaterialTheme.typography.bodySmall,
-                    maxLines = 1,
-                    modifier = Modifier.padding(start = 4.dp),
-                )
-                val region = read.region
-                if (!region.isNullOrEmpty()) {
-                    // start-padding, not hardcoded leading spaces, so the gap sits on
-                    // the correct side under RTL (#147-11).
-                    Text(
-                        text = region,
-                        color = TextSecondary,
-                        style = MaterialTheme.typography.labelSmall,
-                        modifier = Modifier.padding(start = 6.dp),
-                    )
-                }
-            }
-            Text(
-                text = runCatching { Time.dateTime(read.ts) }.getOrDefault(read.ts),
-                color = TextSecondary,
-                style = MaterialTheme.typography.labelSmall,
-            )
-        }
-        ConfidenceChip(read.confidence)
-        // Primary per-plate export: build an OpenALPR-style single-plate report.
-        IconButton(onClick = onReport) {
-            Icon(
-                Icons.Filled.PictureAsPdf,
-                contentDescription = "Plate report",
-                tint = TextSecondary,
-            )
-        }
-        if (showAddToWatchlist) {
-            IconButton(onClick = onAddToWatchlist) {
-                Icon(
-                    Icons.Filled.PlaylistAdd,
-                    contentDescription = "Add to watchlist",
-                    tint = TextSecondary,
-                )
-            }
-        }
-    }
-}
 
 /** Decode ceiling (px) for plate-crop images. A plate is a small fraction of its
  *  snapshot, so without this Coil decodes the snapshot at the tiny thumbnail
@@ -1176,22 +949,6 @@ private fun PlateRow(
  *  result — not the full-size decode — so this fits the P2 bitmap budget. Used by
  *  both the list/grid thumbnails and the report-dialog preview. */
 private const val PLATE_CROP_DECODE_PX = 1024
-
-/** Convenience wrapper: the read's snapshot. Honors the "LPR thumbnail image" app
- *  option — the full vehicle snapshot (default) or cropped to the plate box.
- *  Decodes at [PLATE_CROP_DECODE_PX] so the cropped plate stays sharp at thumbnail
- *  size (harmless for the full-image mode, which just shows a crisp downscale). */
-@Composable
-private fun PlateThumb(read: PlateRead, mediaUrls: MediaUrls, modifier: Modifier = Modifier) {
-    val showCrop = appContainer().store.lprImageMode != "vehicle"
-    PlateSnapshotImage(
-        read = read,
-        mediaUrls = mediaUrls,
-        modifier = modifier,
-        crop = showCrop,
-        decodePx = PLATE_CROP_DECODE_PX,
-    )
-}
 
 /**
  * The read's snapshot: fetched from the sibling detection event's snapshot proxy
@@ -1265,32 +1022,6 @@ private fun PlateSnapshotImage(
                 modifier = Modifier.size(22.dp),
             )
         }
-    }
-}
-
-@Composable
-private fun ConfidenceChip(confidence: Float?) {
-    val color: Color
-    val text: String
-    if (confidence == null) {
-        color = TextSecondary
-        text = "—"
-    } else {
-        val pct = (confidence * 100).roundToInt()
-        color = when {
-            confidence >= 0.85f -> Color(0xFF57C888)
-            confidence >= 0.6f -> TimelineColors.playhead
-            else -> Color(0xFFD65C5C)
-        }
-        text = "$pct%"
-    }
-    Box(
-        modifier = Modifier
-            .background(color.copy(alpha = 0.18f), RoundedCornerShape(12.dp))
-            .border(1.dp, color.copy(alpha = 0.6f), RoundedCornerShape(12.dp))
-            .padding(horizontal = 8.dp, vertical = 4.dp),
-    ) {
-        Text(text, color = color, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
     }
 }
 
@@ -1391,7 +1122,7 @@ private fun WatchlistDialog(
                         }
                     } else {
                         Text(
-                            "Ignored plates are dropped on capture — never stored or alerted.",
+                            "Ignored plates are dropped on capture. They are never stored or alerted on.",
                             color = TextSecondary,
                             style = MaterialTheme.typography.labelSmall,
                             modifier = Modifier.padding(top = 6.dp),
@@ -1419,7 +1150,7 @@ private fun WatchlistDialog(
                             Modifier.fillMaxWidth().padding(16.dp),
                             horizontalArrangement = Arrangement.Center,
                         ) {
-                            CircularProgressIndicator(color = TealAccent)
+                            CircularProgressIndicator(color = LprAccent)
                         }
                     state.watchlistError != null ->
                         Text(
@@ -1539,7 +1270,7 @@ private fun EditWatchlistEntryDialog(
                     }
                 } else {
                     Text(
-                        "Ignored plates are dropped on capture — never stored or alerted.",
+                        "Ignored plates are dropped on capture. They are never stored or alerted on.",
                         color = TextSecondary,
                         style = MaterialTheme.typography.labelSmall,
                         modifier = Modifier.padding(top = 6.dp),
@@ -1575,7 +1306,7 @@ private fun FuzzinessSlider(
 ) {
     // Local drag position, re-seeded whenever the persisted config value changes.
     var pos by remember(fuzz) { mutableFloatStateOf(fuzz.coerceIn(0f, 0.5f)) }
-    val accent = TealAccent
+    val accent = LprAccent
     val faint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
 
     val typed = normalizePlate(plate)
@@ -1619,7 +1350,7 @@ private fun FuzzinessSlider(
             Text(
                 if (usingSample) {
                     "Tolerates up to $allowed misread character${if (allowed == 1) "" else "s"}. " +
-                        "Example on a sample plate — type a plate above to preview yours:"
+                        "Example on a sample plate. Type a plate above to preview yours:"
                 } else {
                     "Tolerates up to $allowed misread character${if (allowed == 1) "" else "s"} on this plate. " +
                         "Would still match:"
@@ -1731,7 +1462,7 @@ private fun WatchlistRow(
             Icon(
                 imageVector = if (entry.notify) Icons.Filled.Notifications else Icons.Filled.NotificationsOff,
                 contentDescription = if (entry.notify) "Notifies on sighting" else "Notifications off",
-                tint = if (entry.notify) TealAccent else TextSecondary,
+                tint = if (entry.notify) LprAccent else TextSecondary,
                 modifier = Modifier.size(18.dp),
             )
         }
@@ -1875,7 +1606,7 @@ private fun PlateReportDialog(
                 enabled = !generating,
             ) {
                 if (generating) {
-                    CircularProgressIndicator(Modifier.size(18.dp), color = TealAccent, strokeWidth = 2.dp)
+                    CircularProgressIndicator(Modifier.size(18.dp), color = LprAccent, strokeWidth = 2.dp)
                 } else {
                     Icon(Icons.Filled.PictureAsPdf, contentDescription = null, modifier = Modifier.size(16.dp))
                     Text("Download PDF", modifier = Modifier.padding(start = 6.dp))
@@ -1956,3 +1687,4 @@ private fun ReportActionButton(
         )
     }
 }
+

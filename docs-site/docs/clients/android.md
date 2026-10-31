@@ -33,6 +33,30 @@ state. See
 [the client feature rundown](/clients/#what-each-client-can-do) for how this
 compares to the other clients.
 
+## The LPR tab
+
+The LPR tab is a calm list of license-plate reads. At the top there is just a search bar; the
+filter button beside it opens one sheet with cameras, time range, "ends at", exact or fuzzy
+match, how to view the list (List, Gallery, or Grouped by plate), **Hide regulars** and
+**Merge duplicates**. A small strip of chips appears under the search bar only while a filter
+is off its default, and tapping a chip clears it. Hide regulars drops plates seen often in the
+last 30 days; plates on your watchlist always show. In landscape the search bar sits next to the
+tabs.
+
+Each row shows the plate crop at its real shape, the plate, its name if you gave it one (long
+names scroll), and the camera, time and confidence. Tap a row to open the plate's page. Press and
+hold for a larger look and quick actions: copy the plate, watch it, correct a misread, make a PDF
+report, or open the moment in Playback. Watching, ignoring, naming and correcting plates are for
+admins; everyone with the **View license plates** permission can copy, report and play back.
+
+The plate page keeps the video of the sighting pinned at the top, with play and pause, 10 second
+skips, a scrubber, mute, pinch to zoom and a bookmark button. Under it, **Visits** lists each time
+the plate showed up (tap one to play it), **History** shows the hours of the day it is usually
+seen, which cameras see it and the last 30 days (tap a bar for its number), and **Details** holds
+the name, watchlist state, known misreads (with Undo) and **Correct plate**. In landscape the
+video sits on the left and the tabs on the right. Hide regulars and the history need a server
+that has the plate-history endpoint; on an older server they are simply not shown.
+
 ## Simple and advanced playback controls
 
 Playback has two control layouts, picked with **Settings > Playback > Show advanced playback controls**.

@@ -423,6 +423,23 @@ class SecureStore(context: Context) {
         get() = safeRead("list") { it.getString(KEY_PLATES_VIEW_MODE, "list") ?: "list" }
         set(value) = safeWrite { it.putString(KEY_PLATES_VIEW_MODE, value) }
 
+    /**
+     * "Hide regulars" on the Plates tab: drops reads of plates seen often in the
+     * last 30 days (watchlisted plates always show). Per-account UI residue,
+     * cleared on logout like [platesViewMode]. Default off.
+     */
+    var platesHideRegulars: Boolean
+        get() = safeRead(false) { it.getBoolean(KEY_PLATES_HIDE_REGULARS, false) }
+        set(value) = safeWrite { it.putBoolean(KEY_PLATES_HIDE_REGULARS, value) }
+
+    /**
+     * "Merge duplicates" on the Plates tab: repeat reads of one pass (two engines,
+     * OCR refinements) become one row. Default on, like the desktop client.
+     */
+    var platesMergeDuplicates: Boolean
+        get() = safeRead(true) { it.getBoolean(KEY_PLATES_MERGE_DUPES, true) }
+        set(value) = safeWrite { it.putBoolean(KEY_PLATES_MERGE_DUPES, value) }
+
     // ── Live-wall views cache (server-backed; this is a local mirror) ────────────
 
     /**
@@ -497,6 +514,8 @@ class SecureStore(context: Context) {
                 .remove(KEY_VIEWS)
                 .remove(KEY_ACTIVE_VIEW)
                 .remove(KEY_PLATES_VIEW_MODE)
+                .remove(KEY_PLATES_HIDE_REGULARS)
+                .remove(KEY_PLATES_MERGE_DUPES)
         }
     }
 
@@ -524,6 +543,8 @@ class SecureStore(context: Context) {
         private const val KEY_SHOW_HA_OVERLAYS = "show_ha_overlays"
         private const val KEY_PLAYBACK_SPAN_MS = "playback_span_ms"
         private const val KEY_PLATES_VIEW_MODE = "plates_view_mode"
+        private const val KEY_PLATES_HIDE_REGULARS = "plates_hide_regulars"
+        private const val KEY_PLATES_MERGE_DUPES = "plates_merge_duplicates"
         private const val KEY_LPR_IMAGE_MODE = "lpr_image_mode"
         private const val KEY_SNAPSHOT_VIEW = "snapshot_captures_view"
         private const val KEY_ADVANCED_PLAYBACK = "advanced_playback_controls"
