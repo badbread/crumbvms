@@ -4,6 +4,26 @@
 
 package video.crumb.app.feature.clips
 
+import video.crumb.app.ui.theme.monoStyle
+import video.crumb.app.ui.theme.monoCaption
+import video.crumb.app.ui.theme.Spacing
+import video.crumb.app.ui.theme.DangerRed
+import video.crumb.app.ui.staggerIn
+import video.crumb.app.ui.dialogEntrance
+import video.crumb.app.ui.StateMessage
+import video.crumb.app.ui.SkeletonTileGrid
+import video.crumb.app.ui.DialogScrim
+import video.crumb.app.ui.CrumbFilterChip
+import video.crumb.app.data.DetectionIcons
+import androidx.compose.ui.unit.sp
+import androidx.compose.material.icons.filled.Sensors
+import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.foundation.lazy.grid.itemsIndexed
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.height
 import android.content.res.Configuration
 import android.view.TextureView
 import android.widget.Toast
@@ -104,7 +124,6 @@ import video.crumb.app.ui.AddBookmarkDialog
 import video.crumb.app.ui.CrumbMode
 import video.crumb.app.ui.player.PlayerSurface
 import video.crumb.app.ui.CrumbModeTabs
-import video.crumb.app.ui.InlineDivider
 import video.crumb.app.ui.theme.NavyDeep
 import video.crumb.app.ui.theme.TextSecondary
 import java.time.Instant
@@ -160,7 +179,7 @@ fun ClipsScreen(
                                 showClips = caps.clips || store.isAdmin,
                                 showPlates = store.platesEnabled,
                             )
-                            InlineDivider()
+                            Spacer(Modifier.width(Spacing.l))
                             ClipsFilters(
                                 type = state.type,
                                 hours = state.hours,
@@ -200,11 +219,14 @@ fun ClipsScreen(
                     onHours = { vm.setHours(it) },
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                        .height(48.dp)
+                        .padding(horizontal = Spacing.l),
                 )
             }
+            // C7: camera menu and the count share one 40 dp row; the count is a
+            // right-aligned mono caption.
             Row(
-                Modifier.padding(horizontal = 12.dp).fillMaxWidth(),
+                Modifier.padding(horizontal = Spacing.l).fillMaxWidth().height(40.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 CameraSelector(
@@ -215,27 +237,45 @@ fun ClipsScreen(
                 Spacer(Modifier.weight(1f))
                 Text(
                     "${state.clips.size} clips",
-                    style = MaterialTheme.typography.bodySmall,
+                    style = MaterialTheme.typography.monoCaption,
                     color = TextSecondary,
                 )
             }
             Box(Modifier.fillMaxSize()) {
+                // C6: refresh keeps the previous grid up while it reloads (the list is
+                // only swapped when the new one arrives), so it never blanks; a first
+                // load shows card-shaped shimmers instead of a spinner.
                 when {
-                    state.loading && state.clips.isEmpty() ->
-                        CircularProgressIndicator(Modifier.align(Alignment.Center))
-                    state.error != null ->
-                        Text(state.error!!, Modifier.align(Alignment.Center).padding(24.dp), color = TextSecondary)
-                    state.clips.isEmpty() ->
-                        Text("No clips in this window.", Modifier.align(Alignment.Center), color = TextSecondary)
+                    state.loading && state.clips.isEmpty() -> SkeletonTileGrid(cols = 2, rows = 3)
+                    state.error != null && state.clips.isEmpty() -> StateMessage(
+                        icon = Icons.Filled.ErrorOutline,
+                        title = "Can't load clips",
+                        body = state.error!!,
+                        actionLabel = "Retry",
+                        onAction = { vm.refresh() },
+                        accent = CLIPS_ACCENT,
+                        modifier = Modifier.align(Alignment.Center),
+                    )
+                    state.clips.isEmpty() -> StateMessage(
+                        icon = Icons.Filled.VideoLibrary,
+                        title = "No clips in this window",
+                        body = "Try a longer range or another camera.",
+                        accent = CLIPS_ACCENT,
+                        modifier = Modifier.align(Alignment.Center),
+                    )
                     else -> LazyVerticalGrid(
                         columns = GridCells.Adaptive(minSize = 160.dp),
-                        contentPadding = PaddingValues(12.dp),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                        contentPadding = PaddingValues(Spacing.l),
+                        horizontalArrangement = Arrangement.spacedBy(Spacing.m),
+                        verticalArrangement = Arrangement.spacedBy(Spacing.m),
                         modifier = Modifier.fillMaxSize(),
                     ) {
-                        items(state.clips, key = { it.id }) { c ->
-                            ClipCard(c, mediaUrls) {
+                        itemsIndexed(state.clips, key = { _, c -> c.id }) { index, c ->
+                            ClipCard(
+                                c,
+                                mediaUrls,
+                                modifier = Modifier.animateItem().staggerIn(index),
+                            ) {
                                 vm.markViewed(c.id)
                                 playing = c
                             }
@@ -282,6 +322,9 @@ fun ClipsScreen(
     }
 }
 
+/** The Clips tab accent (also the selected colour of the type chips, C1). */
+private val CLIPS_ACCENT = Color(0xFFB07CD8)
+
 /** The Clips filter controls (type chips + range dropdown). Shared between the
  *  landscape top-bar (inline next to the tabs) and the portrait row below it. */
 @Composable
@@ -294,18 +337,38 @@ private fun ClipsFilters(
 ) {
     Row(
         modifier,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        horizontalArrangement = Arrangement.spacedBy(Spacing.s),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         listOf("all" to "All", "detection" to "Detections", "motion" to "Motion").forEach { (key, label) ->
-            FilterChip(
+            CrumbFilterChip(
                 selected = type == key,
                 onClick = { onType(key) },
-                label = { Text(label) },
+                label = label,
+                accent = CLIPS_ACCENT,
             )
         }
         Spacer(Modifier.weight(1f))
         RangeSelector(hours = hours, onSelect = onHours)
+    }
+}
+
+/** C2: the dropdown triggers are neutral text with a chevron, not amber; the tab
+ *  accent is the only colour on the screen. 40 dp tall ripple area. */
+@Composable
+private fun MenuTrigger(label: String, enabled: Boolean = true, onClick: () -> Unit) {
+    TextButton(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = Modifier.height(40.dp),
+        contentPadding = PaddingValues(horizontal = Spacing.s),
+        colors = ButtonDefaults.textButtonColors(
+            contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+            disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        ),
+    ) {
+        Text(label, style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Icon(Icons.Filled.ArrowDropDown, contentDescription = null, modifier = Modifier.size(18.dp))
     }
 }
 
@@ -319,10 +382,7 @@ private fun CameraSelector(
     var open by remember { mutableStateOf(false) }
     val current = cameras.firstOrNull { it.id == cameraId }?.name ?: "All cameras"
     Box {
-        TextButton(onClick = { open = true }, enabled = cameras.size > 1 || cameraId != null) {
-            Text(current, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Icon(Icons.Filled.ArrowDropDown, contentDescription = "Choose camera")
-        }
+        MenuTrigger(current, enabled = cameras.size > 1 || cameraId != null) { open = true }
         DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
             DropdownMenuItem(
                 text = { Text("All cameras") },
@@ -352,7 +412,7 @@ private fun RangeSelector(hours: Long, onSelect: (Long) -> Unit) {
     var open by remember { mutableStateOf(false) }
     val current = options.firstOrNull { it.first == hours }?.second ?: "Last ${hours}h"
     Box {
-        TextButton(onClick = { open = true }) { Text(current) }
+        MenuTrigger(current) { open = true }
         DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
             options.forEach { (h, label) ->
                 DropdownMenuItem(
@@ -365,19 +425,25 @@ private fun RangeSelector(hours: Long, onSelect: (Long) -> Unit) {
 }
 
 @Composable
-private fun ClipCard(c: ClipDescriptor, mediaUrls: video.crumb.app.data.MediaUrls, onClick: () -> Unit) {
-    // Resolved via the per-camera scoped-token cache — a plain cache hit once
+private fun ClipCard(
+    c: ClipDescriptor,
+    mediaUrls: video.crumb.app.data.MediaUrls,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
+    // Resolved via the per-camera scoped-token cache: a plain cache hit once
     // warm, a network round-trip only on the first card for that camera / a
     // near-expiry refresh.
     var thumbUrl by remember(c.id) { mutableStateOf<String?>(null) }
     LaunchedEffect(c.id) {
         thumbUrl = runCatching { mediaUrls.clipThumbUrl(c.cameraId, c.id) }.getOrNull()
     }
+    // C3: 12 dp radius, 12 dp inner padding, 14 sp title and 12 sp mono time.
     Column(
-        Modifier
+        modifier
             // Watched: subtle dim so reviewed clips recede without disappearing.
             .alpha(if (c.viewed) 0.55f else 1f)
-            .clip(RoundedCornerShape(9.dp))
+            .clip(MaterialTheme.shapes.medium)
             .background(MaterialTheme.colorScheme.surfaceVariant)
             .clickable(onClick = onClick),
     ) {
@@ -393,39 +459,58 @@ private fun ClipCard(c: ClipDescriptor, mediaUrls: video.crumb.app.data.MediaUrl
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize(),
             )
-            Text(
-                clipBadge(c),
-                color = Color.White,
-                style = MaterialTheme.typography.labelSmall,
+            // C4: humanised kind with its detection icon in a 20 dp pill.
+            Row(
                 modifier = Modifier
                     .align(Alignment.TopStart)
-                    .padding(6.dp)
-                    .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(4.dp))
-                    .padding(horizontal = 5.dp, vertical = 2.dp),
-            )
-            if (c.durationMs > 0) {
+                    .padding(Spacing.s)
+                    .height(20.dp)
+                    .background(Color.Black.copy(alpha = 0.6f), CircleShape)
+                    .padding(horizontal = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(Spacing.xs),
+            ) {
+                if (c.kind == "motion") {
+                    Icon(Icons.Filled.Sensors, contentDescription = null, tint = DangerRed, modifier = Modifier.size(14.dp))
+                } else {
+                    Icon(
+                        DetectionIcons.icon(c.iconKey),
+                        contentDescription = null,
+                        tint = DetectionIcons.color(c.iconKey),
+                        modifier = Modifier.size(14.dp),
+                    )
+                }
                 Text(
-                    "${c.durationMs / 1000}s",
+                    ClipFormat.kindLabel(c),
                     color = Color.White,
                     style = MaterialTheme.typography.labelSmall,
+                    maxLines = 1,
+                )
+            }
+            if (c.durationMs > 0) {
+                // C5: m:ss in mono, 11 sp, small-radius pill.
+                Text(
+                    ClipFormat.duration(c.durationMs),
+                    color = Color.White,
+                    style = monoStyle(11.sp),
                     modifier = Modifier
                         .align(Alignment.BottomEnd)
-                        .padding(6.dp)
-                        .background(Color.Black.copy(alpha = 0.7f), RoundedCornerShape(3.dp))
-                        .padding(horizontal = 4.dp, vertical = 1.dp),
+                        .padding(Spacing.s)
+                        .background(Color.Black.copy(alpha = 0.7f), MaterialTheme.shapes.extraSmall)
+                        .padding(horizontal = 6.dp, vertical = 2.dp),
                 )
             }
         }
-        Column(Modifier.padding(7.dp)) {
+        Column(Modifier.padding(Spacing.m)) {
             Text(
                 c.cameraName,
-                style = MaterialTheme.typography.bodySmall,
+                style = MaterialTheme.typography.labelLarge,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
             Text(
                 formatClipTime(c.startTs),
-                style = MaterialTheme.typography.labelSmall,
+                style = MaterialTheme.typography.monoCaption,
                 color = TextSecondary,
             )
         }
@@ -518,7 +603,7 @@ private fun ClipPlayerDialog(
                 ).show()
             }
         } else {
-            Toast.makeText(context, "Snapshot unavailable — video not ready", Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, "Snapshot unavailable. Video not ready.", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -526,72 +611,117 @@ private fun ClipPlayerDialog(
     // would push the header (and its close button) off-screen — so there pin the
     // header and let the video fill the remaining height instead.
     val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+    val captionText = remember(clip.id) {
+        listOf(clip.cameraName, formatClipTime(clip.startTs), ClipFormat.duration(clip.durationMs))
+            .filter { it.isNotBlank() }
+            .joinToString(" \u00B7 ")
+    }
+    // The four actions, same order as before (timeline, snapshot, bookmark, quality).
+    val actions: @Composable () -> Unit = {
+        IconButton(onClick = onOpenTimeline) {
+            Icon(Icons.Filled.VideoLibrary, contentDescription = "View this moment on the timeline")
+        }
+        IconButton(onClick = onSnapshot) {
+            Icon(Icons.Filled.AddAPhoto, contentDescription = "Snapshot current frame")
+        }
+        onBookmark?.let { cb ->
+            IconButton(onClick = cb) {
+                Icon(Icons.Filled.BookmarkBorder, contentDescription = "Bookmark")
+            }
+        }
+        IconButton(onClick = {
+            val next = !full
+            full = next
+            val at = exo.currentPosition
+            val quality = if (next) "full" else "preview"
+            scope.launch {
+                val url = runCatching { mediaUrls.clipVideoUrl(clip.cameraId, clip.id, quality) }.getOrNull()
+                    ?: return@launch
+                // Same disposed-mid-load guard as the initial load above.
+                runCatching {
+                    exo.setMediaItem(MediaItem.fromUri(url))
+                    exo.prepare()
+                    exo.seekTo(at)
+                    exo.playWhenReady = true
+                }
+            }
+        }) {
+            Icon(
+                Icons.Filled.Hd,
+                contentDescription = if (full) "Full quality (on)" else "Full quality (off)",
+                tint = if (full) MaterialTheme.colorScheme.primary else LocalContentColor.current,
+            )
+        }
+    }
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        // V1: 28 dp radius, 60% scrim, scale-and-fade entry (G5).
+        DialogScrim(0.6f)
         Column(
             Modifier
+                .dialogEntrance()
                 .fillMaxWidth(if (landscape) 0.94f else 0.96f)
                 .then(if (landscape) Modifier.fillMaxHeight(0.96f) else Modifier)
-                .clip(RoundedCornerShape(12.dp))
+                .clip(MaterialTheme.shapes.extraLarge)
                 .background(MaterialTheme.colorScheme.surface),
         ) {
-            Row(
-                Modifier.fillMaxWidth().padding(start = 14.dp, end = 4.dp, top = 2.dp, bottom = 2.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(title, Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
-                IconButton(onClick = onOpenTimeline) {
-                    Icon(Icons.Filled.VideoLibrary, contentDescription = "View this moment on the timeline")
-                }
-                IconButton(onClick = onSnapshot) {
-                    Icon(Icons.Filled.AddAPhoto, contentDescription = "Snapshot current frame")
-                }
-                onBookmark?.let { cb ->
-                    IconButton(onClick = cb) {
-                        Icon(Icons.Filled.BookmarkBorder, contentDescription = "Bookmark")
-                    }
-                }
-                IconButton(onClick = {
-                    val next = !full
-                    full = next
-                    val at = exo.currentPosition
-                    val quality = if (next) "full" else "preview"
-                    scope.launch {
-                        val url = runCatching { mediaUrls.clipVideoUrl(clip.cameraId, clip.id, quality) }.getOrNull()
-                            ?: return@launch
-                        // Same disposed-mid-load guard as the initial load above.
-                        runCatching {
-                            exo.setMediaItem(MediaItem.fromUri(url))
-                            exo.prepare()
-                            exo.seekTo(at)
-                            exo.playWhenReady = true
-                        }
-                    }
-                }) {
-                    Icon(
-                        Icons.Filled.Hd,
-                        contentDescription = if (full) "Full quality (on)" else "Full quality (off)",
-                        tint = if (full) MaterialTheme.colorScheme.primary else LocalContentColor.current,
-                    )
-                }
-                IconButton(onClick = onDismiss) { Icon(Icons.Filled.Close, contentDescription = "Close") }
-            }
-            ClipZoomSurface(
-                clipId = clip.id,
-                highlightBbox = clip.motionBbox?.takeIf { clip.kind == "motion" },
-                highlightSeconds = motionHighlightSeconds,
-                ready = videoReady,
+            // The video sits flush at the top (rounded by the dialog clip). V2: Close
+            // lives on its corner in a 48 dp translucent circle.
+            Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .then(if (landscape) Modifier.weight(1f) else Modifier.aspectRatio(16f / 9f))
-                    .background(Color.Black),
+                    .then(if (landscape) Modifier.weight(1f) else Modifier.aspectRatio(16f / 9f)),
             ) {
-                PlayerSurface(
-                    player = exo,
-                    textureView = true,
-                    useController = true,
-                    onViewReady = { playerView = it },
-                    modifier = Modifier.fillMaxSize(),
-                )
+                ClipZoomSurface(
+                    clipId = clip.id,
+                    highlightBbox = clip.motionBbox?.takeIf { clip.kind == "motion" },
+                    highlightSeconds = motionHighlightSeconds,
+                    ready = videoReady,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.Black),
+                ) {
+                    PlayerSurface(
+                        player = exo,
+                        textureView = true,
+                        useController = true,
+                        onViewReady = { playerView = it },
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
+                IconButton(
+                    onClick = onDismiss,
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(Spacing.s)
+                        .background(Color.Black.copy(alpha = 0.4f), CircleShape),
+                ) {
+                    Icon(Icons.Filled.Close, contentDescription = "Close", tint = Color.White)
+                }
+            }
+            if (landscape) {
+                // Short screen: title and actions share one row under the video.
+                Row(
+                    Modifier.fillMaxWidth().padding(start = Spacing.xl, end = Spacing.s, top = Spacing.s, bottom = Spacing.s),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(title, style = MaterialTheme.typography.titleMedium, maxLines = 1)
+                        Text(captionText, style = MaterialTheme.typography.monoCaption, color = TextSecondary, maxLines = 1)
+                    }
+                    actions()
+                }
+            } else {
+                Column(Modifier.padding(horizontal = Spacing.xl).padding(top = Spacing.l)) {
+                    Text(title, style = MaterialTheme.typography.titleMedium)
+                    Text(captionText, style = MaterialTheme.typography.monoCaption, color = TextSecondary)
+                }
+                Row(
+                    Modifier.fillMaxWidth().padding(end = Spacing.m, bottom = Spacing.s),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    actions()
+                }
             }
         }
     }
@@ -712,14 +842,9 @@ private fun ClipZoomSurface(
     }
 }
 
-private fun clipBadge(c: ClipDescriptor): String =
-    if (c.kind == "motion") {
-        "Motion"
-    } else {
-        c.label.ifBlank { "Detection" }.replaceFirstChar { it.uppercase() }
-    }
+private fun clipBadge(c: ClipDescriptor): String = ClipFormat.kindLabel(c)
 
-private val CLIP_TIME_FMT: DateTimeFormatter = DateTimeFormatter.ofPattern("MMM d, HH:mm:ss")
+private val CLIP_TIME_FMT: DateTimeFormatter = DateTimeFormatter.ofPattern("MMM d HH:mm:ss")
 
 private fun formatClipTime(iso: String): String = try {
     Instant.parse(iso).atZone(ZoneId.systemDefault()).format(CLIP_TIME_FMT)

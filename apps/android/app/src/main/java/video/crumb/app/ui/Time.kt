@@ -18,6 +18,8 @@ object Time {
     private val dateFmt = DateTimeFormatter.ofPattern("EEE MMM d", Locale.US)
     private val dateTimeFmt = DateTimeFormatter.ofPattern("MMM d, HH:mm:ss", Locale.US)
 
+    private val dateTimeCompactFmt = DateTimeFormatter.ofPattern("MMM d HH:mm:ss", Locale.US)
+
     val zone: ZoneId get() = ZoneId.systemDefault()
 
     /** RFC-3339 string for an instant (UTC, suitable for API query params). */
@@ -47,4 +49,8 @@ object Time {
     fun date(instant: Instant): String = dateFmt.format(instant.atZone(zone))
     fun dateTime(instant: Instant): String = dateTimeFmt.format(instant.atZone(zone))
     fun dateTime(iso: String): String = dateTime(parse(iso))
+
+    /** "Oct 30 16:15:46": date and time with no comma, for compact mono readouts. */
+    fun dateTimeCompact(instant: Instant): String = dateTimeCompactFmt.format(instant.atZone(zone))
+    fun dateTimeCompact(iso: String): String = dateTimeCompact(parse(iso))
 }

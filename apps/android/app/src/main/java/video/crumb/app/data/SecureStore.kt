@@ -362,6 +362,15 @@ class SecureStore(context: Context) {
         get() = safeRead(false) { it.getBoolean(KEY_ADVANCED_PLAYBACK, false) }
         set(value) = safeWrite { it.putBoolean(KEY_ADVANCED_PLAYBACK, value) }
 
+    /**
+     * Set once the operator has opened a camera from the Playback wall; the wall's
+     * "Tap a camera" hint is then retired (see [video.crumb.app.feature.playback.PlaybackWallHint]).
+     * Device-local UI state, NOT cleared on logout.
+     */
+    var playbackWallHintSeen: Boolean
+        get() = safeRead(false) { it.getBoolean(KEY_PLAYBACK_WALL_HINT_SEEN, false) }
+        set(value) = safeWrite { it.putBoolean(KEY_PLAYBACK_WALL_HINT_SEEN, value) }
+
     /** One-time flag: the Simple/Advanced default migration has run. */
     var playbackControlsMigrated: Boolean
         get() = safeRead(false) { it.getBoolean(KEY_PLAYBACK_CTRL_MIGRATED, false) }
@@ -549,6 +558,7 @@ class SecureStore(context: Context) {
         private const val KEY_SNAPSHOT_VIEW = "snapshot_captures_view"
         private const val KEY_ADVANCED_PLAYBACK = "advanced_playback_controls"
         private const val KEY_PLAYBACK_CTRL_MIGRATED = "playback_controls_migrated"
+        private const val KEY_PLAYBACK_WALL_HINT_SEEN = "playback_wall_hint_seen"
         private const val KEY_VIEWS = "camera_views_json"
         private const val KEY_ACTIVE_VIEW = "active_view_id"
         private const val KEY_LOW_BW_MODE = "low_bandwidth_mode"

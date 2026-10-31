@@ -291,7 +291,7 @@ internal fun rowMetaLine(cameraName: String, timeLabel: String, confidence: Floa
     buildAnnotatedString {
         append(cameraName)
         append("  ·  ")
-        append(timeLabel)
+        withStyle(SpanStyle(fontFamily = JetBrainsMono)) { append(timeLabel) }
         if (confidence != null) {
             append("  ·  ")
             val low = confidence < LOW_CONFIDENCE

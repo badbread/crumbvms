@@ -2,6 +2,26 @@
 
 package video.crumb.app.feature.live
 
+import androidx.compose.foundation.layout.fillMaxWidth
+import video.crumb.app.ui.theme.monoStyle
+import video.crumb.app.ui.theme.Spacing
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.draw.clip
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.layout.only
+import androidx.compose.foundation.layout.displayCutout
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.EaseOutCubic
+import androidx.compose.animation.core.Animatable
 import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -765,6 +785,23 @@ fun LiveFullscreenScreen(
         }
     }
 
+    // F5: slide/fade the video surface when the camera changes (swipe or picker).
+    val camSwitch = remember { Animatable(1f) }
+    var camSwitchDir by remember { mutableFloatStateOf(0f) }
+    var prevCameraIndex by remember { mutableIntStateOf(cameraIds.indexOf(currentCameraId)) }
+    LaunchedEffect(currentCameraId, cameraIds.size) {
+        val idx = cameraIds.indexOf(currentCameraId)
+        if (prevCameraIndex < 0) {
+            // The camera list has just loaded: record where we are, no animation.
+            prevCameraIndex = idx
+        } else if (idx >= 0 && idx != prevCameraIndex) {
+            camSwitchDir = if (idx > prevCameraIndex) 1f else -1f
+            prevCameraIndex = idx
+            camSwitch.snapTo(0f)
+            camSwitch.animateTo(1f, tween(200, easing = EaseOutCubic))
+        }
+    }
+
     // Full-screen black canvas.
     Box(
         modifier = Modifier
@@ -776,7 +813,14 @@ fun LiveFullscreenScreen(
         // suppressed while the PTZ wheel is up so single-touch reaches the wheel.
         if (player != null && !playerError) {
             ZoomableVideoSurface(
-                modifier = Modifier.fillMaxSize(),
+                modifier = Modifier.fillMaxSize().graphicsLayer {
+                    // F5: the incoming camera slides in from the swipe side (30 dp) and
+                    // fades up over 200 ms. One shared player, so there is no outgoing
+                    // slide; the HUD is a sibling and stays put.
+                    val t = camSwitch.value
+                    alpha = 0.35f + 0.65f * t
+                    translationX = camSwitchDir * 30.dp.toPx() * (1f - t)
+                },
                 suppressPan = ptzVisible,
                 inPip = inPip,
                 onSwipeCamera = { dir ->
@@ -863,18 +907,18 @@ fun LiveFullscreenScreen(
         // the manual HD/SD override. Hidden in PiP.
         val sdLabel = sdBadgeLabel(tier)
         if (!inPip && hdUnavailable && sdLabel != null && !isResolving && !playerError) {
+            // F2: 11 sp mono at 70% white, no box (the scrim keeps it legible).
             Text(
                 text = sdLabel,
-                style = MaterialTheme.typography.labelMedium,
-                color = Color.White,
+                style = monoStyle(11.sp).copy(
+                    shadow = Shadow(color = Color.Black, offset = Offset(0f, 1f), blurRadius = 4f),
+                ),
+                color = Color.White.copy(alpha = 0.7f),
                 modifier = Modifier
                     .align(Alignment.TopCenter)
                     .statusBarsPadding()
                     .padding(top = 8.dp)
-                    .background(
-                        color = Color.Black.copy(alpha = 0.55f),
-                        shape = androidx.compose.foundation.shape.RoundedCornerShape(6.dp),
-                    )
+                    .clip(MaterialTheme.shapes.small)
                     .clickable {
                         streams?.rtspMainUrl?.let {
                             // An explicit "give me HD" wipes this camera's recorded
@@ -888,7 +932,7 @@ fun LiveFullscreenScreen(
                             playerGeneration += 1
                         }
                     }
-                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                    .padding(horizontal = Spacing.s, vertical = Spacing.s),
             )
         }
 
@@ -927,6 +971,18 @@ fun LiveFullscreenScreen(
             )
         }
 
+        // F1: the top controls sit on a soft 110 dp gradient (60% black to clear)
+        // instead of drawing a hard edge across the video. Hidden in PiP.
+        if (!inPip) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .fillMaxWidth()
+                    .height(110.dp)
+                    .background(Brush.verticalGradient(listOf(Color.Black.copy(alpha = 0.6f), Color.Transparent))),
+            )
+        }
+
         // Back button (top-left, respects status bar inset). Hidden in PiP.
         if (!inPip) {
             HintTooltip("Back to camera wall") {
@@ -935,6 +991,8 @@ fun LiveFullscreenScreen(
                     modifier = Modifier
                         .align(Alignment.TopStart)
                         .statusBarsPadding()
+                        // F4 / G10: stay clear of the display cutout in landscape.
+                        .windowInsetsPadding(WindowInsets.displayCutout.only(WindowInsetsSides.Horizontal))
                         .padding(8.dp),
                 ) {
                     Icon(
@@ -952,19 +1010,18 @@ fun LiveFullscreenScreen(
         // centre PTZ wheel. Hidden in PiP (video only).
         if (!inPip) {
             cameraNames[currentCameraId]?.takeIf { it.isNotBlank() }?.let { name ->
+                // F2: 16 sp medium name, shadowed text with no box (same treatment as L3).
                 Text(
                     text = name,
-                    style = MaterialTheme.typography.labelMedium,
+                    style = MaterialTheme.typography.titleMedium.copy(
+                        shadow = Shadow(color = Color.Black, offset = Offset(0f, 1f), blurRadius = 4f),
+                    ),
                     color = Color.White,
                     maxLines = 1,
                     modifier = Modifier
                         .align(Alignment.BottomStart)
-                        .padding(12.dp)
-                        .background(
-                            color = Color.Black.copy(alpha = 0.55f),
-                            shape = androidx.compose.foundation.shape.RoundedCornerShape(6.dp),
-                        )
-                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                        .windowInsetsPadding(WindowInsets.displayCutout.only(WindowInsetsSides.Horizontal))
+                        .padding(Spacing.m),
                 )
             }
         }
@@ -977,13 +1034,9 @@ fun LiveFullscreenScreen(
                 modifier = Modifier
                     .align(Alignment.TopStart)
                     .statusBarsPadding()
-                    .padding(start = 52.dp, top = 8.dp)
-                    .background(
-                        color = Color.Black.copy(alpha = 0.55f),
-                        shape = androidx.compose.foundation.shape.RoundedCornerShape(6.dp),
-                    )
-                    .padding(horizontal = 8.dp, vertical = 4.dp),
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    .windowInsetsPadding(WindowInsets.displayCutout.only(WindowInsetsSides.Horizontal))
+                    .padding(start = 60.dp, top = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(Spacing.xs),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Icon(
@@ -992,9 +1045,13 @@ fun LiveFullscreenScreen(
                     tint = DangerRed,
                     modifier = Modifier.size(16.dp),
                 )
+                // F3: dot plus 12 sp text with a shadow, no box.
                 Text(
                     text = "Motion",
-                    style = MaterialTheme.typography.labelMedium,
+                    style = MaterialTheme.typography.labelMedium.copy(
+                        fontSize = 12.sp,
+                        shadow = Shadow(color = Color.Black, offset = Offset(0f, 1f), blurRadius = 4f),
+                    ),
                     color = Color.White,
                 )
             }
@@ -1006,6 +1063,7 @@ fun LiveFullscreenScreen(
             modifier = Modifier
                 .align(Alignment.TopEnd)
                 .statusBarsPadding()
+                .windowInsetsPadding(WindowInsets.displayCutout.only(WindowInsetsSides.Horizontal))
                 .padding(8.dp),
             horizontalArrangement = Arrangement.spacedBy(4.dp),
         ) {

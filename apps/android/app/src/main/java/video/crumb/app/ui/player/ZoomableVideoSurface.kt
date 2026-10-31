@@ -19,6 +19,7 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
@@ -237,13 +238,16 @@ fun ZoomableVideoSurface(
                     report()
                 })
             }
+            // Clip in the parent's space, before the zoom. The layer's own
+            // `clip = true` is applied after its scale, so the clip grew with the
+            // zoom and the video spilled over the page around a framed player.
+            .clipToBounds()
             .graphicsLayer {
                 scaleX = zoom
                 scaleY = zoom
                 translationX = -offset.x * zoom
                 translationY = -offset.y * zoom
                 transformOrigin = TransformOrigin(0f, 0f)
-                clip = true // keep the zoomed video inside its window, not over the UI
             },
     ) {
         content()
