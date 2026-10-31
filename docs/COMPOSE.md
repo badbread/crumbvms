@@ -323,7 +323,7 @@ Five things can need action, depending on your setup:
   `scripts/setup-env.sh` already has a generated password.
 - **Exports fail with "Permission denied".** An export volume created by an
   earlier image is owned by root, which the api cannot write, so exports, the
-  clip cache, and scrub previews all fail (#692). Fresh installs get a writable
+  clip cache, and scrub previews all fail (#692, fixed by #695). Fresh installs get a writable
   volume now, and the api logs one clear error at boot when it finds the old
   one. Fix it once with `docker compose exec -u root api chown 1001:1001
   /exports`.

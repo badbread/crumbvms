@@ -73,6 +73,10 @@ missing disk. None of that is visible on a good day, which is the point.
 - **Desktop:** the export folder picker can make a new folder, refresh, and open
   the result in Explorer (#641), and an export clip can be duplicated for another
   camera angle (#649).
+- **Exports work on a fresh install.** The export volume used to be created
+  owned by root, which the api cannot write, so exports, the clip cache, and
+  scrub previews all failed until it was fixed by hand (#695). This was already
+  the case in 0.2.0; the upgrade notes cover an existing install.
 - **Android:** exports were redesigned around in and out marks on the playback
   timeline, so you can export straight from playback (#617, #621). A cancelled
   export now counts as finished, and the file keeps the name the server gave it
@@ -137,6 +141,10 @@ missing disk. None of that is visible on a good day, which is the point.
 - **Recording no longer depends on the api.** The recorder registers its own
   streams in the embedded go2rtc (#636) and dials it over loopback rather than
   back through the host's published port (#632).
+- **A segment in flight at a restart is indexed at boot.** The recorder's boot
+  schema check used to take exclusive table locks on every start and could
+  deadlock the reconcile pass, which left that segment unindexed until the next
+  periodic pass (#696). This was already the case in 0.2.0.
 - The HD repair for a camera whose main stream a phone cannot decode now judges
   the stream as served first, covering record-from-sub cameras and sub streams
   too (#613).
@@ -209,7 +217,7 @@ Five things can need action, depending on your setup:
   `scripts/setup-env.sh` already has a generated password.
 - **Exports fail with "Permission denied".** An export volume created by an
   earlier image is owned by root, which the api cannot write, so exports, the
-  clip cache, and scrub previews all fail (#692). Fresh installs get a writable
+  clip cache, and scrub previews all fail (#692, fixed by #695). Fresh installs get a writable
   volume now, and the api logs one clear error at boot when it finds the old
   one. Fix it once with `docker compose exec -u root api chown 1001:1001
   /exports`.
@@ -255,6 +263,8 @@ Worth knowing, no action needed:
 Every pull request merged since 0.2.0, newest first. The release integration
 (#682) landed as one merge; the pull requests it carried are listed after it.
 
+- fix(recorder): stop the boot schema shim deadlocking orphan indexing (#696)
+- fix(api): create /exports in the image so a new export volume is writable (#695)
 - feat(android): Simple / Advanced playback controls setting (#690)
 - feat(android): LPR tab redesign (search + filter sheet, aspect-true rows, plate profile) (#689)
 - fix(android): run Playback's first startCamera after every field exists (#688)
