@@ -2,6 +2,8 @@
 
 package video.crumb.app.feature.playback
 
+import video.crumb.app.ui.theme.monoStyle
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -108,6 +110,12 @@ private val ICON_DISC = Color(0xF21A1C22)   // near-opaque dark disc directly be
  *   [onSetExportEnd]) disables edge-dragging entirely, which is what the
  *   multi-camera playback wall wants.
  * @param onSetExportEnd Called while dragging the OUT handle.
+ * @param timeChip When true (single-camera playback) the playhead time is drawn as a
+ *   12 sp mono chip centred above the playhead (P5). The playback wall passes false
+ *   and shows the time on its control row instead (W4).
+ * @param reserveMarkerBand When true, a 16 dp band above the bars is reserved for the
+ *   detection glyphs (P6) so they no longer overlap the bar area. On short (landscape)
+ *   timelines the band shares its row with the time chip.
  */
 @Composable
 fun CenteredTimeline(
@@ -129,12 +137,14 @@ fun CenteredTimeline(
     exportSelEndMs: Long? = null,
     onSetExportStart: ((Long) -> Unit)? = null,
     onSetExportEnd: ((Long) -> Unit)? = null,
+    timeChip: Boolean = false,
+    reserveMarkerBand: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     val textMeasurer = rememberTextMeasurer()
+    val chipStyle = remember { monoStyle(12.sp).copy(color = Color.White) }
     // remembered so they aren't reallocated on every playhead tick (review B2).
     val gridStyle = remember { TextStyle(color = TextSecondary, fontSize = 9.sp) }
-    val headStyle = remember { TextStyle(color = Color.White, fontSize = 11.sp) }
 
     // Latest values readable inside the (Unit-keyed) gesture loop.
     val playhead = rememberUpdatedState(playheadMs)
@@ -287,8 +297,16 @@ fun CenteredTimeline(
             val visDur = (visEnd - visStart).coerceAtLeast(1L)
             fun xOf(ts: Long): Float = ((ts - visStart).toFloat() / visDur) * w
 
-            val bandH = h * 0.42f
-            val bandTop = (h - bandH) / 2f
+            // Top inset: the time chip row (18 dp) and the detection marker band (16 dp).
+            // Stacked when the timeline is tall enough, sharing one row when it is short.
+            val chipH = if (timeChip) 18.dp.toPx() else 0f
+            val markerH = if (reserveMarkerBand) 16.dp.toPx() else 0f
+            val stacked = h >= 80.dp.toPx()
+            val topInset = if (stacked) chipH + markerH else maxOf(chipH, markerH)
+            val markerTop = if (stacked) chipH else 0f
+            val labelsH = 12.dp.toPx()
+            val bandH = if (topInset > 0f) (h - topInset - labelsH).coerceAtLeast(8.dp.toPx()) else h * 0.42f
+            val bandTop = if (topInset > 0f) topInset else (h - bandH) / 2f
 
             // The Trail band (mirrors the desktop TL palette): a slate baseline =
             // recording present, a faint blue base over recorded regions, and a BLUE
@@ -350,10 +368,12 @@ fun CenteredTimeline(
                     // Two-tone: dim blue ribbon at the floor → bright azure cap at the
                     // ceiling, so a bar both grows AND brightens with intensity.
                     val markColor = lerp(TimelineColors.motionLow, TimelineColors.motion, frac)
-                    drawRect(
+                    // W5: 1.5 dp rounded bar tops.
+                    drawRoundRect(
                         color = markColor,
                         topLeft = Offset(x1, bandTop + bandH - baseH - mh),
                         size = Size(bw, mh),
+                        cornerRadius = CornerRadius(1.5.dp.toPx(), 1.5.dp.toPx()),
                     )
                 }
             }
@@ -385,12 +405,14 @@ fun CenteredTimeline(
             if (detectionEvents.isNotEmpty()) {
                 // Glyph size scales with zoom: closer zoom → bigger icon. The glyph
                 // sits at the top of the band (above the motion marks below).
-                val iconSize = when {
+                val iconSize = if (reserveMarkerBand) {
+                    16.dp.toPx()                              // P6: fixed 16 dp glyphs in their own band
+                } else when {
                     spanMs <= 5 * 60_000L -> 16.dp.toPx()    // ≤5 min zoom
                     spanMs <= 60 * 60_000L -> 13.dp.toPx()   // ≤1 h zoom
                     else -> 11.dp.toPx()                      // >1 h (48 h max)
                 }
-                val iconTop = bandTop + 1f
+                val iconTop = if (reserveMarkerBand) markerTop + (markerH - iconSize) / 2f else bandTop + 1f
                 // Time-ordered (pre-parsed/sorted, review B1) so collision-thinning
                 // works left-to-right: skip any glyph overlapping the previous one.
                 var lastX = Float.NEGATIVE_INFINITY
@@ -420,7 +442,7 @@ fun CenteredTimeline(
                         color = lerp(color, Color.White, 0.35f),
                         radius = r + 0.5f,
                         center = Offset(cx2, cy2),
-                        style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.6f),
+                        style = androidx.compose.ui.graphics.drawscope.Stroke(width = if (reserveMarkerBand) 1.5.dp.toPx() else 1.6f),
                     )
                     // The glyph is drawn at ~78% of the badge so it sits inside the ring.
                     val gSize = iconSize * 0.78f
@@ -494,11 +516,28 @@ fun CenteredTimeline(
                 close()
             }
             drawPath(tri, color = TimelineColors.playhead)
-            // Date + time label centered above the playhead (day must be visible).
-            val label = Time.dateTime(Instant.ofEpochMilli(playheadMs))
-            val measured = textMeasurer.measure(label, headStyle, overflow = TextOverflow.Clip)
-            val lx = (cx - measured.size.width / 2f).coerceIn(0f, w - measured.size.width.toFloat())
-            drawText(measured, topLeft = Offset(lx, 0f))
+            // P5: date + time as a 12 sp mono chip centred above the playhead. (The
+            // playhead is fixed at the centre, so the chip stays put while time scrolls
+            // under it.) Drawn last so it sits over any glyph at the centre.
+            if (timeChip) {
+                val label = Time.dateTimeCompact(Instant.ofEpochMilli(playheadMs))
+                val measured = textMeasurer.measure(label, chipStyle, overflow = TextOverflow.Clip)
+                val padX = 8.dp.toPx()
+                val chipW = measured.size.width + padX * 2
+                val chipTop = 0f
+                val chipHeight = chipH - 2.dp.toPx()
+                val chipLeft = (cx - chipW / 2f).coerceIn(0f, (w - chipW).coerceAtLeast(0f))
+                drawRoundRect(
+                    color = TimelineColors.track,
+                    topLeft = Offset(chipLeft, chipTop),
+                    size = Size(chipW, chipHeight),
+                    cornerRadius = CornerRadius(6.dp.toPx(), 6.dp.toPx()),
+                )
+                drawText(
+                    measured,
+                    topLeft = Offset(chipLeft + padX, chipTop + (chipHeight - measured.size.height) / 2f),
+                )
+            }
         }
     }
 }
