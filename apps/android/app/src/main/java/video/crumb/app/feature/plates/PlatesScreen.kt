@@ -446,7 +446,8 @@ fun PlatesScreen(
         val hidden = state.plates.size - visibleReads.size
         PlatesFilterSheet(
             sheet = PlatesFilterSheetState(
-                cameras = state.cameras.sortedBy { it.name.lowercase() }.map { it.id to it.name },
+                // Server order: the admin's camera order (migration 0085).
+                cameras = state.cameras.map { it.id to it.name },
                 selectedCameraIds = state.selectedCameraIds,
                 hours = state.hours,
                 anchorEndMs = state.anchorEndMs,

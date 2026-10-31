@@ -39,6 +39,13 @@ class _PlaybackLegendBarState extends State<PlaybackLegendBar> {
     });
   }
 
+  /// Position in the server's camera list, which is the admin's display
+  /// order (migration 0085); unknown ids sort last.
+  int _orderOf(String id) {
+    final i = widget.cameras.indexWhere((c) => c.id == id);
+    return i < 0 ? widget.cameras.length : i;
+  }
+
   String _nameFor(String id) {
     for (final c in widget.cameras) {
       if (c.id == id) return c.name;
@@ -76,7 +83,7 @@ class _PlaybackLegendBarState extends State<PlaybackLegendBar> {
               )
               .map((e) => e.key)
               .toList()
-            ..sort((a, b) => _nameFor(a).compareTo(_nameFor(b)));
+            ..sort((a, b) => _orderOf(a).compareTo(_orderOf(b)));
         }
         final shown = entries.take(kLegendCameraMax).toList();
         final extra = entries.length - shown.length;

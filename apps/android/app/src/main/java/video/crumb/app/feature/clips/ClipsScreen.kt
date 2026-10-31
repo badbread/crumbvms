@@ -328,7 +328,8 @@ private fun CameraSelector(
                 text = { Text("All cameras") },
                 onClick = { open = false; onSelect(null) },
             )
-            cameras.sortedBy { it.name.lowercase() }.forEach { cam ->
+            // Server order: the admin's camera order (migration 0085).
+            cameras.forEach { cam ->
                 DropdownMenuItem(
                     text = { Text(cam.name) },
                     onClick = { open = false; onSelect(cam.id) },
