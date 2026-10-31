@@ -2,6 +2,8 @@
 
 package video.crumb.app.ui
 
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.tween
@@ -45,6 +47,8 @@ fun CrumbFilterChip(
     accent: Color,
     modifier: Modifier = Modifier,
     compact: Boolean = false,
+    /** Active-filter strips: show a trailing close icon instead of the selection check. */
+    dismissible: Boolean = false,
 ) {
     val container by animateColorAsState(
         targetValue = if (selected) accent.copy(alpha = 0.20f) else NavySurfaceVariant,
@@ -62,7 +66,7 @@ fun CrumbFilterChip(
         label = {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 AnimatedVisibility(
-                    visible = selected,
+                    visible = selected && !dismissible,
                     enter = expandHorizontally(tween(200)) + fadeIn(tween(200)),
                     exit = shrinkHorizontally(tween(200)) + fadeOut(tween(120)),
                 ) {
@@ -79,6 +83,14 @@ fun CrumbFilterChip(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
+                if (dismissible) {
+                    Icon(
+                        imageVector = Icons.Default.Close,
+                        contentDescription = "Clear $label",
+                        modifier = Modifier.padding(start = 6.dp).size(16.dp),
+                        tint = content,
+                    )
+                }
             }
         },
         modifier = modifier.height(if (compact) 28.dp else 32.dp),
