@@ -1556,6 +1556,7 @@ async fn no_protected_route_is_reachable_without_credentials() {
         (Method::PUT, format!("/config/cameras/{u}/policy")),
         (Method::POST, format!("/config/cameras/{u}/redetect")),
         (Method::PUT, format!("/config/cameras/{u}/clip-source")),
+        (Method::PUT, "/config/camera-order".into()),
         (Method::GET, "/config/policies".into()),
         (Method::POST, "/config/policies".into()),
         (Method::POST, format!("/config/policies/{u}/change-storage")),

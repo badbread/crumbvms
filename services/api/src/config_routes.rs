@@ -14,6 +14,7 @@
 //! | `DELETE` | `/config/cameras/{id}`            | Delete camera + its segments (cascade)   |
 //! | `PUT`    | `/config/cameras/{id}/policy`     | Override per-camera policy fields        |
 //! | `POST`   | `/config/cameras/{id}/redetect`   | Re-run ONVIF discovery + restart stream  |
+//! | `PUT`    | `/config/camera-order`            | Set the display order all clients show   |
 //!
 //! ## Policies
 //! | Method | Path                     | Description                              |
@@ -160,6 +161,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/cameras/:id/policy", put(update_camera_policy))
         .route("/cameras/:id/redetect", post(redetect_camera))
+        .route("/camera-order", put(set_camera_order))
         // ── global default policy ─────────────────────────────────────────────
         .route(
             "/policy/default",
@@ -884,10 +886,52 @@ async fn list_cameras(
     _admin: AdminUser,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<CameraDto>>, ApiError> {
-    let cameras = db::list_cameras_all(state.pool())
+    let cameras = db::list_cameras_for_display(state.pool())
         .await
-        .context("list_cameras_all")?;
+        .context("list_cameras_for_display")?;
     Ok(Json(cameras.into_iter().map(camera_to_dto).collect()))
+}
+
+/// `PUT /config/camera-order` body: camera ids in the order clients should show
+/// them, first one first. An empty list resets to plain name order.
+#[derive(serde::Deserialize)]
+struct CameraOrderRequest {
+    camera_ids: Vec<Uuid>,
+}
+
+/// Upper bound on `camera_ids`, well past any real fleet; stops one request
+/// from making the server build an arbitrarily large array.
+const MAX_CAMERA_ORDER_IDS: usize = 10_000;
+
+/// `PUT /config/camera-order` — set the display order every client shows
+/// cameras in (migration 0085). Cameras left out of the list are unplaced:
+/// they follow the listed ones in name order. Unknown ids are ignored (a camera
+/// deleted while the admin was dragging). Display only; recording is untouched.
+async fn set_camera_order(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+    Json(body): Json<CameraOrderRequest>,
+) -> Result<StatusCode, ApiError> {
+    validate_camera_order(&body.camera_ids)?;
+    db::set_camera_display_order(state.pool(), &body.camera_ids)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn validate_camera_order(ids: &[Uuid]) -> Result<(), ApiError> {
+    if ids.len() > MAX_CAMERA_ORDER_IDS {
+        return Err(ApiError::BadRequest(format!(
+            "camera_ids may list at most {MAX_CAMERA_ORDER_IDS} cameras"
+        )));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(ids.len());
+    if let Some(dup) = ids.iter().find(|id| !seen.insert(**id)) {
+        return Err(ApiError::BadRequest(format!(
+            "camera_ids lists camera {dup} more than once"
+        )));
+    }
+    Ok(())
 }
 
 /// `POST /config/cameras` — create a new camera (clones the default policy).
