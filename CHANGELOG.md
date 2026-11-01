@@ -9,7 +9,7 @@ landed on `main`.
 Crumb is **alpha**. Versions before 1.0 make no compatibility promises, read the
 [Alpha Tester Terms](docs/ALPHA-TESTER-TERMS.md) before you rely on it.
 
-## [0.3.0] - Unreleased
+## [0.3.0] - 2026-11-01
 
 0.2.0 was about Home Assistant. 0.3.0 is about the two things you do most once
 footage exists: finding a moment and getting it out. Scrubbing a timeline now
