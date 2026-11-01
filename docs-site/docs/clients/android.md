@@ -53,7 +53,7 @@ corners and type everywhere. A few things you may notice:
 
 ## The LPR tab
 
-The LPR tab is a calm list of license-plate reads. At the top there is just a search bar; the
+The LPR tab is a calm list of license-plate reads. At the top there is just a search bar (it matches plates and the names you gave them); the
 filter button beside it opens one sheet with cameras, time range, "ends at", exact or fuzzy
 match, how to view the list (List, Gallery, or Grouped by plate), **Hide regulars** and
 **Merge duplicates**. A small strip of chips appears under the search bar only while a filter

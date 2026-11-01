@@ -148,7 +148,8 @@ without retyping it.
 
 When the reader gets one character wrong, the same car shows up as two plates
 (`GIF2GAB` and `GIT2GAB`). An admin can mark one as a misread of the other, and
-from then on both count as the real plate in every client: searches, history,
+from then on both count as the real plate in every client: searches (typing
+the misread finds the real plate too), history,
 today's totals, names and watchlist alerts. The original reads are kept, so a
 correction can be undone at any time. On the desktop it is **Correct plate...**
 in a plate's profile or row menu, see
@@ -167,7 +168,8 @@ and which are new, each plate's history, and a profile per plate. See
 ## Searching and retention
 
 Search the read database with `GET /plates` (exact, prefix, contains, or fuzzy
-match). Crops are served by `GET /plates/:id/crop`. Retention is a day count set
+match). The search matches plate numbers and, in every app, plate names and
+watchlist labels too: `chuck` finds the plate you named "Chuck". Crops are served by `GET /plates/:id/crop`. Retention is a day count set
 in the LPR section, and a storage-footprint card there shows how much disk the
 stored reads and crops are using (`GET /lpr/storage`).
 

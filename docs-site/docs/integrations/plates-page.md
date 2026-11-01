@@ -72,6 +72,13 @@ Turn on **Group by plate** to fold every read of the same plate into one row.
 The row says how many reads it stands for; click that (or press the right
 arrow) to unfold the earlier reads under it.
 
+### Searching
+
+The search box matches plate numbers and the names you gave plates (and
+watchlist labels), in any case: typing `chuck` finds the plate you named
+"Chuck", along with any misreads you corrected to it. **Exact** needs the
+whole plate or the whole name; **Contains** and **Fuzzy** match part of either.
+
 ### Loading more
 
 The list loads 200 reads at a time. **Load more** at the bottom fetches the
@@ -135,7 +142,8 @@ names and watchlist alerts.
 3. Check the sentence under the field, for example "GIT2GAB's 12 reads will
    count as GIF2GAB", and click **Correct**.
 
-Future reads of the misread count as the real plate too. Crumb never changes
+Future reads of the misread count as the real plate too, and searching for
+the misread (or part of it) finds every sighting of the real plate. Crumb never changes
 the reads themselves: the profile of the real plate lists its **known
 misreads**, and **Undo** there (or in the message right after you correct)
 turns a correction back off.

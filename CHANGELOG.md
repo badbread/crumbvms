@@ -72,6 +72,10 @@ missing disk. None of that is visible on a good day, which is the point.
 - **Correct a misread plate.** When the reader gets a character wrong, you can
   now tell Crumb which plate it really was, and the read is filed under the
   right plate from then on (#675, migration 0084).
+- **Search by name.** Typing a plate's name (or a watchlist label) in the
+  search finds that car in every app, so `chuck` finds the plate you named
+  Chuck. Searching for a corrected misread finds every sighting of the real
+  plate, not just the misread ones (#700).
 - New plate stats endpoints back the profiles (#659, migration 0083).
 
 ### Exports you can hand to someone
@@ -298,6 +302,7 @@ Worth knowing, no action needed:
 Every pull request merged since 0.2.0, newest first. The release integration
 (#682) landed as one merge; the pull requests it carried are listed after it.
 
+- fix(lpr): plate search matches plate names, watchlist labels and corrected misreads (#700)
 - feat: admin-set camera display order (drag to reorder in the console) (#698)
 - feat(android): hide the Playback controls in landscape (tap the video, auto-hide while playing) (#697)
 - fix(recorder): stop the boot policy shim deadlocking reconcile's camera lookup (#696)
