@@ -20,6 +20,22 @@ cameras to onboard. After first run, the admin console's camera
 management adds cameras the same way, one at a time or by re-running
 discovery.
 
+## Camera order
+
+Every app (Windows, Android, iPhone and Mac, and the web console) lists
+cameras in the same order: the All Cameras grid, camera pickers, and
+filters. By default that is name order, with numbers sorted the way you
+would expect ("Cam 2" before "Cam 10").
+
+To choose your own order, open **Cameras** in the admin console and click
+**Reorder**. Drag cameras into place, or use the arrow buttons, then click
+**Save order**. Connected apps pick up the new order on their own within a
+few seconds. A camera you add later goes at the end until you place it.
+**Reset to name order** goes back to the default.
+
+Only admins can change the order. It changes how cameras are listed, nothing
+about how they record. Saved views keep their own layout.
+
 ## In this section
 
 - [Adding a camera](/cameras/adding-a-camera), the ongoing (post-wizard)

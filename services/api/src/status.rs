@@ -179,7 +179,7 @@ async fn system_status(
 
     // ── 2. cameras ────────────────────────────────────────────────────────────
     // Viewers only see the cameras scoped to them; admins see all.
-    let cameras: Vec<_> = db::list_cameras_all(pool)
+    let cameras: Vec<_> = db::list_cameras_for_display(pool)
         .await?
         .into_iter()
         .filter(|c| user.can_access_camera(c.id))
