@@ -1347,6 +1347,7 @@ async fn get_ab_report(
             start: Some(start),
             end: Some(end),
             plate: None,
+            name: None,
             match_mode: db::PlateMatch::Contains,
             limit: AB_MAX_READS,
             offset: 0,
@@ -1582,7 +1583,8 @@ pub struct PlatesQuery {
     pub start: Option<DateTime<Utc>>,
     /// Optional window end (ISO 8601, exclusive).
     pub end: Option<DateTime<Utc>>,
-    /// Optional plate search string (normalized server-side before matching).
+    /// Optional search string: matched against plates (normalized server-side
+    /// first) and, as typed, against plate names and watchlist labels.
     pub q: Option<String>,
     /// Match mode: `exact` | `prefix` | `contains` | `fuzzy`. Defaults to
     /// `contains` when `q` is present.
@@ -1647,6 +1649,13 @@ async fn get_plates(
         q.q.as_deref()
             .map(db::normalize_plate)
             .filter(|s| !s.is_empty());
+    // The same text also searches plate names ("chuck" finds the plate named
+    // "Chuck"), as typed rather than normalized, since names have spaces.
+    let name =
+        q.q.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
     let match_mode = match q.match_mode.as_deref() {
         Some("exact") => db::PlateMatch::Exact,
         Some("prefix") => db::PlateMatch::Prefix,
@@ -1659,6 +1668,7 @@ async fn get_plates(
         start: q.start,
         end: q.end,
         plate,
+        name,
         match_mode,
         limit,
         offset,

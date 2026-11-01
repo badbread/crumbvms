@@ -3,7 +3,8 @@
 //! Integration tests for plate corrections (issue #673): the
 //! `/lpr/plate-aliases` CRUD, `/lpr/plate-alias-suggestions`, and alias
 //! resolution in `GET /plates`, `POST /lpr/plates/stats`, `GET /lpr/overview`
-//! and ingest-time watchlist matching. Covers authentication, the
+//! and ingest-time watchlist matching, plus searching `GET /plates` by plate
+//! name and watchlist label. Covers authentication, the
 //! `view_plates` gate on reads, admin-only writes, chain flattening, camera
 //! scoping of the counts, and that undoing a correction restores the raw view.
 //!
@@ -293,10 +294,12 @@ async fn correction_resolves_in_search_stats_and_overview_and_undo_restores() {
         .collect();
     assert_eq!(corrected.len(), 1);
     assert_eq!(corrected[0]["corrected_from"], alias);
-    // Searching the misread string still finds the read (raw text is kept).
+    // Searching the misread string finds the whole car: the misread read
+    // and the canonical plate's own reads, all served as the canonical plate.
     let v = plates_exact(&app, &token, cam, &alias).await;
-    assert_eq!(v["total"], 1);
-    assert_eq!(v["plates"][0]["plate"], canonical);
+    assert_eq!(v["total"], 3);
+    let reads = v["plates"].as_array().unwrap();
+    assert!(reads.iter().all(|r| r["plate"] == canonical));
     // Contains on the canonical string finds the corrected read as well.
     let resp = app
         .send(get_auth(
@@ -305,6 +308,30 @@ async fn correction_resolves_in_search_stats_and_overview_and_undo_restores() {
         ))
         .await;
     assert_eq!(body_json(resp).await["total"], 3);
+    // Prefix, contains and fuzzy on the misread string reach the whole car
+    // too. The misread differs only in its last character, so its last four
+    // characters match the alias and nothing stored as the canonical plate.
+    let tail = &alias[alias.len() - 4..];
+    for (q, mode) in [
+        (alias.as_str(), "prefix"),
+        (tail, "contains"),
+        (alias.as_str(), "fuzzy"),
+    ] {
+        let resp = app
+            .send(get_auth(
+                &format!("/plates?camera_ids={cam}&q={q}&match={mode}"),
+                &token,
+            ))
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["total"], 3, "{mode} search for {q}");
+        assert!(v["plates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["plate"] == canonical));
+    }
 
     // Stats: one entry with all three reads, whichever string is asked for.
     let v = stats(&app, &token, &[&canonical, &alias]).await;
@@ -655,4 +682,108 @@ async fn alias_list_and_suggestions_are_camera_scoped() {
     )
     .await;
     assert_eq!(sug["aliases"][0], vis_alias.as_str());
+}
+
+/// `GET /plates` on one camera with `q` and `match`, returning (total, plates).
+async fn search(
+    app: &TestApp,
+    token: &str,
+    cam: Uuid,
+    q: &str,
+    mode: &str,
+) -> (i64, Vec<serde_json::Value>) {
+    let resp = app
+        .send(get_auth(
+            &format!("/plates?camera_ids={cam}&q={q}&match={mode}"),
+            token,
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK, "{mode} search for {q}");
+    let v = body_json(resp).await;
+    (
+        v["total"].as_i64().unwrap(),
+        v["plates"].as_array().unwrap().clone(),
+    )
+}
+
+#[tokio::test]
+async fn search_matches_plate_names_and_watchlist_labels() {
+    let app = TestApp::new().await;
+    let cam = seed_camera(app.pool()).await;
+    let token = admin_token(&app).await;
+    let now = Utc::now() - Duration::seconds(5);
+
+    // A named car with one corrected misread, a watchlisted car, and a
+    // bystander with no name.
+    let chuck = fresh_plate();
+    let chuck_misread = misread_of(&chuck);
+    let watched = fresh_plate();
+    let other = fresh_plate();
+    seed_read(app.pool(), cam, &chuck, now).await;
+    seed_read(app.pool(), cam, &chuck, now - Duration::minutes(1)).await;
+    seed_read(app.pool(), cam, &chuck_misread, now - Duration::minutes(2)).await;
+    seed_read(app.pool(), cam, &watched, now - Duration::minutes(3)).await;
+    seed_read(app.pool(), cam, &other, now - Duration::minutes(4)).await;
+
+    // Names are global, so make them unique to this run.
+    let tag = &Uuid::new_v4().simple().to_string()[..6];
+    let tag2 = &Uuid::new_v4().simple().to_string()[..6];
+    let name = format!("Chuck {tag}");
+    let resp = app
+        .send(put_auth_json(
+            "/lpr/plate-labels",
+            &token,
+            &serde_json::json!({ "plate": &chuck, "label": &name }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        correct(&app, &token, &chuck_misread, &chuck).await,
+        StatusCode::CREATED
+    );
+    db::upsert_watchlist_entry(
+        app.pool(),
+        &db::UpsertWatchlistParams {
+            plate: watched.clone(),
+            label: Some(format!("Delivery van {tag2}")),
+            note: None,
+            color: None,
+            notify: false,
+            kind: "watch".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+
+    // Lowercase part of the name finds the whole car (misread included),
+    // served as the named plate, and nothing else.
+    let lower = format!("chuck%20{tag}");
+    for mode in ["contains", "fuzzy", "prefix"] {
+        let (total, reads) = search(&app, &token, cam, &lower, mode).await;
+        assert_eq!(total, 3, "{mode}");
+        assert!(reads.iter().all(|r| r["plate"] == chuck), "{mode}");
+        assert!(reads.iter().all(|r| r["display_name"] == name), "{mode}");
+    }
+    // Contains matches the middle of a name; prefix does not.
+    assert_eq!(search(&app, &token, cam, tag, "contains").await.0, 3);
+    assert_eq!(search(&app, &token, cam, tag, "prefix").await.0, 0);
+    // Exact matches the whole name in any case, not a part of it.
+    let upper = format!("CHUCK%20{}", tag.to_uppercase());
+    assert_eq!(search(&app, &token, cam, &upper, "exact").await.0, 3);
+    assert_eq!(search(&app, &token, cam, "chuck", "exact").await.0, 0);
+
+    // Watchlist labels are searchable too.
+    let (total, reads) = search(&app, &token, cam, &format!("van%20{tag2}"), "contains").await;
+    assert_eq!(total, 1);
+    assert_eq!(reads[0]["plate"], watched);
+
+    // LIKE wildcards in the search are literal: `%` and `_` match nothing
+    // here instead of every named plate.
+    assert_eq!(search(&app, &token, cam, "%25", "contains").await.0, 0);
+    assert_eq!(search(&app, &token, cam, "_", "contains").await.0, 0);
+
+    // Plate search is unchanged alongside: the bystander by its own plate.
+    let (total, reads) = search(&app, &token, cam, &other, "exact").await;
+    assert_eq!(total, 1);
+    assert_eq!(reads[0]["plate"], other);
 }

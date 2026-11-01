@@ -26,6 +26,14 @@ credential, media work can no longer queue without limit, and the recorder's
 eviction, retention, and reconcile were made safe on a full, read-only, or
 missing disk. None of that is visible on a good day, which is the point.
 
+> **macOS and iOS are not fully tested in this release.** Windows, Android,
+> the server and the web console were tested end to end. The macOS app (and
+> the iOS app, which is not distributed yet) builds and passes its automated
+> tests against 0.3.0, but has not had the same hands-on testing, and it does
+> not have most of this release's new desktop and Android features. Server
+> changes (camera order, plate corrections, searching by name) do reach it.
+> Please report anything that breaks.
+
 ### Scrubbing that keeps up
 
 - **One-second scrub previews.** The pre-generation worker now also builds a
@@ -140,6 +148,8 @@ missing disk. None of that is visible on a good day, which is the point.
 
 ### macOS
 
+- **Not fully tested in this release**, see the note at the top. Builds and
+  passes its automated tests; hands-on testing is limited.
 - **Exports download the new way.** The Mac app sends its credential in a header
   instead of the download link, which a 0.3.0 server requires. Update the Mac
   app along with the server (#625).
