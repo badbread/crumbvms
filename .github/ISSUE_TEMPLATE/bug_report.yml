@@ -57,7 +57,7 @@ body:
     attributes:
       label: Server version
       description: "Admin console footer, or `curl -s http://<server>:8080/version`, or the image tag you deployed."
-      placeholder: "0.2.0 (sha-1a2b3c4)"
+      placeholder: "0.3.0 (sha-1a2b3c4)"
     validations:
       required: true
   - type: input
@@ -65,7 +65,7 @@ body:
     attributes:
       label: Client version
       description: Version of the client you saw it in. Put "web console" if you were only in a browser (and name the browser).
-      placeholder: "Android 0.2.0, or desktop 0.2.0, or web console (Firefox 141)"
+      placeholder: "Android 0.3.0, or desktop 0.3.0, or web console (Firefox 141)"
   - type: dropdown
     id: install_method
     attributes:
