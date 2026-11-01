@@ -254,12 +254,14 @@ Five things can need action, depending on your setup:
   USER crumb WITH PASSWORD '<new>';"`), then in both `POSTGRES_PASSWORD` and
   `DATABASE_URL`, then `docker compose up -d`. An `.env` from
   `scripts/setup-env.sh` already has a generated password.
-- **Exports fail with "Permission denied".** An export volume created by an
+- **Exports failed with "Permission denied".** An export volume created by an
   earlier image is owned by root, which the api cannot write, so exports, the
-  clip cache, and scrub previews all fail (#692, fixed by #695). Fresh installs get a writable
-  volume now, and the api logs one clear error at boot when it finds the old
-  one. Fix it once with `docker compose exec -u root api chown 1001:1001
-  /exports`.
+  clip cache, and scrub previews all failed (#692, fixed by #695). Fresh installs
+  get a writable volume now, and on upgrade the old volume usually fixes itself:
+  it is empty (0.2.0 could never write to it), and Docker hands an empty volume
+  the new image's ownership. If exports still fail, or the api logs the export
+  directory error at boot, fix it once with
+  `docker compose exec -u root api chown 1001:1001 /exports`.
 - **Non-admin users managed notification channels.** That is now the
   `manage_channels` role permission, which migration 0081 adds switched off for
   every non-admin role. Grant it to the roles that should keep it. Existing
