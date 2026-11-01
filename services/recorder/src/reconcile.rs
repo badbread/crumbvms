@@ -1760,7 +1760,9 @@ impl OrphanWalk<'_> {
                 }
             }
             Err(e) => {
-                error!(path = %abs_path.display(), error = %e, "error while trying to index orphan file; skipping");
+                // `{:#}`: the full anyhow chain. The outer context alone ("looking
+                // up camera for orphan indexing") hid the real cause (#693).
+                error!(path = %abs_path.display(), error = format!("{e:#}"), "error while trying to index orphan file; skipping");
             }
         }
         true
