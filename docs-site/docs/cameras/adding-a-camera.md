@@ -15,11 +15,11 @@ through once:
 2. **Validate** the stream before adding it: the console shows a live
    thumbnail plus the detected resolution, codec, and frame rate, so you
    catch a wrong URL or bad credentials before committing.
-3. **Add**, choosing a name and, if you use them, a camera group. A new
-   camera joins the Default recording policy (or its group's policy); it
-   doesn't get a private copy. If you later change a setting just for that
-   camera, Crumb splits it onto its own named policy at that point, see
-   [Policies and groups](/recording/policies-and-groups).
+3. **Add**, choosing a name. A new camera joins the Default recording
+   policy; it doesn't get a private copy. To put it on a different policy,
+   use **+ Assign cameras** on that policy. If you later change a setting
+   just for that camera, Crumb splits it onto its own named policy at that
+   point, see [Recording policies](/recording/policies-and-groups).
 
 An ONVIF-discovered camera keeps its ONVIF identity attached, which is what
 lets you turn on PTZ control (off by default, see [ONVIF PTZ](/cameras/onvif-ptz))

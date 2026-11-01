@@ -16,7 +16,10 @@ nothing else changes.
 
 1. On the Releases page, download `CrumbVMS-windows-<version>.zip`. libmpv and
    everything else the app needs are inside it, so there's no separate file to
-   manage.
+   manage. Each release also publishes a `.zip.sha256` checksum next to it;
+   to check your download, run
+   `(Get-FileHash CrumbVMS-windows-<version>.zip -Algorithm SHA256).Hash` in
+   PowerShell and compare it with the hash in that file.
 2. Unzip it anywhere, keeping the files together: `crumb_desktop.exe` needs
    `libmpv-2.dll` and the `data/` folder next to it. Run `crumb_desktop.exe`.
    Windows SmartScreen will warn about an unrecognized app, it's unsigned during
@@ -31,8 +34,12 @@ Updating is unzipping the newer release over the top, or into a fresh folder.
 This is one of the two clients I drive every day, so it's the most complete.
 Live wall with per-camera stream quality including a Data-saver tier (a
 low-bitrate transcode, marked with an "SD" chip on the tile), timeline
-playback, clips and export, per-camera PTZ controls, the LPR license-plate
-reads tab with plate crops and watchlist search, and a Home Assistant entity
+playback with one-second scrub previews (when an admin turns on
+**Pre-generate scrub previews** on the console's Server page),
+snapshots, bookmarks, clips and export, per-camera PTZ controls, the LPR
+license-plate tab (plate crops, watchlist search, a page per plate with its
+visits and history, and, for admins, correcting a misread plate), and a Home
+Assistant entity
 overlay that paints your linked sensor and control states on top of the live
 video, and lets you operate a linked Control entity right from its badge. See
 [the client feature rundown](/clients/#what-each-client-can-do) for how this

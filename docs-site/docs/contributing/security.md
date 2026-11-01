@@ -33,10 +33,11 @@ deployment, first-run setup flow, and authentication/token model.
 
 ## What's out of scope
 
-Vulnerabilities in third-party components Crumb doesn't author, an
-embedded object-detection integration, the restreaming layer, FFmpeg, the
-native video library, PostgreSQL, and other bundled or depended-upon
-software, should be reported to their upstream projects instead. If a
+Vulnerabilities in third-party components Crumb doesn't author, such as
+Frigate (bring-your-own object detection), go2rtc (the restreaming layer),
+FFmpeg, mpv/libmpv, PostgreSQL, Eclipse Mosquitto, and other bundled or
+depended-upon software, should be reported to their upstream projects
+instead. If a
 Crumb-side change could still mitigate an upstream issue, it's still worth
 reporting here too, just note the root cause is upstream.
 

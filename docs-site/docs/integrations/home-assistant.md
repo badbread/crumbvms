@@ -143,7 +143,10 @@ segment.
 Open a camera's live view in the desktop, iOS, or Android app and a linked
 entity with a placement shows up as a badge pinned to the picture. Positions are
 stored as fractions of the video frame, not the pane, so a badge stays on the
-door as the tile changes shape. Placing a badge, dragging it into position for
+door as the tile changes shape. A quick-toggle hides all the overlays without
+unlinking anything when you just want the clean picture (on the desktop it
+covers the wall and the maximized pane, shortcut `H`; on iOS and Android it is
+on fullscreen live). Placing a badge, dragging it into position for
 the first time, is done from the desktop app's live view; once placed, it
 renders (and, for a Control link, actuates) the same way on every client. Live
 state comes from `GET /ha/states` on a short cache.
@@ -164,7 +167,7 @@ camera's Home Assistant section in the console or from the desktop app's live
 view (which also handles outline, pinned captions, and the free-drag
 positioning itself):
 
-- **Icon**, from a closed vocabulary of about 65 slugs covering contacts and
+- **Icon**, from a closed vocabulary of about 90 slugs covering contacts and
   openings, motion and presence, lighting, power and switches, climate, safety
   and alarms, cameras and media, network, vehicles and delivery, appliances,
   time, automation, and a generic fallback. Every slug maps to a real glyph on
@@ -174,6 +177,9 @@ positioning itself):
   entity's device class.
 - **Shape:** a compact **dot** or a labelled **pill**.
 - **Color** for the foreground and, on a pill, the background (`#RRGGBB`).
+  An optional **Background (on)** color replaces the background only while the
+  entity is on, so a lit light or an open door reads at a glance; left on
+  **Auto** it follows the normal background.
 - **Pill width** and **text align**, on a pill. By default a pill is **Auto**:
   it hugs its label, so a short name gets a short badge. Pick **Narrow**,
   **Medium** or **Wide** instead and the pill takes a fixed width of four, six
@@ -229,6 +235,7 @@ What each domain supports, in plain terms:
 | Locks | Lock, unlock |
 | Buttons | Press |
 | Scenes, scripts | Run |
+| Automations | Trigger |
 
 That set is intentionally narrow, only actions an operator would plausibly want
 from a camera view, and only ones whose effect is obvious from the button.

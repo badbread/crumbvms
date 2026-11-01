@@ -14,15 +14,19 @@ in reverse.
 ## Upgrading
 
 ```bash
-cd /opt/crumb/app   # or wherever your docker-compose.yml lives
+cd /path/to/crumb   # wherever you cloned the repo (your docker-compose.yml)
 
 # Back up first: migrations may run as part of the upgrade.
 scripts/backup-db.sh
+
+# Bring the compose file and bundled config up to date with the release.
+git pull
 
 # In .env, pin the version you want (the image prefix already defaults to
 # the public ghcr.io/badbread/crumbvms, so leave CRUMB_IMAGE_PREFIX alone
 # unless you run a fork on a different registry):
 #   CRUMB_VERSION=v0.3.0
+# If you never set CRUMB_VERSION you are on `latest`, and the pull is enough.
 
 docker compose pull
 docker compose up -d
@@ -50,7 +54,7 @@ images.)
 
 An in-place upgrade from the v0.2.0 published images was tested end to end, and
 so was rolling back. `.env` needs no changes: every new key is optional. The
-four new migrations applied once each on first boot, footage came through
+five new migrations applied once each on first boot, footage came through
 byte-identical, recording carried on, and devices that were signed in stayed
 signed in. Upgrade the server before the clients; a 0.3.0 desktop's "Open in
 browser" needs a 0.3.0 server.
@@ -111,8 +115,8 @@ Worth knowing, no action needed:
   Assistant iframe panel). The desktop app is unaffected.
 - **First boot can take a little longer** on a large events table while
   migrations 0082 and 0083 build their indexes.
-- **Take a database backup first**, as with
-  any upgrade.
+- **Take a database backup first** (see [Backups](/configuration/backups)), as
+  with any upgrade.
 - **Rolling back was rehearsed**: pinning `CRUMB_VERSION=v0.2.0` and
   `docker compose up -d` brought 0.2.0 up healthy on the 0.3.0 schema, serving
   the same footage. The new migrations are additive. You lose the new features,
@@ -163,9 +167,9 @@ a rehearsed procedure, so take the backup.
 Versioned images make rollback symmetrical with upgrade:
 
 ```bash
-cd /opt/crumb/app
+cd /path/to/crumb
 
-# In .env, set CRUMB_VERSION back to the previous tag, e.g. v0.1.1
+# In .env, set CRUMB_VERSION back to the previous tag, e.g. v0.2.0
 
 docker compose pull
 docker compose up -d

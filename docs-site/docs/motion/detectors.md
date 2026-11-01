@@ -19,15 +19,19 @@ whichever detector fits their scene.
   adaptive background model for scenes with more complex, gradually
   changing backgrounds.
 - **Optical flow** looks at motion vectors between frames rather than
-  static pixel differences, useful for distinguishing genuine directional
-  movement from noise.
-- **Ensemble** combines multiple detectors' judgments rather than relying
-  on one.
+  static pixel differences, so it fires only where image content actually
+  moves and ignores in-place flicker and overall brightness shifts. It is
+  heavier on CPU.
+- **Ensemble** combines Census with MOG2 (MOG2 fills in flat, textureless
+  areas where Census is blind, and a lighting check stops a sudden
+  brightness change from triggering). It is the most robust choice, at about
+  two to three times the CPU of Census alone.
 
-All detectors use a decaying-histogram adaptive threshold underneath
-(see [Tuning](/motion/tuning)) that learns each camera's normal background
-activity level over time, rather than a single fixed sensitivity number
-that has to be hand-tuned per scene and per time of day.
+In the default **Dynamic** sensitivity mode, every detector uses an adaptive
+threshold underneath (see [Tuning](/motion/tuning)) that learns each camera's
+normal background activity level over time, rather than a single fixed
+sensitivity number that has to be hand-tuned per scene and per time of day.
+**Manual** mode replaces that with a fixed floor you set yourself.
 
 ## Choosing one
 
@@ -36,4 +40,5 @@ a specific scene is giving you trouble, a lot of tree or foliage movement
 might do better with a heavier background model, and a scene where
 direction of movement matters (a driveway versus a sidewalk, say) might
 benefit from optical flow. Changing detectors is a per-camera setting, not
-a stack-wide one.
+a stack-wide one: it is the **Algorithm** choice in the camera's **Detection**
+tab in the admin console, under pixel analysis.

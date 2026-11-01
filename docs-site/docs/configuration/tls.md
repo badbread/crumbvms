@@ -27,6 +27,13 @@ authority.
 Reach it at `https://<this-host>:8443`, the same admin console and API as
 the plain HTTP port, just encrypted.
 
+If people use the HTTPS port, also set `TRUST_PROXY=1` in `.env` and restart
+the api. Without it, the api sees every HTTPS request as coming from Caddy,
+so all HTTPS users share one rate-limit and sign-in backoff bucket. The
+bundled Caddy is already trusted by default, so nothing else is needed; see
+[Environment reference](/configuration/environment-reference) for
+`TRUST_PROXY` and `TRUSTED_PROXIES`.
+
 ## The certificate warning
 
 Because the internal certificate authority isn't in your browser's trust

@@ -52,6 +52,9 @@ dialog, no naming step.
 
 A few things follow from that:
 
+- **If the camera is already alone on a policy Crumb auto-created for it**,
+  the edit just updates that policy in place. A policy you created yourself
+  is never changed by a single-camera edit; the camera is split off instead.
 - **If your edit happens to match a policy that already exists**, the
   camera joins that policy instead of minting a new one. Set a camera's
   values back to Default's values and it rejoins Default.
@@ -78,26 +81,33 @@ with the oldest footage across all five evicted first. That is the intended
 meaning of putting cameras on the same policy. If you want each camera to
 have its own budget, put it on its own policy.
 
-## Camera groups
+## Moving cameras between policies
 
-Groups still exist, but only as a bulk-assign convenience, not as
-an inheritance layer. Assigning a policy to a group writes that policy
-directly onto every member camera's own assignment. There is no
-group-level policy that members silently inherit; the group is just a
-shortcut for "set these cameras to this policy in one action."
+To put several cameras on the same policy, open the policy in the admin
+console and use **+ Assign cameras** under "Cameras on this policy". That is
+the bulk way to share one set of recording settings across cameras.
 
-Two consequences to know:
+## Camera groups (older installs)
 
-- While a camera is in a group, its per-camera recording settings are
-  **locked**. To give one camera custom settings you ungroup it first, then
-  edit it (which splits it onto its own policy as described above).
+Camera groups are a leftover from the old model. The console no longer
+creates them (the first-run wizard's group step was removed in 0.2.0), but
+groups made on an older install are still there and still work, as a
+bulk-assign shortcut only, not as an inheritance layer. Assigning a policy to
+a group writes that policy directly onto every member camera's own
+assignment. There is no group-level policy that members silently inherit.
+
+Two consequences to know if you still have groups:
+
+- A grouped camera's per-camera recording settings (the Detection tab's
+  sensitivity, floor, and pre/post-roll) cannot be split off onto their own
+  policy. Saving them shows "change the group's profile or ungroup the camera
+  first". You can still move the camera onto another policy with **+ Assign
+  cameras**.
 - Changing a group's policy re-pins every current member to the new policy
   at that moment. It is a write, not a live link.
 
-I am in the middle of retiring groups in favor of plain policy membership,
-since a policy's member list already is the group. For now they are still
-here and behave as described. Do not build a mental model around group
-inheritance; there isn't any.
+A policy that a group still points at cannot be deleted. Do not build a
+mental model around group inheritance; there isn't any.
 
 ## Per-tier retention and the absolute retention cap
 
@@ -105,9 +115,10 @@ Two different enforcement mechanisms apply, and they interact
 deliberately:
 
 - **Per-tier retention** (the live window, the archive window, and any size
-  cap) governs the normal eviction sweep. The live sweep skips footage
-  that has been moved to an archive tier; the archiver owns deleting that
-  footage once its own window has passed.
+  cap) governs the normal eviction sweep. On a policy with an archive tier,
+  footage past the live window is moved to archive rather than deleted, and
+  the archive window (if set) decides when it is deleted from there. On a
+  policy without one, footage past the live window is deleted.
 - **The absolute maximum retention cap** is a hard ceiling that overrides
   that scoping on purpose: if set, it removes footage older than the
   configured number of days regardless of whether it is live or archived.

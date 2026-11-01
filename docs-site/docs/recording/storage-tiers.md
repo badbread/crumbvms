@@ -18,7 +18,10 @@ with no archive tier at all is equally valid.
 Adding storage doesn't require a compose file edit or a restart of the
 stack's shape. Mount the new disk (or a subdirectory of an existing mount)
 under the same host media path, then add the corresponding path in the
-admin console. The path you add must live **under the media root**; if it
+admin console. (A disk mounted on the host after the containers started is
+typically not visible inside them until they restart, for example
+`docker compose restart recorder api`; a new folder on a disk they already
+see needs nothing.) The path you add must live **under the media root**; if it
 already exists it has to be a directory, and a path that doesn't exist yet
 is accepted as long as its parent is a reachable directory. The recorder
 creates the directory (and the per-camera subdirectories under it) on its
@@ -33,8 +36,11 @@ files. Sibling folders such as `/data/live` and `/data/archive` are fine.
 Once a location holds recordings its folder can no longer be edited:
 recordings are stored relative to that folder, so changing it would make them
 disappear from playback. To move footage to a different disk, add the new
-folder as a separate location and use **Change storage…** on the recording
-profile, which copies and verifies every recording before switching it over.
+folder as a separate location and use **Change live storage…** (or **Change
+archive storage…**) on the recording profile. New footage starts landing on the
+new location right away, and with "Also move existing footage" checked (the
+default) Crumb copies and verifies every existing recording in the background
+before switching it over.
 
 ## How footage moves between tiers
 

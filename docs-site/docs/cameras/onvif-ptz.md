@@ -53,7 +53,9 @@ Hit Done and the layout is saved for that camera.
 The camera needs to support ONVIF's PTZ (and, for focus/iris, imaging)
 service, Crumb needs its ONVIF credentials (normally captured automatically
 during discovery), and the "This camera has pan/tilt/zoom controls" switch
-needs to be on. A camera added purely by RTSP URL without going through
-ONVIF discovery won't have PTZ available; re-detecting it against its ONVIF
-identity (if it has one) fills in the ONVIF side without needing to re-add
-the camera from scratch, and you then flip the switch on.
+needs to be on. The person using it also needs the **PTZ control** permission
+on their role (admins always have it), plus access to that camera. A camera added purely by RTSP URL without going through
+ONVIF discovery won't have PTZ available; entering its ONVIF host and
+credentials in the camera's ONVIF / PTZ section and clicking **Re-detect
+streams** (if it speaks ONVIF at all) fills in the ONVIF side without needing
+to re-add the camera from scratch, and you then flip the switch on.

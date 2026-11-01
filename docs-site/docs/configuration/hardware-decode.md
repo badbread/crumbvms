@@ -69,7 +69,8 @@ the truth with:
 GET /config/decode-status
 ```
 
-or the admin console's motion-decoding panel, which shows the same data:
+or the **Motion decoding** panel in the admin console's **Detection & clips**
+section, which shows the same data:
 per camera, the requested backend, the active one, and a human-readable
 reason whenever they differ. `capabilities: null` means the recorder
 hasn't reported in yet (an older image, or it just hasn't booted), not

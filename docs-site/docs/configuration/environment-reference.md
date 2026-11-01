@@ -13,10 +13,10 @@ repository carries the same set with inline comments; this page is the browsable
 version of it, and the two are kept in step. Most installs never need to touch
 most of these, `setup-env.sh` fills in the values that matter for a first boot.
 
-Every key below is wired into the stock `docker-compose.yml` (the GPU keys
-ride in via their opt-in overlay files), so the workflow is uniform: set the
-key in `.env`, restart the affected container, done. No
-`docker-compose.override.yml` is needed. Where a value is also editable in
+Every key below, apart from the last table, is wired into the stock
+`docker-compose.yml` (the GPU keys ride in via their opt-in overlay files), so
+the workflow is uniform: set the key in `.env`, restart the affected container,
+done. No `docker-compose.override.yml` is needed. Where a value is also editable in
 the admin console, the console value (stored in the database) wins over the
 env default; that's flagged in the notes.
 
@@ -59,7 +59,7 @@ others are mechanical; see [Secrets](/configuration/secrets) for the list.
 
 Crumb's own go2rtc restreamer runs embedded in the recorder container. The
 values below are fallbacks: once you set the server's address in the admin
-console's Server & streaming settings, that value wins.
+console's **Server** section, that value wins.
 
 The admin console's **Crumb RTSP base** is client-facing only: it is the address
 native desktop and phone apps are told to pull from, and nothing else reads it.
@@ -319,7 +319,7 @@ It's opt-in: nothing runs until you start the `alpr` compose profile with
 `docker compose --profile alpr up -d --build crumb-alpr`. First enable LPR and
 mint an ingest token in **Admin → LPR** (Rotate ingest token), then set the
 keys below. One worker instance per camera. See
-[Integrations](/integrations/) for the full setup.
+[License plate recognition](/integrations/lpr) for the full setup.
 
 | Key | Default | Notes |
 |---|---|---|
@@ -353,3 +353,23 @@ All three are forwarded by the stock `docker-compose.yml` into both the api
 and recorder containers: set them in `.env` and restart both. The console
 path (which writes to the database) is still the supported way to configure
 Home Assistant, and the DB value wins whenever both are set.
+
+## Keys the stock compose does not forward
+
+The code reads a few more tuning keys that `docker-compose.yml` deliberately
+does not pass through, so setting them in `.env` alone does nothing. The
+defaults are right for almost every install. If support asks you to change
+one, add it under the matching service's `environment:` in a
+`docker-compose.override.yml` and recreate that container.
+
+| Key | Container | Default | Notes |
+|---|---|---|---|
+| `PLAYBACK_MAX_CONCURRENCY` | api | `8` | how many database connections multi-camera synchronized playback may hold at once, so a burst of playback requests cannot starve everything else |
+| `CLIP_GEN_MAX_CONCURRENCY` | api | `4` | how many Clips-tab clips can play at once; each playing clip runs one video encode |
+| `CLIP_CACHE_MAX_BYTES` | api | `10737418240` (10 GiB) | size budget for the on-demand clip cache under `EXPORT_DIR`; oldest clips are dropped past it, on top of the 24-hour age limit |
+| `DB_STATEMENT_TIMEOUT_MS` | api, recorder | `30000` | longest any single database query may run before it is cancelled |
+| `DB_LOCK_TIMEOUT_MS` | api, recorder | `10000` | longest a database query may wait on a lock before it gives up |
+| `ARCHIVE_TICK_SECONDS` | recorder | `60` | how often the archive scheduler checks for footage due to move to the archive tier |
+| `ARCHIVE_TICK_BUDGET_SECONDS` | recorder | `30` | how long one archive pass may spend moving footage; the rest carries over to the next pass |
+| `RECONCILE_ORPHAN_RATE_HZ` | recorder | `40` | how many untracked footage files per second the reconcile pass adds back to the index (1 to 1000), so a large adoption does not swamp the database |
+| `SKIP_RECONCILE` | recorder | off | `1` or `true` skips the background reconcile pass at recorder startup only. For ongoing maintenance use `RECONCILE_PAUSED` instead |

@@ -15,14 +15,15 @@ person to get it running," not a supported path.
 
 If you want to attempt it, build from source under `apps/desktop-flutter/` on a
 machine with the Flutter SDK, the Rust toolchain (the client keeps a Rust core
-via `flutter_rust_bridge`), and libmpv development libraries installed. See that
-directory in the repository for the current build steps.
+via `flutter_rust_bridge`), and libmpv development libraries installed. There
+are no Linux build steps written up yet, and no release workflow builds Linux,
+so expect to work it out as you go.
 
 Once built, it connects to a server the same way every other native client
 does: "Find my server" or entering `http://<server-host>:8080` by hand,
 then signing in. See [Clients overview](/clients/) for the shared
 connection steps.
 
-If all you need is live view and playback, the
-[web console](/clients/web-console) runs in any Linux browser with nothing to
-build.
+The [web console](/clients/web-console) runs in any Linux browser with nothing
+to build, but it is for administration only: it does not play live video or
+recordings. For watching video, use one of the other native clients.

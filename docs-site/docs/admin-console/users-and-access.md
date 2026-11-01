@@ -27,17 +27,23 @@ The permissions a role can grant include:
 - **Playback**: review recorded footage, not just the live view.
 - **Clips**: open the [Clips](/playback/clips) feed of detections and motion.
 - **Export**: build and download [export](/playback/export) archives.
-- **PTZ**: pan, tilt, and zoom cameras that support it.
+- **PTZ control**: pan, tilt, and zoom cameras that support it.
 - **Manage views**: create and edit saved camera layouts.
 - **View license plates**: see recognised plate reads and search the plate
   database, scoped to the role's cameras. This one is sensitive, a plate
   database is privacy-sensitive, so leave it off unless a role genuinely
   needs it.
+- **Control linked devices**: operate physical devices linked to the role's
+  cameras through [Home Assistant](/integrations/home-assistant), such as locks, garage
+  doors, lights, and sirens. Off by default; seeing a camera, or the state of
+  its linked devices, never implies being able to operate them.
 - **Manage notification destinations**: add, edit, remove and test-send
   [notification](/notifications/) destinations. Off by default: a destination
   tells the server to send alerts, with snapshot images, to a host of the
   person's choosing, so it's an operator job rather than a personal setting.
-  Seeing the destinations that already exist isn't affected.
+  A user without it still sees their own existing destinations, and those keep
+  delivering. Upgrading to 0.3.0 switched this off for every existing
+  non-admin role, so grant it again to any role that should keep it.
 - **Bookmarks**: how much [bookmark](/recording/bookmarks) access a person
   gets. Four levels: **None**; **Own** (create and see only their own);
   **View all** (see everyone's, but create and edit only their own); and

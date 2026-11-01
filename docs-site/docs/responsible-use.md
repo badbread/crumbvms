@@ -52,7 +52,9 @@ exactly this reason.
 Crumb ships an optional, opt-in license-plate reader that runs entirely on
 your own hardware (the `crumb-alpr` worker; it does no face recognition).
 It's off unless you turn it on, and even then it never sends plates or
-footage anywhere. You can also connect your own object detector. Either
+footage anywhere. Only roles you give the **View license plates**
+permission can see plate reads or search them. You can also connect your
+own object detector. Either
 way, the moment Crumb is storing and displaying named people or license
 plates, named biometric data is regulated in some places (Illinois' BIPA,
 for example, imposes consent, notice, and retention rules with real
