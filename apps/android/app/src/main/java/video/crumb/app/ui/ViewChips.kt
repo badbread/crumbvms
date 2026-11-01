@@ -2,32 +2,31 @@
 
 package video.crumb.app.ui
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.material3.FilterChip
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.unit.dp
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.unit.dp
+import androidx.compose.ui.graphics.Color
 import video.crumb.app.data.CameraView
-import video.crumb.app.ui.theme.TextSecondary
+import video.crumb.app.ui.theme.Spacing
+import video.crumb.app.ui.theme.TealAccent
 
 /**
  * The saved-view selector: "All" + one compact chip per [CameraView], horizontally
  * scrollable so any number of views fit. Shared by the Live wall and the Playback
  * wall, in two placements:
  *  - **portrait** — its own thin strip below the Live|Playback tabs.
- *  - **landscape** — inline next to the tabs in the app-bar title (separated by
- *    [InlineDivider]), because landscape height is scarce and a whole extra row is
+ *  - **landscape** — inline next to the tabs in the app-bar title (16 dp of space
+ *    between them, no divider rule), because landscape height is scarce and a whole extra row is
  *    a waste; overflow scrolls sideways within the title's remaining width.
  *
  * @param modifier sizing supplied by the caller (fillMaxWidth+padding for the strip,
@@ -46,40 +45,58 @@ fun ViewChipsRow(
      * existing caller keeps today's behavior unless it opts in to hiding it.
      */
     showAllCamerasView: Boolean = true,
+    /** Selected-chip accent: the tab colour of the screen hosting the chips (L2). */
+    accent: Color = TealAccent,
 ) {
+    val scroll = rememberScrollState()
     Row(
-        modifier = modifier.horizontalScroll(rememberScrollState()),
+        modifier = modifier
+            // Fade whichever edge has more chips beyond it, so a chip cut off at the
+            // edge reads as "scroll for more" rather than as clipped text.
+            .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+            .drawWithContent {
+                drawContent()
+                val fade = 24.dp.toPx()
+                if (scroll.canScrollForward) {
+                    drawRect(
+                        Brush.horizontalGradient(
+                            listOf(Color.Black, Color.Transparent),
+                            startX = size.width - fade,
+                            endX = size.width,
+                        ),
+                        blendMode = BlendMode.DstIn,
+                    )
+                }
+                if (scroll.canScrollBackward) {
+                    drawRect(
+                        Brush.horizontalGradient(
+                            listOf(Color.Transparent, Color.Black),
+                            startX = 0f,
+                            endX = fade,
+                        ),
+                        blendMode = BlendMode.DstIn,
+                    )
+                }
+            }
+            .horizontalScroll(scroll),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        horizontalArrangement = Arrangement.spacedBy(Spacing.s),
     ) {
         if (showAllCamerasView) {
-            FilterChip(
+            CrumbFilterChip(
                 selected = activeViewId == null,
                 onClick = { onSelect(null) },
-                label = { Text("All", style = MaterialTheme.typography.labelMedium) },
-                modifier = Modifier.height(30.dp),
+                label = "All",
+                accent = accent,
             )
         }
         views.forEach { v ->
-            FilterChip(
+            CrumbFilterChip(
                 selected = activeViewId == v.id,
                 onClick = { onSelect(v.id) },
-                label = { Text(v.name, style = MaterialTheme.typography.labelMedium) },
-                modifier = Modifier.height(30.dp),
+                label = v.name,
+                accent = accent,
             )
         }
     }
-}
-
-/** A thin vertical rule used to separate the Live|Playback tabs from the inline
- *  view chips when they share the app-bar title in landscape. */
-@Composable
-fun InlineDivider(modifier: Modifier = Modifier) {
-    Box(
-        modifier
-            .padding(horizontal = 10.dp)
-            .height(20.dp)
-            .width(1.dp)
-            .background(TextSecondary.copy(alpha = 0.4f)),
-    )
 }

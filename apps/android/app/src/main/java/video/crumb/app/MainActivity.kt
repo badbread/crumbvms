@@ -10,9 +10,6 @@ import android.os.Bundle
 import android.util.Rational
 import android.view.WindowManager
 import androidx.activity.compose.setContent
-import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -50,6 +47,10 @@ import video.crumb.app.feature.playback.PlaybackWallScreen
 import video.crumb.app.feature.plates.PlatesScreen
 import video.crumb.app.feature.tuner.MotionTunerScreen
 import video.crumb.app.ui.nav.Routes
+import video.crumb.app.ui.nav.crumbEnter
+import video.crumb.app.ui.nav.crumbExit
+import video.crumb.app.ui.nav.crumbPopEnter
+import video.crumb.app.ui.nav.crumbPopExit
 import video.crumb.app.ui.theme.CrumbTheme
 
 class MainActivity : FragmentActivity() {
@@ -242,16 +243,19 @@ private fun CrumbNavHost() {
     // do NOT auto-reopen the last fullscreen camera, so the user always sees the
     // wall first and chooses a camera from there.
 
-    // Quick cross-fade between destinations (not a slide) so switching the Live ⇄
-    // Playback tabs reads as a content swap under the shared tab row, not "opening
-    // another page". Applies app-wide for a consistent, calm feel.
+    // Fade-through between destinations (G1): the outgoing screen fades out in 90 ms,
+    // the incoming one fades in (scaling 0.92 to 1 between tabs) under the shared tab
+    // row, so switching modes reads as a content swap, not "opening another page". A
+    // wall tile opening its camera grows out of the tile instead (L6 / W6). See
+    // [video.crumb.app.ui.nav.crumbEnter]. Compose animation durations follow the
+    // system "remove animations" scale, so reduced motion is respected.
     NavHost(
         navController = navController,
         startDestination = start,
-        enterTransition = { fadeIn(animationSpec = tween(160)) },
-        exitTransition = { fadeOut(animationSpec = tween(160)) },
-        popEnterTransition = { fadeIn(animationSpec = tween(160)) },
-        popExitTransition = { fadeOut(animationSpec = tween(160)) },
+        enterTransition = { crumbEnter() },
+        exitTransition = { crumbExit() },
+        popEnterTransition = { crumbPopEnter() },
+        popExitTransition = { crumbPopExit() },
     ) {
 
         composable(Routes.LOGIN) {

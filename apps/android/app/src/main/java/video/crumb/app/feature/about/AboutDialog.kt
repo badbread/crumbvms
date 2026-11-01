@@ -2,6 +2,7 @@
 
 package video.crumb.app.feature.about
 
+import video.crumb.app.ui.dialogEntrance
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -62,6 +63,7 @@ fun AboutDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
+        modifier = Modifier.dialogEntrance(),
         confirmButton = {
             TextButton(onClick = onDismiss) { Text("Close") }
         },
