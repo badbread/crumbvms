@@ -101,7 +101,7 @@ body:
     id: crumb_version
     attributes:
       label: Crumb version you tested with
-      placeholder: "0.2.0 (sha-1a2b3c4)"
+      placeholder: "0.3.0 (sha-1a2b3c4)"
   - type: textarea
     id: how_tested
     attributes:
