@@ -30,9 +30,9 @@ where each one trips.
 
 | Platform | Status | Why |
 |---|---|---|
-| Debian or Ubuntu, bare metal or VM | **Tested** | What CI builds and what the developer runs daily. |
-| Proxmox, Debian or Ubuntu VM guest | **Tested** | A VM guest is just a Linux host. No Proxmox specific requirements. |
-| Proxmox, unprivileged LXC | Should work, not verified | Docker in LXC is routine but needs nesting turned on, and the container's user ID shift changes what `chown 1001` means. |
+| Debian or Ubuntu, bare metal | **Tested** | What the developer's production recorder runs on, day in and day out. |
+| Proxmox, unprivileged LXC | **Tested** | The project's build and test box is an unprivileged LXC (nesting and keyctl on) running Docker. Release upgrade and rollback tests record real streams there. Those tests keep footage in Docker volumes inside the container; with storage mounted from the host, mind the user ID shift below. |
+| Proxmox, Debian or Ubuntu VM guest | Should work, not verified | A VM guest is just a Linux host, with no Proxmox specific requirements, but nobody runs Crumb this way yet. |
 | Synology or QNAP, Container Manager | Untested | Storage is usually a shared folder with its own user mapping. `chown` often does not stick. |
 | Unraid | Untested | User shares (`/mnt/user`) are a FUSE layer that synthesises ownership from settings, not from the disk. |
 | Windows or macOS, Docker Desktop / WSL2 | Untested | Bind mounts cross a filesystem translation layer and do not carry Linux ownership. Apple Silicon also emulates. |

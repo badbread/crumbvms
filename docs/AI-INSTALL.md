@@ -71,11 +71,14 @@ from camera count × resolution × retention) free.
 
 ### Running on Proxmox (VM or LXC)
 
-> **Untested path.** No one has verified a Proxmox install yet. Crumb's
-> maintainer runs it on a plain Docker host, not a Proxmox guest, so the steps
-> below are "same Docker stack on a Linux host" reasoning, sound in principle
-> but not a proven runbook. If you stand it up this way, please report back (an
-> issue or a Discussions note) so it can graduate from "should work" to "tested."
+> **Partly tested.** Crumb's production recorder runs on a plain Docker host,
+> but the project's build and test box is an **unprivileged Proxmox LXC**
+> (nesting and keyctl on) running Docker, and release upgrade and rollback
+> tests record real streams there. Those tests keep footage in Docker volumes
+> inside the container, so the host mount point path (and its user ID shift,
+> below) is reasoned rather than proven, and a **VM guest** has not been run.
+> If you stand it up either way, please report back (an issue or a Discussions
+> note) so it can graduate from "should work" to "tested."
 
 CrumbVMS has no Proxmox-specific requirements, it's the same Docker Compose
 stack, and a Proxmox guest running Debian/Ubuntu is just "a Linux host." The
