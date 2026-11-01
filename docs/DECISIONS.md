@@ -111,8 +111,14 @@ Crumb they are the same vehicle (issue #673).
   - `GET /plates`: `plate` is the canonical plate; new nullable
     `corrected_from` carries the raw read when it was corrected. Every search
     mode matches the raw read OR its canonical plate, so an exact search for
-    the canonical plate (the profile's visits) returns its misreads, and a
-    search for the misread string still finds the reads. The name resolves as
+    the canonical plate (the profile's visits) returns its misreads. A
+    search that matches a known misread string returns the whole car: the
+    misread reads and the canonical plate's own reads (amended 2026-11-01,
+    #700; before, searching `GIT2` found only the reads stored as `GIT2GAB`
+    and missed the car's other sightings). The same search text, as typed,
+    also matches plate names and watchlist labels case-insensitively (ILIKE,
+    anchored like the match mode, wildcards escaped), folded onto the whole
+    car the same way. The name resolves as
     `COALESCE(label(canonical), label(raw), watchlist label(canonical),
     watchlist label(raw))`.
   - `POST /lpr/plates/stats`: a requested misread is answered under its

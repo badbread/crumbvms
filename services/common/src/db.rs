@@ -10909,15 +10909,19 @@ pub struct PlateReadQuery {
     pub start: Option<DateTime<Utc>>,
     pub end: Option<DateTime<Utc>>,
     pub plate: Option<String>,
+    /// Also match plates whose name (`plate_labels`) or watchlist label
+    /// contains this text, case-insensitively (anchored like `match_mode`).
+    /// The search text as typed, trimmed; `None` skips the name search.
+    pub name: Option<String>,
     pub match_mode: PlateMatch,
     pub limit: i64,
     pub offset: i64,
     /// Resolve operator plate corrections (`plate_aliases`, migration 0084):
     /// each read comes back with `plate` = the canonical plate it counts as
-    /// and `corrected_from` = what the engine read, a search matches either
-    /// the raw read or its canonical plate (an exact search for a canonical
-    /// plate also returns its misreads), and the name resolves on the
-    /// canonical plate. `false` returns exactly what the engines read (the A/B
+    /// and `corrected_from` = what the engine read, a search matches the raw
+    /// read, its canonical plate, or any known misread of that canonical plate
+    /// (so searching a misread string finds the whole car, not just the reads
+    /// that were misread), and the name resolves on the canonical plate. `false` returns exactly what the engines read (the A/B
     /// benchmark scores the engines on their raw output).
     pub resolve_aliases: bool,
 }
@@ -10975,6 +10979,20 @@ pub async fn list_plate_reads(pool: &Pool, q: &PlateReadQuery) -> Result<(Vec<Pl
         "plate_reads LEFT JOIN (SELECT NULL::text AS canonical_plate) pa ON false"
     };
 
+    // The ILIKE pattern for the name search, with the search's own `%`, `_`
+    // and `\` escaped so they match literally.
+    let name_pattern: Option<String> = q.name.as_deref().map(|t| {
+        let t = t
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        match q.match_mode {
+            PlateMatch::Exact => t,
+            PlateMatch::Prefix => format!("{t}%"),
+            PlateMatch::Contains | PlateMatch::Fuzzy => format!("%{t}%"),
+        }
+    });
+
     let mut conds: Vec<String> = vec!["plate_reads.camera_id = ANY($1)".to_owned()];
     let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&q.camera_ids];
     let mut n = 1;
@@ -10998,38 +11016,130 @@ pub async fn list_plate_reads(pool: &Pool, q: &PlateReadQuery) -> Result<(Vec<Pl
         q.match_mode
     };
     let mut order = "plate_reads.ts DESC".to_owned();
+    // The search matches plates (`plate_cond`) OR plate names (`name_cond`);
+    // either one alone when only one applies.
+    let mut plate_cond: Option<String> = None;
+    let mut name_cond: Option<String> = None;
     if let Some(ref plate) = q.plate {
         n += 1;
         // Every mode matches the raw read OR the canonical plate it was
         // corrected to (`pa.canonical_plate` is NULL when uncorrected or when
-        // resolution is off, so that arm is simply false).
-        match match_mode {
-            // Exact stays an index lookup on (plate, ts): the plate itself
-            // plus the strings corrected to it.
-            PlateMatch::Exact if q.resolve_aliases => conds.push(format!(
-                "plate_reads.plate = ANY(ARRAY[${n}::text] || ARRAY( \
-                   SELECT a.alias_plate FROM plate_aliases a WHERE a.canonical_plate = ${n}))"
-            )),
-            PlateMatch::Exact => conds.push(format!("plate_reads.plate = ${n}")),
-            PlateMatch::Prefix => conds.push(format!(
-                "(plate_reads.plate LIKE ${n} || '%' OR pa.canonical_plate LIKE ${n} || '%')"
-            )),
-            PlateMatch::Contains => conds.push(format!(
-                "(plate_reads.plate LIKE '%' || ${n} || '%' \
-                  OR pa.canonical_plate LIKE '%' || ${n} || '%')"
-            )),
-            PlateMatch::Fuzzy => {
-                conds.push(format!(
-                    "(plate_reads.plate % ${n} OR pa.canonical_plate % ${n})"
-                ));
-                order = format!(
-                    "GREATEST(similarity(plate_reads.plate, ${n}), \
-                              COALESCE(similarity(pa.canonical_plate, ${n}), 0)) DESC, \
-                     plate_reads.ts DESC"
-                );
+        // resolution is off, so that arm is simply false). With resolution
+        // on, a match on any known misread counts for the whole car: the
+        // read's canonical plate (`COALESCE(pa.canonical_plate,
+        // plate_reads.plate)`) is one whose alias matches, so searching a
+        // misread string finds the real plate's own reads too.
+        let alias_arm = |alias_match: String| {
+            if q.resolve_aliases {
+                format!(
+                    " OR COALESCE(pa.canonical_plate, plate_reads.plate) IN ( \
+                       SELECT a.canonical_plate FROM plate_aliases a WHERE {alias_match})"
+                )
+            } else {
+                String::new()
             }
-        }
+        };
+        plate_cond = Some(match match_mode {
+            // Exact stays an index lookup on (plate, ts): the searched
+            // string's canonical plate (itself when it is not a misread) plus
+            // every string corrected to it.
+            PlateMatch::Exact if q.resolve_aliases => {
+                let canon = format!(
+                    "COALESCE((SELECT a0.canonical_plate FROM plate_aliases a0 \
+                       WHERE a0.alias_plate = ${n}), ${n}::text)"
+                );
+                format!(
+                    "plate_reads.plate = ANY(ARRAY[{canon}] || ARRAY( \
+                       SELECT a.alias_plate FROM plate_aliases a WHERE a.canonical_plate = {canon}))"
+                )
+            }
+            PlateMatch::Exact => format!("plate_reads.plate = ${n}"),
+            PlateMatch::Prefix => format!(
+                "(plate_reads.plate LIKE ${n} || '%' OR pa.canonical_plate LIKE ${n} || '%'{})",
+                alias_arm(format!("a.alias_plate LIKE ${n} || '%'"))
+            ),
+            PlateMatch::Contains => format!(
+                "(plate_reads.plate LIKE '%' || ${n} || '%' \
+                  OR pa.canonical_plate LIKE '%' || ${n} || '%'{})",
+                alias_arm(format!("a.alias_plate LIKE '%' || ${n} || '%'"))
+            ),
+            PlateMatch::Fuzzy => format!(
+                "(plate_reads.plate % ${n} OR pa.canonical_plate % ${n}{})",
+                alias_arm(format!("a.alias_plate % ${n}"))
+            ),
+        });
         params.push(plate);
+    }
+    // Plate names (`plate_labels`) and watchlist labels: "chuck" finds the
+    // plate named "Chuck". A case-insensitive ILIKE on the label, anchored
+    // the same way as the plate match (exact = the whole name, prefix = the
+    // start, contains and fuzzy = anywhere). A named plate counts as its
+    // whole car: with resolution on, the name's plate is folded onto its
+    // canonical plate, and the canonical plate's misreads come along.
+    let named_plates = if q.resolve_aliases {
+        "SELECT COALESCE(na.canonical_plate, nl.plate) FROM ( \
+           SELECT pl.plate FROM plate_labels pl WHERE pl.label ILIKE $NAME \
+           UNION SELECT w.plate FROM lpr_watchlist w WHERE w.label ILIKE $NAME) nl \
+         LEFT JOIN plate_aliases na ON na.alias_plate = nl.plate"
+    } else {
+        "SELECT pl.plate FROM plate_labels pl WHERE pl.label ILIKE $NAME \
+         UNION SELECT w.plate FROM lpr_watchlist w WHERE w.label ILIKE $NAME"
+    };
+    let mut named_plates_sql = String::new();
+    if let Some(ref pattern) = name_pattern {
+        n += 1;
+        named_plates_sql = named_plates.replace("$NAME", &format!("${n}"));
+        name_cond = Some(if matches!(match_mode, PlateMatch::Exact) {
+            // Uncorrelated, so exact keeps its (plate, ts) index lookup.
+            if q.resolve_aliases {
+                format!(
+                    "plate_reads.plate = ANY(ARRAY({named_plates_sql}) || ARRAY( \
+                       SELECT a.alias_plate FROM plate_aliases a \
+                       WHERE a.canonical_plate IN ({named_plates_sql})))"
+                )
+            } else {
+                format!("plate_reads.plate IN ({named_plates_sql})")
+            }
+        } else {
+            format!("COALESCE(pa.canonical_plate, plate_reads.plate) IN ({named_plates_sql})")
+        });
+        params.push(pattern);
+    }
+    match (plate_cond, name_cond) {
+        (Some(p), Some(nm)) => conds.push(format!("({p} OR {nm})")),
+        (Some(p), None) => conds.push(p),
+        (None, Some(nm)) => conds.push(nm),
+        (None, None) => {}
+    }
+    if let (PlateMatch::Fuzzy, Some(_)) = (match_mode, &q.plate) {
+        // `$2`-style index of the plate parameter: the name (when present)
+        // was pushed right after it.
+        let pn = if name_pattern.is_some() { n - 1 } else { n };
+        // Closeness is the best of the read, its canonical plate and the
+        // canonical plate's known misreads; a name match ranks first.
+        let alias_sim = if q.resolve_aliases {
+            format!(
+                "COALESCE((SELECT MAX(similarity(a.alias_plate, ${pn})) \
+                   FROM plate_aliases a \
+                   WHERE a.canonical_plate = COALESCE(pa.canonical_plate, plate_reads.plate)), 0)"
+            )
+        } else {
+            "0".to_owned()
+        };
+        let name_rank = if name_pattern.is_some() {
+            format!(
+                ", CASE WHEN COALESCE(pa.canonical_plate, plate_reads.plate) \
+                   IN ({named_plates_sql}) THEN 1 ELSE 0 END"
+            )
+        } else {
+            String::new()
+        };
+        order = format!(
+            "GREATEST(similarity(plate_reads.plate, ${pn}), \
+                      COALESCE(similarity(pa.canonical_plate, ${pn}), 0), \
+                      {alias_sim}{name_rank}) DESC, \
+             plate_reads.ts DESC"
+        );
     }
     let where_clause = conds.join(" AND ");
 
@@ -17014,6 +17124,7 @@ mod tests {
                 start: None,
                 end: None,
                 plate: Some(plate.to_owned()),
+                name: None,
                 match_mode: PlateMatch::Exact,
                 limit: 10,
                 offset: 0,

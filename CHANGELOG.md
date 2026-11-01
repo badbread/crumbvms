@@ -26,6 +26,14 @@ credential, media work can no longer queue without limit, and the recorder's
 eviction, retention, and reconcile were made safe on a full, read-only, or
 missing disk. None of that is visible on a good day, which is the point.
 
+> **macOS and iOS are not fully tested in this release.** Windows, Android,
+> the server and the web console were tested end to end. The macOS app (and
+> the iOS app, which is not distributed yet) builds and passes its automated
+> tests against 0.3.0, but has not had the same hands-on testing, and it does
+> not have most of this release's new desktop and Android features. Server
+> changes (camera order, plate corrections, searching by name) do reach it.
+> Please report anything that breaks.
+
 ### Scrubbing that keeps up
 
 - **One-second scrub previews.** The pre-generation worker now also builds a
@@ -64,6 +72,10 @@ missing disk. None of that is visible on a good day, which is the point.
 - **Correct a misread plate.** When the reader gets a character wrong, you can
   now tell Crumb which plate it really was, and the read is filed under the
   right plate from then on (#675, migration 0084).
+- **Search by name.** Typing a plate's name (or a watchlist label) in the
+  search finds that car in every app, so `chuck` finds the plate you named
+  Chuck. Searching for a corrected misread finds every sighting of the real
+  plate, not just the misread ones (#700).
 - New plate stats endpoints back the profiles (#659, migration 0083).
 
 ### Exports you can hand to someone
@@ -140,6 +152,8 @@ missing disk. None of that is visible on a good day, which is the point.
 
 ### macOS
 
+- **Not fully tested in this release**, see the note at the top. Builds and
+  passes its automated tests; hands-on testing is limited.
 - **Exports download the new way.** The Mac app sends its credential in a header
   instead of the download link, which a 0.3.0 server requires. Update the Mac
   app along with the server (#625).
@@ -240,12 +254,14 @@ Five things can need action, depending on your setup:
   USER crumb WITH PASSWORD '<new>';"`), then in both `POSTGRES_PASSWORD` and
   `DATABASE_URL`, then `docker compose up -d`. An `.env` from
   `scripts/setup-env.sh` already has a generated password.
-- **Exports fail with "Permission denied".** An export volume created by an
+- **Exports failed with "Permission denied".** An export volume created by an
   earlier image is owned by root, which the api cannot write, so exports, the
-  clip cache, and scrub previews all fail (#692, fixed by #695). Fresh installs get a writable
-  volume now, and the api logs one clear error at boot when it finds the old
-  one. Fix it once with `docker compose exec -u root api chown 1001:1001
-  /exports`.
+  clip cache, and scrub previews all failed (#692, fixed by #695). Fresh installs
+  get a writable volume now, and on upgrade the old volume usually fixes itself:
+  it is empty (0.2.0 could never write to it), and Docker hands an empty volume
+  the new image's ownership. If exports still fail, or the api logs the export
+  directory error at boot, fix it once with
+  `docker compose exec -u root api chown 1001:1001 /exports`.
 - **Non-admin users managed notification channels.** That is now the
   `manage_channels` role permission, which migration 0081 adds switched off for
   every non-admin role. Grant it to the roles that should keep it. Existing
@@ -288,6 +304,7 @@ Worth knowing, no action needed:
 Every pull request merged since 0.2.0, newest first. The release integration
 (#682) landed as one merge; the pull requests it carried are listed after it.
 
+- fix(lpr): plate search matches plate names, watchlist labels and corrected misreads (#700)
 - feat: admin-set camera display order (drag to reorder in the console) (#698)
 - feat(android): hide the Playback controls in landscape (tap the video, auto-hide while playing) (#697)
 - fix(recorder): stop the boot policy shim deadlocking reconcile's camera lookup (#696)
