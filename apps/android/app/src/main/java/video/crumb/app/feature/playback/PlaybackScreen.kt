@@ -2,6 +2,27 @@
 
 package video.crumb.app.feature.playback
 
+import video.crumb.app.ui.theme.mono
+import video.crumb.app.ui.theme.Spacing
+import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.material3.AssistChipDefaults
+import androidx.compose.material3.AssistChip
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.layout.only
+import androidx.compose.foundation.layout.displayCutout
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.ExitTransition
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.heightIn
@@ -731,7 +752,7 @@ fun PlaybackScreen(
                     snackbarHostState.showSnackbar("Snapshot failed")
                 }
             } else {
-                snackbarHostState.showSnackbar("Snapshot unavailable — video not ready")
+                snackbarHostState.showSnackbar("Snapshot unavailable. Video not ready.")
             }
         }
     }
@@ -757,6 +778,34 @@ fun PlaybackScreen(
     // video) and compact the transport, giving the video the height it should have.
     val isLandscape =
         LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+
+    // Landscape: a tap on the video hides or shows the controls, and while playing
+    // they hide by themselves after a few seconds without a touch, so the video can
+    // use the full height. Portrait never hides (PlaybackChromePolicy).
+    var userHidControls by rememberSaveable { mutableStateOf(false) }
+    var lastTouchAt by remember { mutableStateOf(0L) }
+    val chromeHold = remember { ChromeHold() }
+    val hasVideo = state.currentSegment != null
+    val chromeHidden = PlaybackChromePolicy.hidden(isLandscape, userHidControls, hasVideo)
+    LaunchedEffect(isLandscape) { if (!isLandscape) userHidControls = false }
+    val autoHideArmed = PlaybackChromePolicy.autoHideArmed(
+        landscape = isLandscape,
+        hasVideo = hasVideo,
+        playing = state.playing,
+        scrubbing = state.scrubbing,
+        held = chromeHold.held || showBookmarkDialog,
+        alreadyHidden = userHidControls,
+    )
+    LaunchedEffect(autoHideArmed, lastTouchAt) {
+        if (autoHideArmed) {
+            delay(PlaybackChromePolicy.AUTO_HIDE_MS)
+            userHidControls = true
+        }
+    }
+    val toggleControls: () -> Unit = {
+        userHidControls = !userHidControls
+        lastTouchAt = System.currentTimeMillis()
+    }
 
     // ── UI ───────────────────────────────────────────────────────────────────────
     Scaffold(
@@ -959,6 +1008,7 @@ fun PlaybackScreen(
                             // Track zoom/pan so a "Current view" snapshot can crop to
                             // exactly what's on screen.
                             onTransformChange = { viewTransform = it },
+                            onTap = if (isLandscape) toggleControls else null,
                             // Hoisted so the zoom survives segment gaps (#386).
                             state = zoomState,
                         ) {
@@ -972,7 +1022,9 @@ fun PlaybackScreen(
                         // Filmstrip thumbnail overlay during scrubbing
                         // (hidden while the drag is inside the loaded segment: the
                         // live player is the preview then)
-                        if (state.scrubbing && state.scrubFrameUrl != null && !state.scrubInLoadedSegment) {
+                        FadeInWhen(
+                            visible = state.scrubbing && state.scrubFrameUrl != null && !state.scrubInLoadedSegment,
+                        ) {
                             Box(
                                 modifier = Modifier
                                     .fillMaxSize()
@@ -1006,7 +1058,10 @@ fun PlaybackScreen(
                         // filmstrip frame wherever the server has pre-generated one
                         // for the segment under the finger (see ScrubSprites.kt).
                         val spriteTile = state.scrubSprite
-                        if (state.scrubbing && spriteTile != null && !state.scrubInLoadedSegment) {
+                        FadeInWhen(
+                            visible = state.scrubbing && spriteTile != null && !state.scrubInLoadedSegment,
+                        ) {
+                            if (spriteTile == null) return@FadeInWhen
                             val painter = remember(spriteTile) { spriteTilePainter(spriteTile) }
                             Image(
                                 painter = painter,
@@ -1046,8 +1101,22 @@ fun PlaybackScreen(
                 // within THAT box and the tooltip box itself falls to the video
                 // Box's `contentAlignment = Center` — which floated the arrow dead
                 // centre over the footage. Aligning the wrapper pins it top-left.
-                if (isLandscape) {
-                    Box(modifier = Modifier.align(Alignment.TopStart).padding(2.dp)) {
+                FadeWhen(
+                    visible = isLandscape && !chromeHidden,
+                    modifier = Modifier.align(Alignment.TopStart),
+                ) {
+                    // P1/P2: the back arrow sits on the 48 dp grid inside the cutout
+                    // inset, with the camera name beside it in the letterbox (14 sp
+                    // medium at 75%). The alignment lives on a wrapper Row, NOT on the
+                    // IconButton inside HintTooltip: HintTooltip wraps its content in
+                    // its own wrap-content Box, so a `.align` on the inner button would
+                    // fall back to the video Box's centre alignment.
+                    Row(
+                        modifier = Modifier
+                            .windowInsetsPadding(WindowInsets.displayCutout.only(WindowInsetsSides.Horizontal))
+                            .padding(start = Spacing.xs, top = Spacing.xs),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
                         HintTooltip("Back to live") {
                             IconButton(onClick = onBack) {
                                 Icon(
@@ -1057,41 +1126,68 @@ fun PlaybackScreen(
                                 )
                             }
                         }
-                    }
-                }
-                // Landscape: the top app bar (which carries the camera name in
-                // portrait) is hidden, so show which camera is loaded as a small,
-                // semi-transparent label in the BOTTOM-LEFT corner of the video —
-                // minimal, never a top bar, and clear of the top-left Back arrow and
-                // the bottom transport. Portrait already names the camera in the bar.
-                if (isLandscape) {
-                    state.cameraName?.takeIf { it.isNotBlank() }?.let { name ->
-                        Text(
-                            text = name,
-                            style = MaterialTheme.typography.labelMedium,
-                            color = Color.White,
-                            maxLines = 1,
-                            modifier = Modifier
-                                .align(Alignment.BottomStart)
-                                .padding(8.dp)
-                                .background(
-                                    color = Color.Black.copy(alpha = 0.55f),
-                                    shape = RoundedCornerShape(6.dp),
-                                )
-                                .padding(horizontal = 8.dp, vertical = 4.dp),
-                        )
+                        state.cameraName?.takeIf { it.isNotBlank() }?.let { name ->
+                            Text(
+                                text = name,
+                                style = MaterialTheme.typography.labelLarge.copy(
+                                    shadow = Shadow(color = Color.Black, offset = Offset(0f, 1f), blurRadius = 4f),
+                                ),
+                                color = Color.White.copy(alpha = 0.75f),
+                                maxLines = 1,
+                                modifier = Modifier.padding(start = Spacing.xs),
+                            )
+                        }
                     }
                 }
                 // (Audio toggle: portrait → top app bar actions; landscape → inline
                 // on the transport row below, next to Snapshot/Bookmark. It is NOT
                 // floated over the video in either orientation.)
+
+                // Controls hidden: keep the time on screen, small and out of the way.
+                FadeWhen(
+                    visible = chromeHidden,
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .windowInsetsPadding(WindowInsets.displayCutout.only(WindowInsetsSides.Horizontal))
+                        .padding(Spacing.s),
+                ) {
+                    Text(
+                        text = remember(state.playheadMs / 1000) {
+                            Time.dateTime(Instant.ofEpochMilli(state.playheadMs))
+                        },
+                        style = MaterialTheme.typography.mono,
+                        color = Color.White.copy(alpha = 0.85f),
+                        modifier = Modifier
+                            .background(Color.Black.copy(alpha = 0.45f), RoundedCornerShape(6.dp))
+                            .padding(horizontal = 8.dp, vertical = 3.dp),
+                    )
+                }
             }
 
             // ── PINNED transport bar (controls + timeline) at the bottom ──────────
+            AnimatedVisibility(
+                visible = !chromeHidden,
+                enter = expandVertically(tween(200)) + fadeIn(tween(200)),
+                exit = shrinkVertically(tween(200)) + fadeOut(tween(150)),
+            ) {
+            CompositionLocalProvider(LocalChromeHold provides chromeHold) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(NavySurface),
+                    // Any touch on the bar restarts the auto-hide countdown. Observed
+                    // on the Initial pass and never consumed, so the controls still
+                    // get every event.
+                    .pointerInput(Unit) {
+                        awaitPointerEventScope {
+                            while (true) {
+                                awaitPointerEvent(PointerEventPass.Initial)
+                                lastTouchAt = System.currentTimeMillis()
+                            }
+                        }
+                    }
+                    .background(NavySurface)
+                    // G10: keep the transport clear of the display cutout in landscape.
+                    .windowInsetsPadding(WindowInsets.displayCutout.only(WindowInsetsSides.Horizontal)),
             ) {
                 // Top breathing room above the transport. Snapshot + Bookmark are no
                 // longer a separate landscape row (that made the bar too tall) — in
@@ -1180,12 +1276,19 @@ fun PlaybackScreen(
                     exportSelEndMs = state.exportSelEndMs,
                     onSetExportStart = { ts -> vm.setExportEdge(isStart = true, epochMs = ts) },
                     onSetExportEnd = { ts -> vm.setExportEdge(isStart = false, epochMs = ts) },
+                    // P5/P6: the time rides above the playhead as a mono chip and the
+                    // detection glyphs get their own 16 dp band, so the timeline is a
+                    // little taller (W5) instead of carrying a separate text line.
+                    timeChip = true,
+                    reserveMarkerBand = true,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(if (isLandscape) 40.dp else 72.dp)
-                        .padding(horizontal = 8.dp),
+                        .height(if (isLandscape) 56.dp else 88.dp)
+                        .padding(horizontal = Spacing.s),
                 )
                 Spacer(Modifier.height(if (isLandscape) 2.dp else 6.dp))
+            }
+            }
             }
         }
     }
@@ -1217,6 +1320,30 @@ fun PlaybackScreen(
             },
             onDismiss = { showBookmarkDialog = false },
         )
+    }
+}
+
+/**
+ * P7: scrub-preview overlays fade in over 100 ms. A top-level wrapper so the plain
+ * [AnimatedVisibility] overload is used (inside the screen's Column/Box scopes the
+ * scoped overloads would otherwise be picked up).
+ */
+@Composable
+private fun FadeWhen(visible: Boolean, modifier: Modifier = Modifier, content: @Composable () -> Unit) {
+    AnimatedVisibility(
+        visible = visible,
+        modifier = modifier,
+        enter = fadeIn(tween(150)),
+        exit = fadeOut(tween(150)),
+    ) {
+        content()
+    }
+}
+
+@Composable
+private fun FadeInWhen(visible: Boolean, content: @Composable () -> Unit) {
+    AnimatedVisibility(visible = visible, enter = fadeIn(tween(100)), exit = ExitTransition.None) {
+        content()
     }
 }
 
@@ -1343,10 +1470,14 @@ private fun PlaybackControls(
 ) {
     val landscape = compact
     // Landscape is vertically cramped, so the transport runs a notch smaller there.
-    val ctlSize = if (compact) 30.dp else 38.dp
-    val ctlIcon = if (compact) 18.dp else 22.dp
-    val playSize = if (compact) 38.dp else 50.dp
-    val playIcon = if (compact) 22.dp else 28.dp
+    // P3: bigger targets (IconButton still guarantees a 48 dp hit area), play is 56 dp
+    // in portrait. Siblings touch; groups are separated by Spacing.l (see GroupGap).
+    val ctlSize = if (compact) 36.dp else 44.dp
+    val ctlIcon = if (compact) 20.dp else 24.dp
+    val playSize = if (compact) 44.dp else 56.dp
+    val playIcon = if (compact) 24.dp else 28.dp
+    // Gap between control groups; a touch tighter in portrait where the bar is full.
+    val groupGap = if (compact) Spacing.l else Spacing.m
 
     // Shared launcher for the date+time "jump to" picker (Material3 date then time
     // dialog), used from the Advanced bar and from the Simple More sheet.
@@ -1373,6 +1504,8 @@ private fun PlaybackControls(
     var sheetOpen by remember { mutableStateOf(false) }
     var markMenuOpen by remember { mutableStateOf(false) }
     var switchMenuOpen by remember { mutableStateOf(false) }
+    // Keep the bar up (no auto-hide) while any of its menus, sheets or dialogs is open.
+    HoldChrome(showJump || sheetOpen || markMenuOpen || switchMenuOpen)
 
     val hasMark = onMarkIn != null || onMarkOut != null
     val markTint = if (onClearSelection != null) {
@@ -1401,7 +1534,7 @@ private fun PlaybackControls(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             SpeedChip(speed, onSetSpeed)
-            Spacer(Modifier.width(2.dp))
+            Spacer(Modifier.width(groupGap))
             if (stepPinned) {
                 SmallControl(Icons.Default.NavigateBefore, "Step back one frame", barSize, ctlIcon, onStepBack)
             }
@@ -1411,6 +1544,7 @@ private fun PlaybackControls(
             if (stepPinned) {
                 SmallControl(Icons.Default.NavigateNext, "Step forward one frame", barSize, ctlIcon, onStepFwd)
             }
+            Spacer(Modifier.width(groupGap / 2))
             LivePill(onGotoLast)
             SmallControl(Icons.Default.MoreVert, "More controls", barSize, ctlIcon) { sheetOpen = true }
         }
@@ -1510,9 +1644,9 @@ private fun PlaybackControls(
                 SmallControl(Icons.Default.FirstPage, "Go to first recording", ctlSize, ctlIcon, onGotoFirst)
                 SmallControl(Icons.Default.NavigateBefore, "Step back one frame", ctlSize, ctlIcon, onStepBack)
                 MotionJumpControl(forward = false, size = ctlSize, iconSize = ctlIcon, onClick = onPrevMotion)
-                Spacer(Modifier.width(2.dp))
+                Spacer(Modifier.width(Spacing.s))
                 PlayPauseButton(playing, playSize, playIcon, onPlayPause)
-                Spacer(Modifier.width(2.dp))
+                Spacer(Modifier.width(Spacing.s))
                 MotionJumpControl(forward = true, size = ctlSize, iconSize = ctlIcon, onClick = onNextMotion)
                 SmallControl(Icons.Default.NavigateNext, "Step forward one frame", ctlSize, ctlIcon, onStepFwd)
                 SmallControl(Icons.Default.LastPage, "Go to last recording", ctlSize, ctlIcon, onGotoLast)
@@ -1577,9 +1711,9 @@ private fun PlaybackControls(
                     SmallControl(Icons.Default.FirstPage, "Go to first recording", ctlSize, ctlIcon, onGotoFirst)
                     SmallControl(Icons.Default.NavigateBefore, "Step back one frame", ctlSize, ctlIcon, onStepBack)
                     MotionJumpControl(forward = false, size = ctlSize, iconSize = ctlIcon, onClick = onPrevMotion)
-                    Spacer(Modifier.width(2.dp))
+                    Spacer(Modifier.width(6.dp))
                     PlayPauseButton(playing, playSize, playIcon, onPlayPause)
-                    Spacer(Modifier.width(2.dp))
+                    Spacer(Modifier.width(6.dp))
                     MotionJumpControl(forward = true, size = ctlSize, iconSize = ctlIcon, onClick = onNextMotion)
                     SmallControl(Icons.Default.NavigateNext, "Step forward one frame", ctlSize, ctlIcon, onStepFwd)
                     SmallControl(Icons.Default.LastPage, "Go to last recording", ctlSize, ctlIcon, onGotoLast)
@@ -1643,17 +1777,26 @@ private fun SpeedChip(speed: Float, onSetSpeed: (Float) -> Unit) {
     Box {
         var open by remember { mutableStateOf(false) }
         HintTooltip("Playback speed") {
-            FilledTonalButton(
+            // P4: a 36 dp tonal chip with a chevron and a mono label.
+            AssistChip(
                 onClick = { open = true },
-                contentPadding = PaddingValues(start = 10.dp, end = 4.dp),
-                colors = ButtonDefaults.filledTonalButtonColors(
+                label = { Text(speedLabel(speed), style = MaterialTheme.typography.mono) },
+                trailingIcon = {
+                    Icon(
+                        Icons.Default.ArrowDropDown,
+                        contentDescription = "Pick speed",
+                        modifier = Modifier.size(18.dp),
+                    )
+                },
+                shape = MaterialTheme.shapes.small,
+                border = null,
+                colors = AssistChipDefaults.assistChipColors(
                     containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                    contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                    labelColor = MaterialTheme.colorScheme.onSurface,
+                    trailingIconContentColor = MaterialTheme.colorScheme.onSurfaceVariant,
                 ),
-            ) {
-                Text(speedLabel(speed), style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
-                Icon(Icons.Default.ArrowDropUp, contentDescription = "Pick speed", modifier = Modifier.size(18.dp))
-            }
+                modifier = Modifier.height(36.dp),
+            )
         }
         SpeedMenu(open, speed, onSetSpeed) { open = false }
     }
@@ -1661,6 +1804,7 @@ private fun SpeedChip(speed: Float, onSetSpeed: (Float) -> Unit) {
 
 @Composable
 private fun SpeedMenu(open: Boolean, speed: Float, onSetSpeed: (Float) -> Unit, onClose: () -> Unit) {
+    HoldChrome(open)
     DropdownMenu(expanded = open, onDismissRequest = onClose) {
         listOf(8f, 4f, 2f, 1f, 0.5f).forEach { s ->
             val isCurrent = s == speed
@@ -1794,12 +1938,11 @@ private fun SheetTile(
     }
 }
 
-/** Thin vertical divider between control groups on the Advanced landscape bar. */
+/** Gap between control groups on the Advanced landscape bar (no rule, P3). */
 @Composable
 private fun BarDivider() {
-    Spacer(Modifier.width(6.dp))
-    Box(Modifier.width(1.dp).height(20.dp).background(TextSecondary.copy(alpha = 0.35f)))
-    Spacer(Modifier.width(6.dp))
+    // P3: groups are separated by 16 dp of space; the thin rule is gone.
+    Spacer(Modifier.width(Spacing.l))
 }
 
 /**
@@ -1866,7 +2009,7 @@ private fun MotionJumpControl(
     HintTooltip(if (forward) "Next motion event" else "Previous motion event") {
     IconButton(
         onClick = onClick,
-        modifier = Modifier.width(size * 1.3f).height(size),
+        modifier = Modifier.width(size).height(size),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             if (!forward) {

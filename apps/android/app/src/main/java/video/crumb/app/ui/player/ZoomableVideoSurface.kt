@@ -7,7 +7,6 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -15,10 +14,12 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
@@ -27,6 +28,9 @@ import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntSize
 import kotlin.math.abs
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 private const val MIN_SCALE = 1.0f
 
@@ -131,6 +135,9 @@ fun ZoomableVideoSurface(
     inPip: Boolean = false,
     onSwipeCamera: ((Int) -> Unit)? = null,
     onTransformChange: ((ViewTransform) -> Unit)? = null,
+    // Single tap on the video (Playback uses it to show or hide its controls).
+    // Fires after the double-tap window so a double-tap (zoom reset) never toggles.
+    onTap: (() -> Unit)? = null,
     state: ZoomableSurfaceState = rememberZoomableSurfaceState(),
     content: @Composable () -> Unit,
 ) {
@@ -144,6 +151,12 @@ fun ZoomableVideoSurface(
 
     // Report transform changes (zoom/pan/reset) to the parent for snapshot cropping.
     val transformCb = rememberUpdatedState(onTransformChange)
+    // Read through State so a new lambda each recomposition doesn't restart the
+    // gesture detector (that dropped taps in progress several times a second).
+    val tapCb = rememberUpdatedState(onTap)
+    val swipeCb = rememberUpdatedState(onSwipeCamera)
+    val tapScope = rememberCoroutineScope()
+    val pendingTap = remember { arrayOfNulls<Job>(1) }
     fun report() {
         // Keep the hoisted state authoritative so a preserved zoom survives the
         // surface remounting on a segment transition. (#386)
@@ -171,17 +184,26 @@ fun ZoomableVideoSurface(
     Box(
         modifier = modifier
             .onSizeChanged { size = it }
-            .pointerInput(suppressPan, onSwipeCamera) {
+            .pointerInput(suppressPan, onSwipeCamera != null) {
                 awaitEachGesture {
                     // Per-gesture accumulators for the swipe decision.
                     var totalPan = Offset.Zero
                     var maxPointers = 0
 
-                    awaitFirstDown(requireUnconsumed = false)
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    val downAt = down.uptimeMillis
+                    // Taps are judged here, by the system touch slop, not by a
+                    // separate tap detector: this loop consumes even a finger's 1 px
+                    // jitter, which made a plain tap detector miss most real taps.
+                    var maxTravel = 0f
                     do {
                         val event = awaitPointerEvent()
                         val pressed = event.changes.count { it.pressed }
                         if (pressed > maxPointers) maxPointers = pressed
+                        event.changes.firstOrNull { it.id == down.id }?.let {
+                            val d = (it.position - down.position).getDistance()
+                            if (d > maxTravel) maxTravel = d
+                        }
 
                         val zoomChange = event.calculateZoom()
                         val panChange = event.calculatePan()
@@ -222,28 +244,49 @@ fun ZoomableVideoSurface(
                     // Gesture ended. A single-finger, dominantly-horizontal drag while
                     // fully zoomed out (and not in PTZ mode) switches cameras. Pinches
                     // (>=2 pointers) and zoomed-in pans are excluded by the guards.
-                    val cb = onSwipeCamera
+                    val cb = swipeCb.value
                     if (cb != null && maxPointers < 2 && !suppressPan &&
                         zoom <= 1.001f && size.width > 0
                     ) {
                         cameraSwipeDirection(totalPan.x, totalPan.y, size.width)?.let(cb)
                     }
+
+                    // Tap: one finger, within the touch slop, released before a
+                    // long press. A second tap inside the double-tap window resets
+                    // the zoom; otherwise the single tap fires once that window ends.
+                    val upAt = currentEvent.changes.firstOrNull()?.uptimeMillis ?: downAt
+                    val isTap = maxPointers < 2 &&
+                        maxTravel <= viewConfiguration.touchSlop &&
+                        upAt - downAt < viewConfiguration.longPressTimeoutMillis
+                    if (isTap) {
+                        val waiting = pendingTap[0]
+                        if (waiting != null && waiting.isActive) {
+                            waiting.cancel()
+                            pendingTap[0] = null
+                            zoom = 1f
+                            offset = Offset.Zero
+                            report()
+                        } else {
+                            val window = viewConfiguration.doubleTapTimeoutMillis
+                            pendingTap[0] = tapScope.launch {
+                                delay(window)
+                                pendingTap[0] = null
+                                tapCb.value?.invoke()
+                            }
+                        }
+                    }
                 }
             }
-            .pointerInput(Unit) {
-                detectTapGestures(onDoubleTap = {
-                    zoom = 1f
-                    offset = Offset.Zero
-                    report()
-                })
-            }
+            // Clip in the parent's space, before the zoom. The layer's own
+            // `clip = true` is applied after its scale, so the clip grew with the
+            // zoom and the video spilled over the page around a framed player.
+            .clipToBounds()
             .graphicsLayer {
                 scaleX = zoom
                 scaleY = zoom
                 translationX = -offset.x * zoom
                 translationY = -offset.y * zoom
                 transformOrigin = TransformOrigin(0f, 0f)
-                clip = true // keep the zoomed video inside its window, not over the UI
             },
     ) {
         content()

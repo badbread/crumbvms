@@ -2,6 +2,10 @@
 
 package video.crumb.app.feature.settings
 
+import video.crumb.app.ui.theme.Spacing
+import video.crumb.app.ui.dialogEntrance
+import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -91,32 +95,31 @@ fun SettingsDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
+        // S1: 28 dp radius (the M3 extra-large shape from the theme) and the shared
+        // scale-and-fade entry (G5).
+        modifier = Modifier.dialogEntrance(),
+        shape = MaterialTheme.shapes.extraLarge,
         confirmButton = {
             TextButton(onClick = onDismiss) { Text("Done") }
         },
-        title = { Text("Settings") },
+        title = { Text("Settings", style = MaterialTheme.typography.titleLarge) },
         text = {
             Column(
-                verticalArrangement = Arrangement.spacedBy(2.dp),
                 modifier = Modifier.verticalScroll(rememberScrollState()),
             ) {
-                Text(
-                    text = "PTZ — control style",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = TextSecondary,
-                )
-                PtzStyleRow(
+                SectionHeader("PTZ control style", first = true)
+                ChoiceRow(
                     label = "Joystick wheel",
-                    description = "A round 8-direction wheel at the bottom of the screen.",
+                    description = "A round 8-direction wheel at the bottom.",
                     selected = ptzStyle == "wheel",
                     onSelect = {
                         ptzStyle = "wheel"
                         store.ptzStyle = "wheel"
                     },
                 )
-                PtzStyleRow(
+                ChoiceRow(
                     label = "Edge arrows",
-                    description = "Up/down/left/right pinned to the edges of the camera view.",
+                    description = "Arrows pinned to the edges of the view.",
                     selected = ptzStyle == "edges",
                     onSelect = {
                         ptzStyle = "edges"
@@ -124,268 +127,83 @@ fun SettingsDialog(
                     },
                 )
 
-                // ── Live view section ────────────────────────────────────────────
-                Text(
-                    text = "Live view",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = TextSecondary,
-                    modifier = Modifier.padding(top = 12.dp),
+                SectionHeader("Live view")
+                SwitchRow(
+                    title = "Motion tuner button",
+                    description = "In the fullscreen live view. Admin only.",
+                    checked = motionTunerOn,
+                    onCheckedChange = { checked ->
+                        motionTunerOn = checked
+                        store.motionTunerEnabled = checked
+                    },
                 )
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .weight(1f)
-                            .padding(end = 8.dp),
-                    ) {
-                        Text(
-                            text = "Show motion-tuner button",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = TextPrimary,
-                        )
-                        Text(
-                            text = "Show the motion-detection tuner button in the fullscreen live view (admin).",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextSecondary,
-                        )
-                    }
-                    Switch(
-                        checked = motionTunerOn,
-                        onCheckedChange = { checked ->
-                            motionTunerOn = checked
-                            store.motionTunerEnabled = checked
-                        },
-                        colors = crumbSwitchColors(),
-                    )
-                }
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .weight(1f)
-                            .padding(end = 8.dp),
-                    ) {
-                        Text(
-                            text = "Low-bandwidth mode",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = TextPrimary,
-                        )
-                        Text(
-                            text = "Drop the live wall to ~1 fps still snapshots instead of " +
-                                "video — for weak or metered connections. Also engages on its " +
-                                "own if streams keep stalling (with a tap-to-restore banner).",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextSecondary,
-                        )
-                    }
-                    Switch(
-                        checked = lowBandwidthMode,
-                        onCheckedChange = onLowBandwidthChange,
-                        colors = crumbSwitchColors(),
-                    )
-                }
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .weight(1f)
-                            .padding(end = 8.dp),
-                    ) {
-                        Text(
-                            text = "Adaptive video quality",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = TextPrimary,
-                        )
-                        Text(
-                            text = "Protect this device's video decoder on big walls. " +
-                                "Warns before a heavy wall, and quietly steps busy tiles " +
-                                "down to snapshots if the decoder or the device gets hot, " +
-                                "restoring them once it recovers.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextSecondary,
-                        )
-                    }
-                    Switch(
-                        checked = adaptiveWallQuality,
-                        onCheckedChange = onAdaptiveWallQualityChange,
-                        colors = crumbSwitchColors(),
-                    )
-                }
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .weight(1f)
-                            .padding(end = 8.dp),
-                    ) {
-                        Text(
-                            text = "Show \"All Cameras\" quick view",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = TextPrimary,
-                        )
-                        Text(
-                            text = "Auto-build a grid of every camera as a selectable " +
-                                "default view. Turn off to have your own saved views " +
-                                "be the default instead.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextSecondary,
-                        )
-                    }
-                    Switch(
-                        checked = showAllCamerasView,
-                        onCheckedChange = onShowAllCamerasViewChange,
-                        colors = crumbSwitchColors(),
-                    )
-                }
+                SwitchRow(
+                    title = "Low bandwidth mode",
+                    description = "Stills at about 1 fps instead of video.",
+                    checked = lowBandwidthMode,
+                    onCheckedChange = onLowBandwidthChange,
+                )
+                SwitchRow(
+                    title = "Adaptive video quality",
+                    description = "Drops tiles to stills when the decoder is saturated.",
+                    checked = adaptiveWallQuality,
+                    onCheckedChange = onAdaptiveWallQualityChange,
+                )
+                SwitchRow(
+                    title = "Show \"All cameras\" view",
+                    description = "A grid of every camera in the view list.",
+                    checked = showAllCamerasView,
+                    onCheckedChange = onShowAllCamerasViewChange,
+                )
 
-                // ── Home Assistant section ────────────────────────────────────────
                 // What the entity "more-info" popup (opened from the HA sheet or an
                 // on-video badge) shows below the state. Both default on; read/written
                 // straight through to [store], and [HaMoreInfoDialog] reads the same
                 // flags when it next opens.
-                Text(
-                    text = "Home Assistant — entity popup",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = TextSecondary,
-                    modifier = Modifier.padding(top = 12.dp),
+                SectionHeader("Home Assistant popup")
+                SwitchRow(
+                    title = "Show entity type",
+                    description = "The Type row, for example Light or Garage door.",
+                    checked = haShowDeviceType,
+                    onCheckedChange = { checked ->
+                        haShowDeviceType = checked
+                        store.showHaDeviceType = checked
+                    },
                 )
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .weight(1f)
-                            .padding(end = 8.dp),
-                    ) {
-                        Text(
-                            text = "Show entity type",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = TextPrimary,
-                        )
-                        Text(
-                            text = "Show the \"Type\" row (e.g. Light, Garage door) in the " +
-                                "entity detail popup.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextSecondary,
-                        )
-                    }
-                    Switch(
-                        checked = haShowDeviceType,
-                        onCheckedChange = { checked ->
-                            haShowDeviceType = checked
-                            store.showHaDeviceType = checked
-                        },
-                        colors = crumbSwitchColors(),
-                    )
-                }
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .weight(1f)
-                            .padding(end = 8.dp),
-                    ) {
-                        Text(
-                            text = "Show entity ID",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = TextPrimary,
-                        )
-                        Text(
-                            text = "Show the raw entity_id (e.g. light.front_porch) in the " +
-                                "entity detail popup.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextSecondary,
-                        )
-                    }
-                    Switch(
-                        checked = haShowEntityId,
-                        onCheckedChange = { checked ->
-                            haShowEntityId = checked
-                            store.showHaEntityId = checked
-                        },
-                        colors = crumbSwitchColors(),
-                    )
-                }
+                SwitchRow(
+                    title = "Show entity ID",
+                    description = "The raw entity_id, for example light.front_porch.",
+                    checked = haShowEntityId,
+                    onCheckedChange = { checked ->
+                        haShowEntityId = checked
+                        store.showHaEntityId = checked
+                    },
+                )
 
-                // ── Playback section ─────────────────────────────────────────────
-                Text(
-                    text = "Playback",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = TextSecondary,
-                    modifier = Modifier.padding(top = 12.dp),
+                SectionHeader("Playback")
+                SwitchRow(
+                    title = "Show advanced playback controls",
+                    description = "Off keeps the bar simple, with the rest under More.",
+                    checked = advancedPlayback,
+                    onCheckedChange = { checked ->
+                        advancedPlayback = checked
+                        store.advancedPlaybackControls = checked
+                    },
                 )
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .weight(1f)
-                            .padding(end = 8.dp),
-                    ) {
-                        Text(
-                            text = "Show advanced playback controls",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = TextPrimary,
-                        )
-                        Text(
-                            text = "Off keeps the playback bar simple, with the rest under More.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextSecondary,
-                        )
-                    }
-                    Switch(
-                        checked = advancedPlayback,
-                        onCheckedChange = { checked ->
-                            advancedPlayback = checked
-                            store.advancedPlaybackControls = checked
-                        },
-                        colors = crumbSwitchColors(),
-                    )
-                }
-                Text(
-                    text = "Snapshot captures",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = TextSecondary,
-                    modifier = Modifier.padding(top = 12.dp),
-                )
-                PtzStyleRow(
+
+                SectionHeader("Playback snapshots")
+                ChoiceRow(
                     label = "Full frame",
-                    description = "Always save the whole camera frame, even when zoomed in.",
+                    description = "The whole frame, even when zoomed in.",
                     selected = !snapshotView,
                     onSelect = {
                         snapshotView = false
                         store.snapshotCapturesView = false
                     },
                 )
-                PtzStyleRow(
+                ChoiceRow(
                     label = "Current view (zoomed)",
-                    description = "Save just what's on screen — crop to the zoomed/panned area.",
+                    description = "Just what is on screen.",
                     selected = snapshotView,
                     onSelect = {
                         snapshotView = true
@@ -393,77 +211,106 @@ fun SettingsDialog(
                     },
                 )
 
-                // ── Security section ──────────────────────────────────────────────
-                Text(
-                    text = "Security",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = TextSecondary,
-                    modifier = Modifier.padding(top = 12.dp),
-                )
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .weight(1f)
-                            .padding(end = 8.dp),
-                    ) {
-                        Text(
-                            text = "Require biometric unlock",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = TextPrimary,
-                        )
-                        Text(
-                            text = when (biometricAvail) {
-                                BiometricAvailability.AVAILABLE ->
-                                    "Ask for your fingerprint, face, or device PIN each time the app starts."
-                                BiometricAvailability.NONE_ENROLLED ->
-                                    "Set up a fingerprint or face unlock in your device Settings to use this."
-                                else ->
-                                    "This device has no biometric hardware available."
-                            },
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextSecondary,
-                        )
-                    }
-                    Switch(
-                        checked = biometricOn,
-                        enabled = biometricAvail == BiometricAvailability.AVAILABLE && activity != null,
-                        onCheckedChange = { checked ->
-                            if (checked) {
-                                // Confirm the user can actually authenticate before
-                                // arming the lock, so we never strand them behind it.
-                                activity?.let { act ->
-                                    showBiometricPrompt(
-                                        act,
-                                        "Enable biometric unlock",
-                                        "Confirm to turn this on",
-                                    ) { ok ->
-                                        if (ok) {
-                                            biometricOn = true
-                                            store.biometricEnabled = true
-                                        }
+                SectionHeader("Security")
+                SwitchRow(
+                    title = "Require biometric unlock",
+                    description = when (biometricAvail) {
+                        BiometricAvailability.AVAILABLE ->
+                            "Fingerprint, face or PIN each time the app starts."
+                        BiometricAvailability.NONE_ENROLLED ->
+                            "Set up fingerprint or face unlock in device Settings first."
+                        else ->
+                            "No biometric hardware on this device."
+                    },
+                    checked = biometricOn,
+                    enabled = biometricAvail == BiometricAvailability.AVAILABLE && activity != null,
+                    onCheckedChange = { checked ->
+                        if (checked) {
+                            // Confirm the user can actually authenticate before
+                            // arming the lock, so we never strand them behind it.
+                            activity?.let { act ->
+                                showBiometricPrompt(
+                                    act,
+                                    "Enable biometric unlock",
+                                    "Confirm to turn this on",
+                                ) { ok ->
+                                    if (ok) {
+                                        biometricOn = true
+                                        store.biometricEnabled = true
                                     }
                                 }
-                            } else {
-                                biometricOn = false
-                                store.biometricEnabled = false
                             }
-                        },
-                        colors = crumbSwitchColors(),
-                    )
-                }
+                        } else {
+                            biometricOn = false
+                            store.biometricEnabled = false
+                        }
+                    },
+                )
             }
         },
     )
 }
 
-/** A single radio-selectable preference row: label over a one-line description. */
+/**
+ * S2: section header, 11 sp uppercase in the tab accent, 24 dp above (none for the
+ * first) and 8 dp below.
+ */
 @Composable
-private fun PtzStyleRow(
+private fun SectionHeader(text: String, first: Boolean = false) {
+    Text(
+        text = text.uppercase(),
+        style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 0.6.sp),
+        color = TealAccent,
+        modifier = Modifier.padding(top = if (first) 0.dp else Spacing.xl, bottom = Spacing.s),
+    )
+}
+
+/** S4: one-line description, 12 sp at 55%. */
+@Composable
+private fun SettingDescription(text: String) {
+    Text(
+        text = text,
+        style = MaterialTheme.typography.bodySmall,
+        color = TextPrimary.copy(alpha = 0.55f),
+    )
+}
+
+/**
+ * S3: a switch row. At least 48 dp tall, the switch vertically centred against the
+ * text block and 12 dp from it, so every switch lines up on one right edge.
+ */
+@Composable
+private fun SwitchRow(
+    title: String,
+    description: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    enabled: Boolean = true,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 48.dp)
+            .padding(vertical = Spacing.xs),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(Spacing.m),
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(text = title, style = MaterialTheme.typography.bodyMedium, color = TextPrimary)
+            SettingDescription(description)
+        }
+        Switch(
+            checked = checked,
+            enabled = enabled,
+            onCheckedChange = onCheckedChange,
+            colors = crumbSwitchColors(),
+        )
+    }
+}
+
+/** S3: a radio-selectable preference row: label over a one-line description. */
+@Composable
+private fun ChoiceRow(
     label: String,
     description: String,
     selected: Boolean,
@@ -472,26 +319,20 @@ private fun PtzStyleRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .heightIn(min = 48.dp)
             .selectable(selected = selected, onClick = onSelect, role = Role.RadioButton)
-            .padding(vertical = 6.dp),
-        verticalAlignment = Alignment.Top,
+            .padding(vertical = Spacing.xs),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(Spacing.m),
     ) {
         RadioButton(
             selected = selected,
             onClick = null, // the whole row is the click target
             colors = RadioButtonDefaults.colors(selectedColor = TealAccent),
         )
-        Column(modifier = Modifier.padding(start = 8.dp)) {
-            Text(
-                text = label,
-                style = MaterialTheme.typography.bodyMedium,
-                color = TextPrimary,
-            )
-            Text(
-                text = description,
-                style = MaterialTheme.typography.bodySmall,
-                color = TextSecondary,
-            )
+        Column(modifier = Modifier.weight(1f)) {
+            Text(text = label, style = MaterialTheme.typography.bodyMedium, color = TextPrimary)
+            SettingDescription(description)
         }
     }
 }

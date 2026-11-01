@@ -441,8 +441,16 @@ fun barFractions(values: List<Int>, minNonZero: Float = 0.06f, minZero: Float = 
     }
 }
 
-/** The caption shown when a bar is tapped, e.g. "9 am: 12 reads". */
-fun hourBarCaption(hour: Int, reads: Int): String = "${hourLabel(hour)}: ${readsLabel(reads)}"
+/**
+ * The caption shown when an hour bar is tapped, e.g. "9 am to 10 am: 12 of 176
+ * reads". The hour chart sums every day of the plate's history, so the caption
+ * names the hour as a range and the total, never reading as "12 in one hour".
+ */
+fun hourBarCaption(hour: Int, reads: Int, total: Int): String =
+    "${hourLabel(hour)} to ${hourLabel(hour + 1)}: $reads of ${readsLabel(total)}"
+
+/** The hour chart title: it covers every read, on every day, not one day. */
+fun hourChartTitle(total: Int): String = "Time of day, all ${readsLabel(total)}"
 
 /** The caption for a day bar: [daysAgo] 0 = today. */
 fun dayBarCaption(daysAgo: Int, reads: Int, nowMs: Long, zone: ZoneId = Time.zone): String {

@@ -367,8 +367,9 @@ class PlatesLogicTest {
 
     @Test
     fun `bar captions show the number`() {
-        assertEquals("9 am: 12 reads", hourBarCaption(9, 12))
-        assertEquals("6 pm: 1 read", hourBarCaption(18, 1))
+        assertEquals("9 am to 10 am: 12 of 176 reads", hourBarCaption(9, 12, 176))
+        assertEquals("11 pm to 12 am: 1 of 1 read", hourBarCaption(23, 1, 1))
+        assertEquals("Time of day, all 176 reads", hourChartTitle(176))
         val now = ms("2026-10-30T12:00:00Z")
         assertEquals("Today: 3 reads", dayBarCaption(0, 3, now, utc))
         assertEquals("Thu, Oct 29: 0 reads", dayBarCaption(1, 0, now, utc))

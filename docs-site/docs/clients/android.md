@@ -15,7 +15,9 @@ slug: /clients/android
    Store.
 3. Open the downloaded `.apk` and tap Install.
 4. Launch Crumb, then tap "Find my server" (scans your Wi-Fi network) or
-   "Enter manually" and type `http://<server-host>:8080`. Log in.
+   type the address into the **Server address** field (for example
+   `http://<server-host>:8080`). Log in. A wrong password shows under the
+   username; a server that cannot be reached shows under the address.
 
 ## What you can do here
 
@@ -32,6 +34,22 @@ both able to operate a linked Control entity directly, not just show its
 state. See
 [the client feature rundown](/clients/#what-each-client-can-do) for how this
 compares to the other clients.
+
+## Look and feel
+
+The Android app keeps one look across its screens: the same spacing, rounded
+corners and type everywhere. A few things you may notice:
+
+- Tapping a camera on the Live wall or the Playback wall opens it by growing out
+  of that tile, and Back shrinks it into place again.
+- While a wall or list loads you see grey placeholder tiles and rows instead of
+  a spinner. Lists fade in as they appear.
+- The view chips under the tabs, the Latest chip on the Playback wall, the Clips
+  type filters and the LPR filter chips are all the same chip.
+- Clip durations read as minutes and seconds (0:28), and the detection label on
+  a clip says, for example, "License plate".
+- On the Playback wall, the small hint "Tap a camera for full controls" shows
+  until you open a camera for the first time, then stays away.
 
 ## The LPR tab
 
@@ -74,6 +92,12 @@ The choice is stored on the phone, so each device can differ.
 
 Phones that had the app before this option existed start in Advanced, so nothing
 moves on update. The camera wall view in Playback is the same in both modes.
+
+In landscape, tap the video to hide the controls and give the footage the whole
+screen; tap again to bring them back. While a recording plays, the controls also
+hide by themselves after a few seconds without a touch. They stay up while paused,
+while you scrub, and while a menu is open. With the controls hidden, the time
+still shows in the corner.
 
 ## Verifying the download (optional but recommended)
 

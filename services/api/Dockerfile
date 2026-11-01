@@ -112,15 +112,20 @@ RUN ln -sf /usr/lib/jellyfin-ffmpeg/ffmpeg  /usr/local/bin/ffmpeg \
 # Copy the compiled binary from the builder stage.
 COPY --from=builder /build/target/release/crumb-api /usr/local/bin/crumb-api
 
-# Create mount points and export output directory.
+# Create mount points and export output directories.
 # Compose mounts the broad media root /data READ-ONLY (same bind as recorder).
-# /data/exports is an API-owned rw volume.
-RUN mkdir -p /data/live /data/archive /data/exports
+# /data/exports is the image's own default EXPORT_DIR; compose sets
+# EXPORT_DIR=/exports and mounts the crumb_exports named volume there. /exports
+# must exist in the image, owned by crumb: Docker seeds a NEW named volume with
+# the ownership of the directory it is mounted over, and a path missing from the
+# image gives a root-owned volume the api (uid 1001) cannot write, so every
+# export on a fresh install failed with "Permission denied" (#692).
+RUN mkdir -p /data/live /data/archive /data/exports /exports
 
 # Run as a non-root crumb user.
 RUN groupadd --gid 1001 crumb \
     && useradd --uid 1001 --gid 1001 --no-create-home crumb \
-    && chown -R crumb:crumb /data
+    && chown -R crumb:crumb /data /exports
 
 USER crumb
 

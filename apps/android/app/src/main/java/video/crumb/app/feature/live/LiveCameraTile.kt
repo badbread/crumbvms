@@ -2,6 +2,17 @@
 
 package video.crumb.app.feature.live
 
+import androidx.compose.foundation.layout.fillMaxWidth
+import video.crumb.app.ui.theme.Spacing
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.AnimatedVisibility
 import android.graphics.drawable.BitmapDrawable
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
@@ -222,9 +233,9 @@ fun LiveCameraTile(
                     .padding(bottom = 6.dp)
                     .background(
                         color = AutoShedAmber.copy(alpha = 0.85f),
-                        shape = RoundedCornerShape(4.dp),
+                        shape = CircleShape,
                     )
-                    .padding(horizontal = 5.dp, vertical = 1.dp),
+                    .padding(horizontal = 6.dp, vertical = 1.dp),
             )
         }
 
@@ -234,61 +245,85 @@ fun LiveCameraTile(
             LiveIndicator(
                 modifier = Modifier
                     .align(Alignment.TopEnd)
-                    .padding(6.dp),
+                    .padding(Spacing.s),
             )
         }
 
         // Detection / motion badge (top-left). Frigate's classified object icons
-        // (person/vehicle/animal/…, color-coded) take precedence over the generic
-        // red motion runner — the runner shows only when there's motion but no
-        // classified object.
-        if (detections.isNotEmpty() || motion) {
+        // (person/vehicle/animal/..., color-coded) take precedence over the generic
+        // red motion runner; the runner shows only when there is motion but no
+        // classified object. L7: a 20 dp pill at 72% black, at most two icons, that
+        // fades in over 150 ms and out over 200 ms. The last shown icons are held
+        // while it fades out so it does not collapse to an empty pill.
+        val badgeVisible = detections.isNotEmpty() || motion
+        var heldDetections by remember { mutableStateOf<List<String>>(emptyList()) }
+        LaunchedEffect(detections, motion) {
+            if (badgeVisible) heldDetections = detections.take(2)
+        }
+        AnimatedVisibility(
+            visible = badgeVisible,
+            enter = fadeIn(tween(150)),
+            exit = fadeOut(tween(200)),
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(Spacing.s),
+        ) {
             Row(
                 modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .padding(6.dp)
-                    .background(Color.Black.copy(alpha = 0.72f), RoundedCornerShape(4.dp))
-                    .padding(horizontal = 4.dp, vertical = 3.dp),
-                horizontalArrangement = Arrangement.spacedBy(3.dp),
+                    .height(20.dp)
+                    .background(Color.Black.copy(alpha = 0.72f), CircleShape)
+                    .padding(horizontal = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(Spacing.xs),
             ) {
-                if (detections.isNotEmpty()) {
-                    detections.forEach { key ->
+                val shownDetections = if (badgeVisible) detections.take(2) else heldDetections
+                if (shownDetections.isNotEmpty()) {
+                    shownDetections.forEach { key ->
                         Icon(
                             imageVector = detectionIconFor(key),
                             contentDescription = "Detected: $key",
                             tint = detectionColorFor(key),
-                            modifier = Modifier.size(17.dp),
+                            modifier = Modifier.size(14.dp),
                         )
                     }
                 } else {
-                    // Generic, unclassified motion → a non-human "motion sensor"
+                    // Generic, unclassified motion: a non-human "motion sensor"
                     // glyph (radiating waves), distinct from the person icon so the
                     // two never read as the same thing.
                     Icon(
                         imageVector = Icons.Default.Sensors,
                         contentDescription = "Motion (unclassified)",
                         tint = DangerRed,
-                        modifier = Modifier.size(17.dp),
+                        modifier = Modifier.size(14.dp),
                     )
                 }
             }
         }
 
-        // Camera name label (bottom-left).
+        // Camera name label (bottom-left), L3: shadowed text over a soft bottom
+        // gradient instead of a black box, so it stops fighting the camera's own
+        // burned-in text and the OSD.
+        Box(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .fillMaxHeight(0.44f)
+                .background(
+                    Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.6f))),
+                ),
+        )
         Text(
             text = camera.name,
-            style = MaterialTheme.typography.labelSmall,
+            style = MaterialTheme.typography.labelMedium.copy(
+                fontSize = 12.sp,
+                shadow = Shadow(color = Color.Black, offset = Offset(0f, 1f), blurRadius = 4f),
+            ),
             color = Color.White,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier
                 .align(Alignment.BottomStart)
-                .padding(start = 6.dp, bottom = 6.dp, end = 32.dp)
-                .background(
-                    color = Color.Black.copy(alpha = 0.55f),
-                    shape = RoundedCornerShape(4.dp),
-                )
-                .padding(horizontal = 4.dp, vertical = 2.dp),
+                .padding(start = Spacing.s, bottom = Spacing.s, end = 32.dp),
         )
         // (Per-tile playback shortcut removed — playback is reached via the
         // Playback tab. Tapping a tile opens fullscreen live.)
@@ -1224,9 +1259,12 @@ private fun TileReconnectingOverlay(modifier: Modifier = Modifier) {
 
 @Composable
 private fun LiveIndicator(modifier: Modifier = Modifier) {
+    // L7: 8 dp dot inside a 2 dp dark ring so it reads over bright frames.
     Box(
         modifier = modifier
-            .size(8.dp)
+            .size(12.dp)
+            .background(color = Color.Black.copy(alpha = 0.55f), shape = CircleShape)
+            .padding(2.dp)
             .background(color = DangerRed, shape = CircleShape),
     )
 }
