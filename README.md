@@ -50,9 +50,10 @@ are not as hammered on as the desktop and Android. Client details are in the
 
 **Investigate**
 - Frame-level scrubbable timeline, H.265 handed native to the decoder with no server transcode, and a pre-generated preview proxy so revisiting a spot is a ~1 ms cached read instead of a ~250 ms re-decode
+- **Scrubbing that keeps up with your hand.** Optional one-second preview frames show the right picture under your finger while you drag, on desktop and Android
 - Jump to the next or previous motion event, digital-zoom into a clip
 - Motion dots **and** Frigate object icons on one timeline bar, with hover hints
-- **License-plate recognition on a searchable LPR tab.** Read plates with Frigate's native LPR, with Crumb's own local engine, or run both. Filter, jump to the clip, and set a watchlist that alerts you on a sighting, with fuzzy matching that knows the OCR lookalikes (O/0, I/1, S/5) and shows you live which misreads it would accept
+- **License-plate recognition built around the car, not the read.** Read plates with Frigate's native LPR, with Crumb's own local engine, or run both. The plate desk shows today at a glance (new plates, regulars, watchlist hits), every row carries the plate's history, and a plate profile leads with the video, then its visits, time-of-day pattern and last 30 days. Name a plate and search it by name ("chuck" finds Chuck), hide the regulars, and correct a misread once so it counts as the right car everywhere. A watchlist alerts you on a sighting, with fuzzy matching that knows the OCR lookalikes (O/0, I/1, S/5)
 - Bookmarks with protected, never-auto-deleted retention
 
 **Watch**
@@ -75,7 +76,7 @@ are not as hammered on as the desktop and Android. Client details are in the
 **Control**
 - First-run wizard, generated secrets, LAN-only by default
 - Custom roles with per-camera and per-group access
-- Batch export list to MP4 or AES-256 encrypted ZIP, optional timestamp burn-in
+- Batch export list to MP4 or AES-256 encrypted ZIP, optional timestamp burn-in, readable file names and a real size estimate before you start. On Android, mark in and out right on the playback timeline and export from there
 - Clients: Windows desktop (Flutter/libmpv), macOS (native SwiftUI), Android (Compose/Media3), web admin console. macOS and iOS are built and kept current, less battle-tested for now
 
 > Crumb records and lets you investigate. Frigate detects. They compose over MQTT.
@@ -89,6 +90,7 @@ are not as hammered on as the desktop and Android. Client details are in the
 
 - **Build a live wall** the way you want it: grid, carousels, a hotspot tile that follows motion, detection tiles, clocks, and web panes, saved per device.
 - **Per-camera stream quality**: main, sub, or Data saver, individually or as a wall default.
+- **Your camera order**: drag cameras into the order you want once, in the console, and every app lists them that way.
 - **Tune motion** by drawing exclusion zones right on the live image and picking a detector, with a shadow mode to try it on real footage before flipping a camera live.
 - **Retention your way**: named recording policies, each camera assigned to one, with size caps and free-space headroom.
 - **Custom roles** with per-camera and per-group access.
@@ -124,12 +126,16 @@ seat instead of a hobby dashboard, and honestly it is where most of the work goe
 
 ## Screenshots
 
-<sub>From a current build. Plates are redacted and the LPR list uses demo data; a couple of secondary screens still lag the newest polish.</sub>
+<sub>From a current build, except the License plate screens: those are illustrated mockups of the shipped 0.3.0 screens with invented plates, so no real plates or footage are shown. A couple of secondary screens still lag the newest polish.</sub>
 
 <table>
   <tr>
-    <td width="50%"><img src=".github/media/lpr-list.png" alt="License-plate reads with crops, per-engine tags, and confidence"><br><sub><b>LPR</b>: searchable plate reads, Frigate and Crumb engine tags, watchlist (demo data shown).</sub></td>
+    <td width="50%"><img src=".github/media/lpr-plate-desk.png" alt="The desktop plate desk: tiles for today's reads, unique plates, new plates and watchlist hits, a regulars versus strangers bar, and a list of plate reads with camera frame, plate crop, name, marks such as NEW, WATCHLIST and UNUSUAL HOUR, history and a 30-day sparkline, filtered by a search for chuck"><br><sub><b>The plate desk</b>: today at a glance, regulars vs strangers, and a list that marks what is new, watched, or out of hours. Search finds plates by name too (illustrated demo data).</sub></td>
     <td width="50%"><img src=".github/media/ha-control-slider.png" alt="A Home Assistant light badge on live video opened into its control card, with On and Off buttons and a brightness slider"><br><sub><b>Home Assistant</b>: badges pinned on the live video, and controls you can actually operate, sliders and all.</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src=".github/media/lpr-plate-profile.png" alt="A desktop plate profile for 8KDW214, named Chuck: the plate crop, first and last seen, totals, actions including Correct plate, known misreads with Undo, the video clip with player controls, recent visits, a usual-arrival hint, a 30-day bar chart, per-camera counts and an hour-of-day chart"><br><sub><b>Every plate gets a profile</b>: the clip first, then its visits, when it usually shows up, and the misreads you have corrected to it (illustrated demo data).</sub></td>
+    <td width="50%"><img src=".github/media/lpr-android.png" alt="Two Android screens: the License plate tab with a search bar and two-line rows with plate crops, names and marks, and a plate profile with the video pinned on top, stats, and Visits, History and Details tabs"><br><sub><b>LPR on Android</b>: one search bar, rows that keep the crop's real shape, and a plate profile with the video pinned on top (illustrated demo data).</sub></td>
   </tr>
   <tr>
     <td width="50%"><img src=".github/media/lpr-engine-benchmark.png" alt="Engine Benchmark screen comparing Frigate and Crumb ALPR side by side, with per-engine hit rate and confidence and a list of paired vehicle passes"><br><sub><b>Race the plate readers</b>: run Frigate and Crumb's engine on one camera and watch them go head to head on your own traffic (plates redacted).</sub></td>
