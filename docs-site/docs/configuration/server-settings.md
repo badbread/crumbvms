@@ -10,8 +10,8 @@ Some of Crumb's configuration lives in the database rather than `.env`, so
 it can be changed from the admin console at any time without editing files
 or restarting containers. The clearest example is the server's streaming
 addresses: `.env` carries fallback values that let a fresh install work out
-of the box, but the moment an admin sets a value in the console's Server &
-streaming panel, that value wins.
+of the box, but the moment an admin sets a value in the console's **Server**
+section, that value wins.
 
 ## Precedence rule
 
@@ -33,24 +33,29 @@ console value falls back to the environment. This means:
 
 The most common settings an operator changes after first-run setup:
 
-- **Server**, under this section: the streaming addresses native clients use
-  to reach live RTSP and WebRTC, update checks (the same toggle that
-  overrides `UPDATE_CHECK_ENABLED`, DB wins), and scrub previews (the
-  live-editable `THUMB_PREGEN_*` / `THUMB_CACHE_*` knobs).
-- **Storage**, recording profiles, size and time caps, storage tiers, plus
-  the storage advisor's per-profile fill-rate and retention cards (see
-  [Recording & Storage](/recording/)).
-- **Motion decoding**, the requested hardware-decode backend (see
-  [Hardware decode](/configuration/hardware-decode)).
+- **Server**, under **Administer**: this server's address, the Crumb
+  restream bases native clients use to reach live RTSP and WebRTC (plus a
+  read-only badge showing whether the RTSP restream requires a password,
+  which only `GO2RTC_AUTH` changes), the bookmarks on/off switch for all
+  clients, update checks (the same toggle that overrides
+  `UPDATE_CHECK_ENABLED`, DB wins), scrub previews (the live-editable
+  `THUMB_PREGEN_*` / `THUMB_CACHE_*` knobs), and **Run setup again** to
+  reopen the first-run wizard.
+- **Recording**, recording profiles: retention, size and time caps, storage
+  tiers (see [Recording & Storage](/recording/)).
+- **Storage**, the storage locations plus the storage advisor's
+  per-profile fill-rate and retention cards.
 - **Detection & clips**, the Frigate detection integration's stream and API
-  bases, and clip generation options (see [Integrations](/integrations/)).
+  bases, the motion-decode backend (see
+  [Hardware decode](/configuration/hardware-decode)), and clip generation
+  options (see [Integrations](/integrations/)).
 - **Home Assistant**, connection settings, a global overview of every linked
   entity across all cameras, and orphaned-link detection (see
-  [Integrations](/integrations/)).
+  [Home Assistant](/integrations/home-assistant)).
 - **LPR**, license-plate recognition: the per-camera engine selection
   (none / Frigate / crumb-alpr / both), OCR-confidence floor, detection
   zones, the plate watchlist with match fuzziness, and the crumb-alpr ingest
-  token.
+  token (see [License plate recognition](/integrations/lpr)).
 - **Notifications**, channels, per-camera rules, quiet hours (see
   [Notifications](/notifications/)).
 - **Users & security**, accounts, roles, per-camera access grants (see

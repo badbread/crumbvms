@@ -20,7 +20,8 @@ clients are for, see [Clients](/clients/).
   [first-run wizard](/getting-started/first-run-wizard) runs here:
   confirming the server address, choosing storage and retention, and
   finding cameras on your network.
-- **Cameras.** Discovery, adding, editing, grouping, and stream testing.
+- **Cameras.** Discovery, adding, editing, grouping, stream testing, and
+  the order cameras are listed in on every client (drag to reorder).
   See [Cameras & Streams](/cameras/).
 - **Recording and storage.** Recording profiles (each camera is pinned to a
   named profile), size caps, storage tiers, and the storage advisor's
@@ -29,24 +30,26 @@ clients are for, see [Clients](/clients/).
 - **Motion tuning.** The motion tuner: per-camera detector choice, and
   exclusion zones drawn over a still-frame preview of the camera. See
   [Motion & Detection](/motion/).
-- **Detection and clips.** The Frigate detection integration and clip
-  options. See [Integrations](/integrations/).
+- **Detection and clips.** The Frigate detection integration, the
+  motion-decode backend (see [Hardware decode](/configuration/hardware-decode)),
+  and clip options. See [Integrations](/integrations/).
 - **Home Assistant.** A dedicated hub: the HA connection settings, an
   overview of every linked entity across all cameras with orphaned-link
   detection, and (from each camera's Connection tab) linking that camera's HA
   motion, sensor, and control entities, or using an HA sensor as a
-  recording trigger. See [Integrations](/integrations/).
+  recording trigger. See [Home Assistant](/integrations/home-assistant).
 - **LPR.** License-plate recognition: per-camera engine (none, Frigate,
   crumb-alpr, or both), an OCR-confidence floor, detection zones, and a plate
   watchlist (watch or ignore entries, with adjustable match fuzziness). The
-  optional crumb-alpr worker is Crumb's own local plate OCR.
+  optional crumb-alpr worker is Crumb's own local plate OCR. See
+  [License plate recognition](/integrations/lpr).
 - **Users and security.** Custom roles carrying both a capability set and a
   base set of cameras, plus optional extra per-camera grants on top for an
   individual user, so a limited account can be restricted to specific
   cameras, or to live view only. See
   [Users & access](/admin-console/users-and-access).
 - **Server.** The streaming address native clients use to reach live video,
-  hardware decode selection, update checks, scrub previews, and other
+  the bookmarks switch, update checks, scrub previews, and other
   console-side settings that override environment defaults. See
   [Server settings](/configuration/server-settings).
 - **Notifications.** Channels, rules, and quiet hours. See

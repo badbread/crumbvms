@@ -9,7 +9,8 @@ slug: /contributing/
 Crumb is solo-maintained and free and open source, licensed
 AGPL-3.0-or-later, forever: no paid tier, no license enforcement, no
 open-core split. Thoughtful contributions are welcome, bug fixes, tests,
-documentation, and well-scoped features alike.
+documentation, and well-scoped features alike. By contributing, you agree
+your work is contributed under that license.
 
 ## Before you start
 
@@ -51,6 +52,17 @@ Clippy warnings are treated as errors, so a clean `clippy` run is required,
 not just a green `test`. The integration tests need a Postgres instance to
 talk to; a throwaway one works fine for local runs.
 
+Changes under `apps/desktop-flutter` are also checked by CI (Flutter 3.44.6).
+From that directory:
+
+```bash
+flutter analyze --no-fatal-infos lib test
+flutter test
+```
+
+Warnings and errors fail the analyze step; info-level lints do not. Changes
+under `apps/android` additionally run `./gradlew :app:testDebugUnitTest`.
+
 ## Coding conventions
 
 - Match the surrounding code's style rather than importing a different
@@ -62,6 +74,20 @@ talk to; a throwaway one works fine for local runs.
 - If your change touches how a fresh install is stood up or configured,
   update the install runbook in the same change. This is a standing repo
   rule.
+
+## Reporting and fixing bugs
+
+The flow is the same for every part of Crumb (recorder, API, a client, docs):
+
+1. **File an issue first**, even a one-liner, using the bug report template,
+   with the `bug` label plus the relevant area label.
+2. **One bug, one branch, one pull request**, on its own `fix/<slug>` branch
+   off `main`. Don't batch unrelated fixes together.
+3. **Link the issue** by putting `Fixes #<n>` in the pull request body.
+
+A footage-threatening or won't-boot bug can skip the issue-first step and go
+straight to a `fix/` branch and an expedited pull request; file the issue
+afterward.
 
 ## AI-assisted contributions
 

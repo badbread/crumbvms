@@ -22,7 +22,9 @@ platforms:
 **Honest status.** The web console is production-ready for administration. The
 Windows desktop and Android clients are the daily-driver, most-tested paths for
 actually watching video, and they carry the newest features. macOS and iOS both
-work and are ready to try, but are rougher and lag on features. None of the
+work and are ready to try, but are rougher and lag on features, and in 0.3.0
+they were not fully tested: they build and pass their automated tests, but have
+not had the hands-on testing Windows and Android got. None of the
 native clients have a signed installer or app-store listing yet, so installing
 one means sideloading and getting past your OS's warning about an unrecognized
 app. That's expected for a self-hosted project without a release budget behind
@@ -33,7 +35,8 @@ it yet, not a sign of anything wrong with the build.
 The clients don't all do the same things yet. The Windows desktop and Android
 clients are where I build first, so they're the most complete. The macOS and
 iOS apps share one SwiftUI codebase and cover the core watch-and-review path but
-don't have the newer surfaces. The web console administers the server but plays
+don't have most of the newer surfaces, such as the redesigned license-plate
+page and one-second scrub previews. The web console administers the server but plays
 no video.
 
 | Feature | Web console | Windows desktop | Android | macOS / iOS |
@@ -42,20 +45,23 @@ no video.
 | Live view | no | yes | yes | yes |
 | Timeline playback | no | yes | yes | yes |
 | Clips & export | no | yes | yes | yes |
-| PTZ controls | no | yes | yes | no |
-| Data-saver / adaptive quality | n/a | yes (Data-saver tier, "SD" chip) | yes (Auto / Full / Data-saver) | no |
-| LPR (license-plate) reads tab | configures LPR | yes | yes | no |
+| PTZ controls | no | yes | yes | yes |
+| Data-saver / adaptive quality | n/a | yes (Data-saver tier, "SD" chip) | yes (Auto / Full / Data-saver) | yes (Auto / Full / Data saver) |
+| LPR (license-plate) reads tab | configures LPR | yes | yes | yes (older list, no plate profile) |
 | Home Assistant | configures, links & the hub | overlay + control | overlay + control | overlay + control |
-| Snapshot button | no | yes | yes (single-camera views) | no |
+| Snapshot button | no | yes | yes (single-camera views) | yes (Playback) |
 
 Notes:
 
 - **Data-saver / adaptive quality** plays a low-bitrate transcode to save
   bandwidth. On desktop it's a per-camera stream tier marked with an "SD" chip;
-  on Android the quality control is Auto / Full / Data-saver, where Auto uses
-  full quality on Wi-Fi and Data-saver on a metered connection.
+  on Android, macOS and iOS the quality control is Auto / Full / Data-saver,
+  where Auto uses full quality on Wi-Fi and Data-saver on a metered connection.
 - **LPR** reads are browsed in the desktop and Android LPR tab (plate crops,
-  watchlist search, fuzzy preview). The web console is where LPR is configured
+  watchlist search, fuzzy preview), where each plate also has its own page with
+  its visits and history, and an admin can correct a misread plate. The macOS
+  and iOS LPR tab is the older list and gallery of reads, with watchlist and
+  plate names but no plate page. The web console is where LPR is configured
   (engine, detection zones, watchlist).
 - **Home Assistant** is configured, linked, and given its own hub (a
   cross-camera link overview plus orphaned-link detection) in the web console.

@@ -31,9 +31,12 @@ hour ending at wherever you were looking, which you can then adjust.
 Rather than exporting one clip at a time, Crumb works from a list. As you review
 [clips](/playback/clips) or scrub the [timeline](/playback/scrubbing), you add the
 moments you care about to an export list, from one camera or several, across a
-whole afternoon if you need to. A single export job takes up to 50 clips. When
-the list is complete you export it in one action and Crumb produces the video
-files for you to download.
+whole afternoon if you need to. A single export job takes up to 50 clips, and
+each clip can cover at most one day (`EXPORT_MAX_RANGE_SECONDS`). When the list
+is complete you export it in one action and Crumb produces the video files for
+you to download. The desktop app
+shows an estimated size and processing time for the list before you start,
+based on the footage actually recorded in those windows.
 
 This mirrors how a professional operator assembles an evidence package: gather
 the relevant moments first, review the list, then export once.
@@ -48,6 +51,11 @@ A few switches on the export, all optional:
 - **Password-protect the download.** Set a password and Crumb wraps the export
   in an AES-256 encrypted ZIP, so it's useless to anyone who intercepts the
   file without the password. Hand the password over separately.
+
+The desktop app also lets you pick the video codec (**Copy**, the fastest, with
+no re-encode, or a re-encode to **H.264** or **H.265**, which gives smaller files
+but takes longer, H.265 most of all) and the container (MP4 or MKV). Burning in
+the timestamp always re-encodes, so it takes longer than a plain copy.
 
 ## What you get
 
@@ -81,4 +89,4 @@ the export when it's ready; if it expires before you get to it, just export the
 list again.
 
 See the [environment reference](/configuration/environment-reference) for those
-two settings. Most installs never need to change them.
+settings and the export limits. Most installs never need to change them.

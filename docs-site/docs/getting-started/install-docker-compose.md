@@ -57,10 +57,13 @@ it and the script says so, the change belongs on the server or in the mount
 options.
 
 You can point the script at the real target so it preflights that instead of
-`./_data`:
+`./_data`. Since step 1 already wrote `.env`, add `--force` to regenerate it
+(this also generates a new admin password, so note the one it prints). Only do
+this before the stack's first start, since an existing database keeps the old
+password:
 
 ```bash
-MEDIA_HOST_PATH=/mnt/your-disk/crumb-data ./scripts/setup-env.sh
+MEDIA_HOST_PATH=/mnt/your-disk/crumb-data ./scripts/setup-env.sh --force
 ```
 
 This matters because the failure is quiet: a custom path that Docker

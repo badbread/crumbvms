@@ -97,8 +97,8 @@ up:
 
 **What to check:** run the write test above from inside the container. If
 Docker in LXC fights you, particularly with NVIDIA, fall back to a VM. That
-tradeoff is covered in
-[Install with an AI agent](/getting-started/install-with-ai-agent).
+tradeoff is covered in the install runbook's Proxmox section,
+[`docs/AI-INSTALL.md`](https://github.com/badbread/crumbvms/blob/main/docs/AI-INSTALL.md).
 
 ## Synology and QNAP
 

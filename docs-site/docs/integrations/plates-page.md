@@ -39,8 +39,8 @@ history columns show a dash. Everything else works as before.
 ## The list
 
 Each row is one pass of a car (duplicate reads of the same car within a few
-seconds, including reads from both engines, are folded together; the layers
-button in the toolbar turns that off). A row shows:
+seconds, including reads from both engines, are folded together; **Merge
+duplicates** in the toolbar turns that off). A row shows:
 
 - the camera frame and the plate cut out of it,
 - the plate, its name if you gave it one, and marks such as **NEW**,
@@ -58,6 +58,12 @@ Hover over a plate crop to see a larger view of the frame with the plate
 outlined. Click a row to open the plate's profile (below); the actions menu at
 the end of the row copies the plate, names it, corrects a misread (see below),
 adds it to the watchlist, or makes a PDF report.
+
+### Hide regulars
+
+**Hide regulars** in the toolbar takes the cars you see every day off the
+list, so new and occasional plates stand out. Watchlisted plates always show,
+and the button counts how many reads it is hiding.
 
 ### Density
 
@@ -106,7 +112,11 @@ the same as in the list, and clicking a card opens the plate's profile.
 
 ## Plate profile
 
-Clicking a row or a card opens everything known about that plate:
+Clicking a row or a card opens everything known about that plate. It leads
+with the video clip of the read you opened, playing in place with Crumb's clip
+controls (scrub bar, frame step, speed, loop, mouse-wheel zoom and a bookmark
+button), and on a wide window the plate's visits sit beside the video. Below
+that:
 
 - the plate, the crop from the read you clicked, its name (admins can edit it
   with the pencil) and the watchlist star (admins can add or remove it),
@@ -118,10 +128,11 @@ Clicking a row or a card opens everything known about that plate:
   shows up (midnight at the top), and which cameras see it most,
 - its recent visits. Reads on the same camera a few minutes apart count as one
   visit, so a car sitting at the gate is one line, not ten. Click a visit to
-  play its clip (or jump to the timeline when there is no clip).
+  play its clip in the player above (or jump to the timeline when there is no
+  clip).
 
-**Play clip**, **View on timeline**, **Copy plate** and **Report** act on the
-read you opened the profile from. Press Esc or **Back to plates** to return to
+**Full-screen clip** and **View on timeline** act on the read playing in the
+profile; **Copy plate** and **Report** act on the read you opened it from. Press Esc or **Back to plates** to return to
 the list; with the profile open, `j` and `k` step to the next and previous
 plate in the list.
 

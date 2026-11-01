@@ -28,6 +28,9 @@ what the native desktop and mobile clients are for. See
 
 Console surfaces worth calling out:
 
+- **Camera order.** Cameras has a **Reorder** button: drag cameras into place
+  (or use the arrows) and save, and every client lists them in that order.
+  **Reset to name order** goes back to the default.
 - **LPR (license plates).** A dedicated section for plate recognition: enable
   it, pick the engine and confidence, draw per-camera detection zones, and
   manage the watchlist and its fuzzy-match tolerance. The plate reads themselves

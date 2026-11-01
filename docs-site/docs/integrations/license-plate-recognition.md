@@ -77,9 +77,11 @@ One worker instance reads one camera. Run several instances for several cameras.
    (`POST /config/lpr/rotate-token`). It's shown once. The token is how the
    worker authenticates; the server rejects any read when LPR is disabled.
 3. Set that camera's **Engine** to **Crumb (fast-alpr)** or **Both**.
-4. Set the worker's env in `.env`: at minimum `CRUMB_API_BASE`,
-   `LPR_INGEST_TOKEN`, `LPR_CAMERA_ID`, and `LPR_RTSP_URL` (the full table of
-   knobs and their defaults lives in `services/alpr-worker/README.md`).
+4. Set the worker's env in `.env`: at minimum `LPR_INGEST_TOKEN`,
+   `LPR_CAMERA_ID`, and `LPR_RTSP_URL` (`LPR_API_BASE`, the Crumb API address
+   the worker posts to, already defaults to the stock `http://api:8080`; the
+   full table of knobs and their defaults lives in
+   `services/alpr-worker/README.md`).
 5. Start it: `docker compose --profile alpr up -d --build crumb-alpr`.
 
 The worker polls `GET /lpr/worker-config` (ingest-token auth, not a user login)
@@ -159,11 +161,13 @@ Details tab. The
 API is `GET`/`POST /lpr/plate-aliases` and `DELETE /lpr/plate-aliases/:alias`
 (reading needs **View license plates**, changing is admin-only).
 
-## Reviewing plates on the desktop
+## Reviewing plates on the desktop and Android
 
 The desktop app's Plates tab shows today's totals, which plates are regulars
 and which are new, each plate's history, and a profile per plate. See
-[The Plates page](./plates-page.md).
+[The Plates page](./plates-page.md). The Android app's License plate tab is
+built for a phone: a search box with a filter sheet, rows that keep each crop's
+real shape, and a plate profile with the same history and time-of-day charts.
 
 ## Searching and retention
 
@@ -175,11 +179,12 @@ stored reads and crops are using (`GET /lpr/storage`).
 
 ## Print a plate report
 
-Any single sighting exports as a clean one-page PDF from the desktop client: the
+Any single sighting exports as a clean one-page PDF from the desktop or Android app: the
 plate, the sighting time (with a timezone you pick), the camera, both the full
 frame and the plate crop, and a short dossier of that plate's other recent
 sightings. If the plate is on your watchlist, the report leads with a red
-watchlist banner. It saves or shares through the normal system dialog, so you can
+watchlist banner. The desktop previews it in the app before you save it;
+Android offers Open, Save to Downloads, or Share. Either way you can
 hand a sighting to whoever needs it (an HOA, an insurer, the police) without
 screenshotting the app.
 

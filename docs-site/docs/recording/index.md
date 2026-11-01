@@ -11,9 +11,13 @@ re-encoding, and every recorded segment is indexed in Postgres, which is
 the single source of truth for what footage exists and where it lives. A
 recording's file on disk without a matching database row is treated as an
 orphan: Crumb adopts it back into the index when it can, or quarantines it
-to a `_quarantine/` folder for review rather than deleting it on sight. A
-database row pointing at a missing file is treated as dangling and removed.
-Neither state is allowed to persist silently.
+to a `_quarantine/` folder for review rather than deleting it on sight
+(quarantined files are deleted automatically after 14 days). A database row
+pointing at a missing file is treated as dangling and removed, but only on a
+disk Crumb can confirm is really mounted: if a disk looks empty because it
+failed to mount, or far more files are missing than retention explains,
+Crumb leaves the index alone and raises an alert instead. Neither state is
+allowed to persist silently.
 
 ## The two recording modes
 

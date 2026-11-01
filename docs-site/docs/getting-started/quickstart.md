@@ -34,10 +34,10 @@ sudo chown -R 1001:1001 /mnt/your-disk/crumb-data
 
 `setup-env.sh` creates the directory and *tries* the ownership change, but that only succeeds if you ran it as root, and the command in step 1 does not. It tells you when it couldn't, and prints the exact `chown` to run. It then preflights the directory for real: it names the filesystem, attempts a write there as uid 1001, and stops with a non-zero exit rather than let you continue if the answer is definitely no. On an NFS or SMB share no local `chown` helps, the fix belongs in the export or the mount options.
 
-Getting this wrong is quiet: a directory Docker auto-creates ends up root-owned, the recorder can't write, and footage is lost while live view (which touches no disk) keeps working. Set `MEDIA_HOST_PATH` before you run `setup-env.sh` and it preflights the real target instead of `./_data`:
+Getting this wrong is quiet: a directory Docker auto-creates ends up root-owned, the recorder can't write, and footage is lost while live view (which touches no disk) keeps working. Set `MEDIA_HOST_PATH` when you run `setup-env.sh` and it preflights the real target instead of `./_data`. If you already ran step 1, add `--force` (this regenerates `.env`, including a new admin password, so note the new one it prints). Only do this before the stack's first start, since an existing database keeps the old password:
 
 ```bash
-MEDIA_HOST_PATH=/mnt/your-disk/crumb-data ./scripts/setup-env.sh
+MEDIA_HOST_PATH=/mnt/your-disk/crumb-data ./scripts/setup-env.sh --force
 ```
 
 ## 3. Bring up the stack

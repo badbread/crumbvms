@@ -37,8 +37,9 @@ first, so "show me what happened" is one place to look.
 Click a clip to play it. From there you can jump straight to that moment on the
 full [timeline](/playback/scrubbing) if you want the surrounding context, or move
 to the next clip to keep scanning. A clip you want to keep can be
-[bookmarked](/recording/bookmarks) so it's protected from automatic cleanup, or
-[exported](/playback/export) to save or share.
+[bookmarked](/recording/bookmarks) with protection, which holds it back from
+automatic cleanup for up to 30 days, or [exported](/playback/export) to save or
+share for good.
 
 ## Filtering the feed
 

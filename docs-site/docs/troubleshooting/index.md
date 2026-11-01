@@ -21,6 +21,15 @@ because it was hand-edited or copied from `.env.example` without filling
 them in. Re-run `scripts/setup-env.sh` rather than inventing values; the
 compose file deliberately has no insecure fallback for these two.
 
+**The `api` container keeps restarting, and its log says a secret is a
+"placeholder".** `.env` still holds an example value such as
+`change-me` for `JWT_SECRET`, `GO2RTC_PASS`, or the password inside
+`DATABASE_URL`. The api refuses to start on these rather than run with a
+guessable credential. On a fresh install, re-run `scripts/setup-env.sh
+--force`. On an install that already has data, change the database password
+in Postgres first, then in `.env`; the
+[upgrade notes](/getting-started/upgrade-and-rollback) have the exact steps.
+
 **`docker compose pull` errors with "not found," "denied," or a 403** on
 the `ghcr.io/badbread/crumbvms/...` images. Images aren't published for the
 repository or fork you're running yet. Use the build-from-source override
@@ -64,6 +73,16 @@ from prebuilt images and only copying what looks necessary.
 **`/health` stays `503`.** Give Postgres a moment to finish starting and
 the migrations to run; check `docker compose logs postgres` if it doesn't
 clear within a minute or two.
+
+**Exports, clips, or scrub previews fail with "Permission denied".** The
+api's export volume is owned by root, which the api (uid 1001) cannot write.
+The api says so at boot (`EXPORT_DIR is not writable` in
+`docker compose logs api`). Current images create a writable volume, but one
+left over from an older install can still be root-owned. Fix it once with:
+
+```bash
+docker compose exec -u root api chown 1001:1001 /exports
+```
 
 **GPU not found for motion decode.** Drop the GPU overlay and run on CPU
 (`MOTION_HWACCEL=cpu`, the default); recording itself never needed the GPU in the

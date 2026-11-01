@@ -107,9 +107,10 @@ and publishes each camera over RTSP as:
 - `rtsp://<crumb-host>:18554/<name>_sub` for the sub stream,
 
 where `<name>` is the camera's go2rtc name from the admin camera editor. These
-streams are authenticated the same way Crumb's own native clients connect; see
-[Server settings](/configuration/server-settings) for the exact address and
-credentials to use.
+streams are authenticated by default with the restream username and password
+from your `.env` (`GO2RTC_USER` / `GO2RTC_PASS`, generated at install); see the
+[Environment reference](/configuration/environment-reference) for those keys
+and the optional `GO2RTC_AUTH=off` open-restream mode.
 
 Point Frigate at those URLs instead of the camera's own address. Use the sub
 stream for Frigate's `detect` role, since a lower resolution is enough for
@@ -197,17 +198,24 @@ but nothing shows up in Crumb's Plates tab, that's the first thing to check. See
 ## Setup
 
 1. Point Crumb at the MQTT broker your detector publishes to (the
-   `FRIGATE_MQTT_URL` environment variable, or the equivalent admin
-   console setting). Use a plaintext `mqtt://` address: Crumb's MQTT
-   client is built without a TLS transport, so an `mqtts://` URL is
-   rejected with a clear error rather than quietly connected in the
-   clear. Keep the broker on a trusted LAN.
-2. For each camera, set its detector-side camera name in the admin
-   camera editor, so Crumb can map incoming events to the right camera.
+   `FRIGATE_MQTT_URL` environment variable, or the **Broker URL** field in
+   the console's Frigate panel, which also has a **Test connection**
+   button), and tick **Enable Frigate detections**. Use a plaintext
+   `mqtt://` address: Crumb's MQTT client is built without a TLS
+   transport, so an `mqtts://` URL is rejected with a clear error rather
+   than quietly connected in the clear. Keep the broker on a trusted LAN.
+   Saving applies within about 15 seconds, no restart needed.
+2. For each camera, set its **Frigate camera name** (camera editor, Info
+   tab) to the camera's name in your Frigate config, so Crumb can map
+   incoming events to the right camera.
 3. Optionally point Crumb at the detector's HTTP API base as well, for
-   snapshot proxying and a startup backfill of recent events. The admin
-   console's Frigate settings panel includes a test button that checks
-   both bases before you save.
+   snapshot proxying and a backfill of recent events (24 hours by
+   default) when Crumb connects. It lives under **Frigate stream
+   addresses**, whose **Test URL bases** button checks both bases from
+   the server before you save.
+4. Optionally let Frigate's detections trigger recording on a camera, in
+   place of or alongside pixel motion; see
+   [Motion sources](/motion/frigate-as-source).
 
 Those two addresses are different services and are not interchangeable. The
 **go2rtc API (:1984)** base is only used to pull live video for cameras served
@@ -215,9 +223,9 @@ by Frigate; the **HTTP API (:5000)** base is what fetches event snapshots and
 backfills events. Setting one never fills in the other, so if snapshots are
 missing while detections arrive fine, the HTTP API base is the field to check.
 
-When the MQTT URL is left unset, the entire detection subsystem stays
-disabled: no background task runs, and the events surface simply returns
-empty results. The behavior of pixel motion detection, recording, and
+When the MQTT URL is left unset (or the integration is not enabled), the
+Frigate detection subsystem stays disabled: no broker connection or
+background task runs, and the events surface simply returns empty results. The behavior of pixel motion detection, recording, and
 everything else is completely unaffected either way.
 
 ## What you're responsible for

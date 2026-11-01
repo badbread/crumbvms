@@ -18,9 +18,11 @@ confirm it delivers before relying on it.
 
 Adding, editing, removing and test-sending a destination is limited to
 administrators and to roles granted the **Manage notification destinations**
-permission, which the console's role editor exposes and which is off by default.
-Everyone else still sees the destinations that exist, and destinations that are
-already set up keep delivering either way. A destination has to be an ordinary
+permission, which the console's role editor exposes and which is off by default
+(upgrading to 0.3.0 switched it off for every existing non-admin role, so grant it
+again to any role that should keep managing destinations). Administrators see
+every destination; other users see only their own. Destinations that are already
+set up keep delivering either way. A destination has to be an ordinary
 `http`/`https` address; a role with the permission cannot point one back at the
 Crumb server itself, though an administrator can. Addresses on your own LAN are
 fine, which is what a self-hosted ntfy or Home Assistant needs.
@@ -61,10 +63,14 @@ much as they do for the underlying detector, see
 
 Separately from per-camera motion notifications, a set of system-health
 alerts is mostly on by default and rule-based: a recorder that's stopped
-heartbeating, a camera that's stopped writing new footage, low disk space,
-a stale or failed database backup, or a disconnected object-detection
-integration. These fire to your configured channels the same way motion
-notifications do.
+heartbeating, a camera that's offline or recording nothing, a camera stream
+the restreamer refused, footage deleted before its retention was up, low disk
+space, storage that can't be written, a recording profile over its size cap,
+a stale or failed database backup, a disconnected Frigate/MQTT integration,
+and a license-plate watchlist hit. An "update available" alert also exists
+but is off by default. Each one can be switched on or off, and footage-loss
+alerts break through quiet hours by default. These fire to your configured
+channels the same way motion notifications do.
 
 **One limitation worth knowing:** the alerting engine runs inside the API
 process itself, so it can report problems with the recorder, a camera, or
@@ -79,3 +85,10 @@ Before a deliberate restart or planned maintenance, arming a maintenance
 window suppresses health alerts (they're still recorded, just not
 dispatched) for the duration, so a normal, expected restart doesn't page
 anyone for the brief gap while streams reconnect.
+
+There is no console button for this yet. An administrator arms one through
+the API with `POST /config/maintenance` and a body of `{"minutes": 15}` (up to
+1440, a full day; `0` ends the window early), and `GET /config/maintenance`
+shows whether one is active. To arm a window from the moment the api starts,
+set `MAINTENANCE_UNTIL` in `.env` to a Unix timestamp (see
+[Environment reference](/configuration/environment-reference#alerting)).

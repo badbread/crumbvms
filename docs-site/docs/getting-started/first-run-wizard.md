@@ -125,12 +125,14 @@ CPU and Auto are both fine defaults, skipping this step is normal. See
 
 Add one destination (ntfy, Pushover, or a generic webhook) with a save and
 test-send button. The full set of options, per-camera rules, quiet hours,
-and additional channels, live in Settings afterward.
+and more channel types (Discord, Slack, Telegram), live in the console's
+**Notifications** section afterward.
 
 ## 10. Additional users (optional)
 
 Add more accounts inline: username, password, and role. Fine-grained
-per-camera access control lives in Settings → Users & security afterward.
+per-camera access control lives in the console's **Users & security**
+section afterward.
 
 ## Done
 
@@ -140,4 +142,4 @@ depends on completing them during first run.
 
 If you close the tab partway through, reopening `/admin` drops you back on
 the step you left off. You can also re-run the whole guided setup any time
-from **Server** in the console.
+with **Run setup again** on the console's **Server** page.

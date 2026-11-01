@@ -99,6 +99,14 @@ hide by themselves after a few seconds without a touch. They stay up while pause
 while you scrub, and while a menu is open. With the controls hidden, the time
 still shows in the corner.
 
+## Locking the app
+
+**Settings > Security > Require biometric unlock** asks for your fingerprint,
+face or PIN each time the app starts. It is off by default, and needs a
+fingerprint or face unlock already set up on the phone. Separately, the app
+hides camera content in the recent-apps switcher, so a glance at your open apps
+does not show your cameras.
+
 ## Verifying the download (optional but recommended)
 
 The APK is signed with the project's release keystore in CI, but it isn't

@@ -14,7 +14,8 @@ path yet. Apple doesn't allow sideloading a build onto someone else's
 iPhone the way Android does; the only route to alpha testers is
 TestFlight, which requires the paid Apple Developer Program that hasn't
 been set up yet. Until then, iOS is "works on the maintainer's phone," not
-something you can install.
+something you can install. It was also not fully tested against 0.3.0: it
+builds and passes its automated tests, but has not had hands-on testing.
 
 Once TestFlight is set up, this becomes: install the TestFlight app from
 the App Store, open your invite, tap Install, then point the app at your
@@ -25,9 +26,12 @@ handles updates automatically from there.
 
 Because it shares the macOS SwiftUI codebase, the feature set matches the Apple
 desktop app: live view, timeline playback, clips, export, bookmarks, motion
-tuning, and Home Assistant, on-video badges plus tap-to-actuate control for a
-linked Control entity. The newer surfaces I've built on the Windows desktop and
-Android clients are not in the Apple app yet: no LPR license-plate tab, and no
-Data-saver quality tier. See
+tuning, PTZ, an Auto / Full / Data saver quality control, an LPR tab (a list or
+gallery of plate reads with watchlist and plate names), and Home Assistant,
+on-video badges plus tap-to-actuate control for a linked Control entity. The
+newer surfaces I've built on the Windows desktop and Android clients are not in
+the Apple app yet, for example the redesigned license-plate page (a page per
+plate with its history, and correcting a misread) and one-second scrub
+previews. See
 [the client feature rundown](/clients/#what-each-client-can-do) for the full
 comparison.

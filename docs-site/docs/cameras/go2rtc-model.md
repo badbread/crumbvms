@@ -46,7 +46,7 @@ otherwise let anyone on the network enumerate or tamper with camera
 streams directly, bypassing Crumb's own user roles and per-camera access
 grants.
 
-RTSP itself (the actual video, not the management API) is published to
-your LAN so native clients can connect, with its own authentication layered
-on top; see [Server settings](/configuration/server-settings) for setting
+RTSP and WebRTC media (the actual video, not the management API) are
+published to your LAN so native clients can connect, with their own
+authentication layered on top; see [Server settings](/configuration/server-settings) for setting
 the address clients use to reach it.

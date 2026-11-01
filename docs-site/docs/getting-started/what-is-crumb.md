@@ -52,7 +52,7 @@ experience did not exist yet at this price point.
   belongs to exactly one named policy; pointing several cameras at the same
   policy is how they share retention settings.
 - **Exports** a selected span, or a batch list built up across a review
-  session, to MP4 or an encrypted archive.
+  session, as separate MP4 files, one zip, or a password-protected archive.
 - **Controls access** with custom roles and per-camera grants, so a limited
   account can be restricted to specific cameras or to live-only.
 
@@ -66,7 +66,7 @@ experience did not exist yet at this price point.
   fully local plate reader (fast-alpr) that runs on your own hardware, no
   cloud and no third-party account, and you can also feed plate reads in from
   your own Frigate instead. Both are off by default and stay on your box. See
-  [Integrations](/integrations/) for how to turn it on.
+  [License plate recognition](/integrations/lpr) for how to turn it on.
 - **It does not require an account, a subscription, or any connection to a
   vendor's servers.** Setup happens entirely on your own network.
 - **It does not send footage, thumbnails, metadata, or usage statistics
