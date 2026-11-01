@@ -173,7 +173,7 @@ fun ViewEditorDialog(
                     ) {
                         Column(Modifier.padding(12.dp)) {
                             Text(
-                                "In this view — long-press the handle to reorder (${selected.size})",
+                                "In this view. Long-press the handle to reorder (${selected.size})",
                                 style = MaterialTheme.typography.labelLarge,
                                 color = TextSecondary,
                             )

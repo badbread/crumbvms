@@ -2,6 +2,34 @@
 
 package video.crumb.app.feature.playback
 
+import video.crumb.app.ui.theme.mono
+import video.crumb.app.ui.theme.TimelineColors
+import video.crumb.app.ui.theme.Spacing
+import video.crumb.app.ui.nav.TileOrigin
+import video.crumb.app.ui.staggerIn
+import video.crumb.app.ui.StateMessage
+import video.crumb.app.ui.SkeletonTileGrid
+import video.crumb.app.ui.SkeletonBox
+import video.crumb.app.ui.CrumbFilterChip
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.findRootCoordinates
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.material.icons.filled.VideocamOff
+import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.foundation.lazy.grid.itemsIndexed
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.layout.only
+import androidx.compose.foundation.layout.displayCutout
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.Crossfade
 import android.content.res.Configuration
 import android.graphics.drawable.BitmapDrawable
 import androidx.compose.foundation.Image
@@ -73,7 +101,6 @@ import video.crumb.app.ui.CrumbMode
 import video.crumb.app.ui.CrumbModeTabs
 import video.crumb.app.ui.GridLayoutToggle
 import video.crumb.app.ui.HintTooltip
-import video.crumb.app.ui.InlineDivider
 import video.crumb.app.ui.JumpToDateTimeDialog
 import video.crumb.app.ui.Time
 import video.crumb.app.ui.ViewChipsRow
@@ -188,6 +215,8 @@ fun PlaybackWallScreen(
         mutableStateOf(WallGridLayout.entries.getOrElse(store.liveGridLayout) { WallGridLayout.TWO })
     }
     var showJump by remember { mutableStateOf(false) }
+    // W3: first-run hint, retired once a camera has been opened from the wall.
+    var hintSeen by remember { mutableStateOf(store.playbackWallHintSeen) }
     // Time the tiles preview: null = "Latest" (live frozen frame); a value = show
     // each camera's RECORDED frame nearest that moment (via the filmstrip). Set on
     // scrub + jump so scrubbing the shared timeline updates every tile's snapshot.
@@ -299,7 +328,7 @@ fun PlaybackWallScreen(
         topBar = {
             TopAppBar(
                 // Same Live | Playback tabs as the Live wall (Playback underlined), with
-                // the saved-view chips inline to their right (separated by a rule;
+                // the saved-view chips inline to their right (16 dp gap, no rule;
                 // overflow scrolls sideways). Tapping "Live" returns to the Live wall.
                 title = {
                     // Landscape: view chips inline next to the tabs. Portrait: tabs only
@@ -319,13 +348,13 @@ fun PlaybackWallScreen(
                                 showClips = caps.clips || store.isAdmin,
                                 showPlates = store.platesEnabled,
                             )
-                            InlineDivider()
                             ViewChipsRow(
                                 views = views,
                                 activeViewId = activeViewId,
                                 onSelect = { setActive(it) },
-                                modifier = Modifier.weight(1f),
+                                modifier = Modifier.weight(1f).padding(start = Spacing.l),
                                 showAllCamerasView = showAllCamerasView,
+                                accent = TimelineColors.playhead,
                             )
                         }
                     } else {
@@ -386,24 +415,22 @@ fun PlaybackWallScreen(
                     onSelect = { setActive(it) },
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 8.dp, vertical = 2.dp),
+                        .padding(horizontal = Spacing.l, vertical = Spacing.xs),
                     showAllCamerasView = showAllCamerasView,
+                    accent = TimelineColors.playhead,
                 )
             }
             // ── Snapshot grid (fills space above the controls) ───────────────────
             Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
                 when {
-                    loading -> CircularProgressIndicator(
-                        modifier = Modifier.align(Alignment.Center),
-                        color = TealAccent,
-                    )
+                    loading -> SkeletonTileGrid(cols = minOf(layout.cols, maxCols))
 
-                    error != null -> Column(
-                        modifier = Modifier.align(Alignment.Center).padding(32.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                    ) {
-                        Text(error!!, color = MaterialTheme.colorScheme.error)
-                        TextButton(onClick = {
+                    error != null -> StateMessage(
+                        icon = Icons.Default.ErrorOutline,
+                        title = "Can't load cameras",
+                        body = error!!,
+                        actionLabel = "Retry",
+                        onAction = {
                             error = null
                             loading = true
                             scope.launch {
@@ -413,38 +440,58 @@ fun PlaybackWallScreen(
                                     goLatest()
                                 }.onFailure { e -> loading = false; error = e.toUserMessage() }
                             }
-                        }) { Text("Retry", color = TealAccent) }
-                    }
-
-                    shownCameras.isEmpty() -> Text(
-                        text = if (suppressingAllCameras) {
-                            "No saved views — create one on the Live tab, or turn " +
-                                "\"Show All Cameras\" back on in Settings."
-                        } else {
-                            "No cameras available"
                         },
-                        color = TextSecondary,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier
-                            .align(Alignment.Center)
-                            .padding(horizontal = 24.dp),
+                        modifier = Modifier.align(Alignment.Center),
+                    )
+
+                    shownCameras.isEmpty() -> StateMessage(
+                        icon = Icons.Default.VideocamOff,
+                        title = if (suppressingAllCameras) "No saved views yet" else "No cameras available",
+                        body = if (suppressingAllCameras) {
+                            "Create one on the Live tab, or turn \"Show All cameras\" back on in Settings."
+                        } else {
+                            null
+                        },
+                        modifier = Modifier.align(Alignment.Center),
                     )
 
                     else -> LazyVerticalGrid(
                         columns = GridCells.Fixed(minOf(layout.cols, maxCols)),
-                        contentPadding = PaddingValues(8.dp),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        contentPadding = PaddingValues(Spacing.s),
+                        horizontalArrangement = Arrangement.spacedBy(Spacing.xs),
+                        verticalArrangement = Arrangement.spacedBy(Spacing.xs),
                         modifier = Modifier.fillMaxSize(),
                     ) {
-                        items(shownCameras, key = { it.id }) { cam ->
+                        itemsIndexed(shownCameras, key = { _, c -> c.id }) { index, cam ->
                             WallSnapshotTile(
                                 camera = cam,
                                 previewMs = previewMs,
-                                onClick = { onOpenPlayback(cam.id, if (atLatest) 0L else cursorMs) },
+                                onClick = {
+                                    // W3: the hint has done its job once a camera is opened.
+                                    if (!hintSeen) {
+                                        hintSeen = true
+                                        store.playbackWallHintSeen = true
+                                    }
+                                    onOpenPlayback(cam.id, if (atLatest) 0L else cursorMs)
+                                },
                                 modifier = Modifier
+                                    .animateItem()
+                                    .staggerIn(index)
                                     .fillMaxWidth()
-                                    .aspectRatio(16f / 9f),
+                                    .aspectRatio(16f / 9f)
+                                    // Remember the tile position so the camera can grow
+                                    // out of it (W6).
+                                    .onGloballyPositioned { c ->
+                                        val root = c.findRootCoordinates().size
+                                        if (root.width > 0 && root.height > 0) {
+                                            val b = c.boundsInRoot()
+                                            TileOrigin.record(
+                                                cam.id,
+                                                b.center.x / root.width,
+                                                b.center.y / root.height,
+                                            )
+                                        }
+                                    },
                             )
                         }
                     }
@@ -452,32 +499,52 @@ fun PlaybackWallScreen(
             }
 
             // ── Shared playback controls (the "multi-window" transport) ──────────
-            Column(modifier = Modifier.fillMaxWidth().background(NavySurface)) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(NavySurface)
+                    // G10: keep the transport clear of the display cutout in landscape.
+                    .windowInsetsPadding(WindowInsets.displayCutout.only(WindowInsetsSides.Horizontal)),
+            ) {
+                // W3: first-run hint on its own centred line, so it is never cut off
+                // by the time chip; gone for good once a camera has been opened.
+                if (PlaybackWallHint.shouldShow(hintSeen)) {
+                    Text(
+                        text = PlaybackWallHint.TEXT,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
+                        maxLines = 1,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth().padding(top = Spacing.xs),
+                    )
+                }
                 Row(
                     modifier = Modifier.fillMaxWidth()
-                        .padding(horizontal = 12.dp, vertical = if (isLandscape) 0.dp else 4.dp),
+                        .padding(horizontal = Spacing.l, vertical = if (isLandscape) 0.dp else Spacing.xs),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    FilledTonalButton(
+                    // W2: Latest is the shared chip, amber when selected.
+                    CrumbFilterChip(
+                        selected = atLatest,
                         onClick = { goLatest() },
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-                        colors = ButtonDefaults.filledTonalButtonColors(
-                            containerColor = if (atLatest) TealAccent.copy(alpha = 0.25f)
-                                else MaterialTheme.colorScheme.surfaceVariant,
-                        ),
-                    ) {
-                        Text("Latest", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium)
-                    }
+                        label = "Latest",
+                        accent = TimelineColors.playhead,
+                    )
+                    Spacer(Modifier.weight(1f))
+                    // W4: the time readout rides on this row, mono, in a small chip.
                     Text(
-                        text = "Tap a camera for full playback control",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = TextSecondary,
-                        modifier = Modifier.weight(1f).padding(horizontal = 10.dp),
+                        text = Time.dateTimeCompact(Instant.ofEpochMilli(cursorMs)),
+                        style = MaterialTheme.typography.mono,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        modifier = Modifier
+                            .background(MaterialTheme.colorScheme.surfaceVariant, MaterialTheme.shapes.extraSmall)
+                            .padding(horizontal = 10.dp, vertical = 3.dp),
                     )
                     HintTooltip("Jump to date & time") {
                         IconButton(
                             onClick = { showJump = true },
-                            modifier = Modifier.size(if (isLandscape) 36.dp else 48.dp),
+                            modifier = Modifier.size(if (isLandscape) 40.dp else 48.dp),
                         ) {
                             Icon(Icons.Default.Schedule, contentDescription = "Jump to date & time")
                         }
@@ -518,8 +585,8 @@ fun PlaybackWallScreen(
                     },
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(if (isLandscape) 40.dp else 64.dp)
-                        .padding(horizontal = 8.dp),
+                        .height(if (isLandscape) 56.dp else 64.dp)
+                        .padding(horizontal = Spacing.s),
                 )
             }
         }
@@ -642,42 +709,56 @@ private fun WallSnapshotTile(
 
     Box(
         modifier = modifier
-            .clip(RoundedCornerShape(8.dp))
+            .clip(MaterialTheme.shapes.small)
             .background(Color.Black)
             .clickable { onClick() },
     ) {
         val f = frame
         when {
-            f != null -> Image(
-                bitmap = f,
-                contentDescription = camera.name,
-                contentScale = ContentScale.Crop,
+            // W7: stills crossfade over 120 ms while scrubbing instead of popping.
+            f != null -> Crossfade(
+                targetState = f,
+                animationSpec = tween(120),
+                label = "wallStill",
                 modifier = Modifier.fillMaxSize(),
-            )
+            ) { img ->
+                Image(
+                    bitmap = img,
+                    contentDescription = camera.name,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
 
             noFootage -> Text(
                 text = "No footage",
+                style = MaterialTheme.typography.bodySmall,
                 color = TextSecondary,
-                fontSize = 11.sp,
                 modifier = Modifier.align(Alignment.Center),
             )
 
-            else -> CircularProgressIndicator(
-                modifier = Modifier.align(Alignment.Center).size(22.dp),
-                color = TealAccent,
-                strokeWidth = 2.dp,
-            )
+            else -> SkeletonBox(Modifier.fillMaxSize())
         }
+        // Same shadowed name over a soft gradient as the Live wall (L3).
+        Box(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .fillMaxHeight(0.44f)
+                .background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.6f)))),
+        )
         Text(
             text = camera.name,
+            style = MaterialTheme.typography.labelMedium.copy(
+                fontSize = 12.sp,
+                shadow = Shadow(color = Color.Black, offset = Offset(0f, 1f), blurRadius = 4f),
+            ),
             color = Color.White,
-            fontSize = 11.sp,
-            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
             modifier = Modifier
                 .align(Alignment.BottomStart)
-                .padding(6.dp)
-                .background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(4.dp))
-                .padding(horizontal = 6.dp, vertical = 2.dp),
+                .padding(start = Spacing.s, bottom = Spacing.s, end = Spacing.s),
         )
     }
 }

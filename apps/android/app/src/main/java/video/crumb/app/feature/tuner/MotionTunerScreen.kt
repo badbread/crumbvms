@@ -476,7 +476,7 @@ fun MotionTunerScreen(
             }
         } else {
             Text(
-                "Recording is triggered by Frigate detections — the pixel detector, threshold and exclusions below are not used.",
+                "Recording is triggered by Frigate detections. The pixel detector, threshold and exclusions below are not used.",
                 style = MaterialTheme.typography.bodySmall,
                 color = TextSecondary,
                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
