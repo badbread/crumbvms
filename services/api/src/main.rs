@@ -819,6 +819,26 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Export dir writability check (#692). Exports, the clip cache, and the
+    // scrub-preview thumbnails all live under EXPORT_DIR. A crumb_exports
+    // volume created by an image that predates the fix is root-owned, which
+    // makes every one of them fail per request with no hint why, so say it
+    // once, loudly, at boot. Never fatal: live view and recording don't need it.
+    {
+        let export_dir = std::path::PathBuf::from(&cfg.export_dir);
+        tokio::spawn(async move {
+            if let Err(e) = check_export_dir_writable(&export_dir).await {
+                tracing::error!(
+                    export_dir = %export_dir.display(),
+                    error = %e,
+                    "EXPORT_DIR is not writable: exports, clips and scrub previews will fail. \
+                     Fix the volume once with: docker compose exec -u root api chown 1001:1001 {}",
+                    export_dir.display()
+                );
+            }
+        });
+    }
+
     // Thumbnail pre-generation (opt-in via THUMB_PREGEN_ENABLED, or the
     // admin-console "Scrub previews" toggle, issue #10). The worker always
     // loops and re-resolves its settings each cycle, idling (one SELECT per
@@ -1194,6 +1214,17 @@ async fn dir_size_bytes(dir: &std::path::Path) -> u64 {
     total
 }
 
+/// Create `export_dir` if needed and prove a file can be written in it (#692).
+/// Mirrors the storage preflight's write probe: an empty file named for this
+/// process, removed straight after.
+async fn check_export_dir_writable(export_dir: &std::path::Path) -> std::io::Result<()> {
+    tokio::fs::create_dir_all(export_dir).await?;
+    let probe = export_dir.join(format!(".crumb-writetest-{}", std::process::id()));
+    tokio::fs::write(&probe, b"").await?;
+    let _ = tokio::fs::remove_file(&probe).await;
+    Ok(())
+}
+
 /// Evict cached clip media (under `{export_dir}/clips`): first anything older
 /// than `ttl` (by mtime), then — if the surviving files still exceed
 /// `max_bytes` — the oldest until back under budget.
@@ -1381,5 +1412,47 @@ mod export_budget_tests {
             vec![oldest, middle],
             "evict oldest-first, and stop as soon as the total is within budget"
         );
+    }
+}
+
+#[cfg(test)]
+mod export_dir_check_tests {
+    use super::check_export_dir_writable;
+
+    #[tokio::test]
+    async fn creates_a_missing_dir_and_leaves_no_probe_behind() {
+        let base = std::env::temp_dir().join(format!("crumb-exportcheck-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+        let dir = base.join("exports");
+
+        check_export_dir_writable(&dir)
+            .await
+            .expect("a fresh dir is writable");
+        assert!(dir.is_dir(), "the export dir is created");
+        let mut entries = tokio::fs::read_dir(&dir).await.unwrap();
+        assert!(
+            entries.next_entry().await.unwrap().is_none(),
+            "the probe file is removed"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    /// A path under a regular file can never be created, even as root (the
+    /// build box runs the suite as root, so a chmod-based test would pass).
+    #[tokio::test]
+    async fn reports_an_unusable_dir() {
+        let base =
+            std::env::temp_dir().join(format!("crumb-exportcheck-bad-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let file = base.join("not-a-dir");
+        tokio::fs::write(&file, b"x").await.unwrap();
+
+        assert!(check_export_dir_writable(&file.join("exports"))
+            .await
+            .is_err());
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
     }
 }

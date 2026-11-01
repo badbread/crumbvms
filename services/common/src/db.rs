@@ -7549,6 +7549,10 @@ pub async fn ensure_policy_advanced_storage_columns(pool: &Pool) -> Result<()> {
 /// also runs it so it tolerates a fresh DB).
 ///
 /// The migration is strictly additive / non-destructive:
+/// Takes no ACCESS EXCLUSIVE lock on `cameras` / `recording_policies` once the
+/// schema is settled (issue #693: the old unconditional ALTERs deadlocked a
+/// concurrent camera read at recorder boot).
+///
 /// * `recording_policies.name` — adds a nullable label; backfills only the
 ///   single default row to `"Default"`. Every other (cloned per-camera) policy
 ///   keeps `name = NULL` ("custom").
@@ -7586,28 +7590,55 @@ pub async fn ensure_named_policies_and_groups(pool: &Pool) -> Result<()> {
     // is ALWAYS released before returning (no `?` early-return between the
     // lock and the unlock below).
     let result = async {
+        // LOCKING (issue #693): this batch is ONE implicit transaction, and the
+        // recorder runs it at boot while reconcile phase 2 is already reading
+        // `v_camera_effective_policy` (which locks `cameras` BEFORE
+        // `recording_policies`). An unconditional `ALTER TABLE` takes ACCESS
+        // EXCLUSIVE even when it changes nothing, so the old shape (ALTER
+        // recording_policies, then ALTER cameras, on every boot) inverted that
+        // lock order and deadlocked a concurrent `get_camera`; Postgres killed
+        // the reader, and the orphan pass left a real segment unindexed. So:
+        // each ALTER runs ONLY when it has work to do (a settled database takes
+        // no ACCESS EXCLUSIVE lock here at all), and the `cameras` step comes
+        // first, matching the view's lock order when both are needed.
         client
             .batch_execute(
                 r"
-                -- 1. Named policies: add the label column + backfill the default.
-                ALTER TABLE recording_policies ADD COLUMN IF NOT EXISTS name text;
-                UPDATE recording_policies SET name = 'Default' WHERE is_default AND name IS NULL;
-
-                -- 2. Every camera belongs to a policy (Phase 2, migration 0068).
+                -- 1. Every camera belongs to a policy (Phase 2, migration 0068).
                 --    RE-ADD the NOT NULL constraint that migration established, so
                 --    this per-boot shim can never silently undo it (landmine L4:
                 --    it previously DROPed NOT NULL on every boot). GUARDED on the
                 --    absence of NULL policy_id rows so a mixed-version boot that
                 --    left an inheriting camera (only an OLD binary can still write
                 --    NULL) will not crash the shim -- the new code never writes
-                --    NULL, and the next clean boot re-adds it. No-op once already SET.
+                --    NULL, and the next clean boot re-adds it. Skipped entirely
+                --    (no lock taken) once the column is already NOT NULL.
                 DO $ensure_policy_not_null$
                 BEGIN
-                    IF NOT EXISTS (SELECT 1 FROM cameras WHERE policy_id IS NULL) THEN
+                    IF EXISTS (SELECT 1 FROM pg_attribute
+                               WHERE attrelid = 'cameras'::regclass
+                                 AND attname = 'policy_id'
+                                 AND NOT attisdropped
+                                 AND NOT attnotnull)
+                       AND NOT EXISTS (SELECT 1 FROM cameras WHERE policy_id IS NULL) THEN
                         ALTER TABLE cameras ALTER COLUMN policy_id SET NOT NULL;
                     END IF;
                 END
                 $ensure_policy_not_null$;
+
+                -- 2. Named policies: add the label column + backfill the default.
+                --    The ALTER only runs when the column is missing (see LOCKING).
+                DO $ensure_policy_name$
+                BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM pg_attribute
+                                   WHERE attrelid = 'recording_policies'::regclass
+                                     AND attname = 'name'
+                                     AND NOT attisdropped) THEN
+                        ALTER TABLE recording_policies ADD COLUMN name text;
+                    END IF;
+                END
+                $ensure_policy_name$;
+                UPDATE recording_policies SET name = 'Default' WHERE is_default AND name IS NULL;
 
                 -- 3. Camera groups + their (optional) shared policy. Retained
                 --    (dormant) post-Phase-2 for rollback comfort; a later cleanup
