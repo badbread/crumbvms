@@ -651,7 +651,10 @@ pub(crate) async fn camera_liveness_age(
 ) -> anyhow::Result<(Option<i64>, &'static str)> {
     if use_cache_heartbeat {
         let ts = db::camera_motion_cache_status_updated_at(pool, camera_id).await?;
-        Ok((ts.map(|ts| (now - ts).num_seconds()), "motion-cache heartbeat"))
+        Ok((
+            ts.map(|ts| (now - ts).num_seconds()),
+            "motion-cache heartbeat",
+        ))
     } else {
         let last = db::camera_last_segment(pool, camera_id).await?;
         Ok((
@@ -701,7 +704,10 @@ pub(crate) fn classify_liveness(
 /// Creation grace for [`classify_liveness`] at the default threshold, honouring
 /// the same `CAMERA_OFFLINE_BOOT_GRACE_SECS` knob as the alert.
 pub(crate) fn default_camera_create_grace_secs() -> i64 {
-    camera_create_grace_secs(CAMERA_LIVENESS_DEFAULT_SECS, camera_offline_boot_grace_secs())
+    camera_create_grace_secs(
+        CAMERA_LIVENESS_DEFAULT_SECS,
+        camera_offline_boot_grace_secs(),
+    )
 }
 
 /// `camera_offline` — for every enabled camera, checks a liveness signal and
@@ -820,19 +826,19 @@ async fn check_camera_offline(
         // `signal` names which liveness check produced `age`, purely for the
         // alert detail message — the offline/online decision itself is the
         // same `offline_from_age` regardless of which column fed it.
-        let (age, signal) =
-            match camera_liveness_age(pool, cam.id, use_cache_heartbeat, now).await {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        camera_id = %cam.id,
-                        use_cache_heartbeat,
-                        "system-health: camera liveness query failed"
-                    );
-                    continue;
-                }
-            };
+        let (age, signal) = match camera_liveness_age(pool, cam.id, use_cache_heartbeat, now).await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    camera_id = %cam.id,
+                    use_cache_heartbeat,
+                    "system-health: camera liveness query failed"
+                );
+                continue;
+            }
+        };
         let offline = offline_from_age(age, threshold);
         let was = was_offline.get(&cam.id).copied().unwrap_or(false);
 
@@ -1257,23 +1263,38 @@ mod tests {
 
     #[test]
     fn liveness_fresh_signal_is_live() {
-        assert_eq!(classify_liveness(Some(5), 120, 9_999, 180), CameraLiveness::Live);
+        assert_eq!(
+            classify_liveness(Some(5), 120, 9_999, 180),
+            CameraLiveness::Live
+        );
         // The threshold boundary matches offline_from_age (strict >).
-        assert_eq!(classify_liveness(Some(120), 120, 9_999, 180), CameraLiveness::Live);
+        assert_eq!(
+            classify_liveness(Some(120), 120, 9_999, 180),
+            CameraLiveness::Live
+        );
     }
 
     #[test]
     fn liveness_new_camera_that_never_reported_is_starting() {
-        assert_eq!(classify_liveness(None, 120, 30, 180), CameraLiveness::Starting);
+        assert_eq!(
+            classify_liveness(None, 120, 30, 180),
+            CameraLiveness::Starting
+        );
     }
 
     #[test]
     fn liveness_silent_after_the_grace_or_once_it_has_reported() {
         // Never reported, and the creation grace is over (#711: the camera
         // with a wrong stream path that still showed "Recording").
-        assert_eq!(classify_liveness(None, 120, 600, 180), CameraLiveness::Silent);
+        assert_eq!(
+            classify_liveness(None, 120, 600, 180),
+            CameraLiveness::Silent
+        );
         // Reported once, then went quiet: silent even inside the grace window.
-        assert_eq!(classify_liveness(Some(121), 120, 30, 180), CameraLiveness::Silent);
+        assert_eq!(
+            classify_liveness(Some(121), 120, 30, 180),
+            CameraLiveness::Silent
+        );
     }
 
     #[test]
