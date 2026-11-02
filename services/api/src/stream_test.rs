@@ -18,6 +18,11 @@
 //! Admin-only — the same capability as configuring camera URLs. The URL is read
 //! from the request BODY (never a query string) so credentials in
 //! `rtsp://user:pass@host` aren't logged.
+//!
+//! Body: `{ "url": "...", "camera_id"?: "<uuid>", "slot"?: "main" | "sub" }`. A
+//! password sent as the `********` mask is replaced by that camera's stored one
+//! for the slot, only if the URL keeps the stored scheme, host and port;
+//! otherwise the request fails asking for the password (#712).
 
 use std::process::Stdio;
 use std::time::Duration;
