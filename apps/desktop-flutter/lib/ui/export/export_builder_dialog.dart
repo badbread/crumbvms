@@ -37,6 +37,7 @@ import 'package:crumb_desktop/api/playback_api.dart';
 import 'package:crumb_desktop/ui/export/clip_trim_timeline.dart';
 import 'package:crumb_desktop/ui/playback/gapless_segment_pane.dart';
 import 'package:crumb_desktop/ui/playback/gapless_segment_pane_controller.dart';
+import '../date_time_picker_dialog.dart';
 
 /// One clip in the batch builder's list (local-only until submit turns it
 /// into a [BatchExportItem]).
@@ -487,29 +488,14 @@ class _ExportBuilderDialogState extends State<_ExportBuilderDialog> {
 
   Future<void> _pickDateTime(bool isStart) async {
     final initial = (isStart ? _start : _end).toLocal();
-    final date = await showDatePicker(
-      context: context,
-      initialDate: initial,
+    final combined = await showDateTimePickerDialog(
+      context,
+      initial: initial,
       firstDate: DateTime.now().subtract(const Duration(days: 3650)),
       lastDate: DateTime.now().add(const Duration(days: 1)),
-      // Compact text-entry rather than the oversized full calendar.
-      initialEntryMode: DatePickerEntryMode.input,
+      title: isStart ? 'Export start' : 'Export end',
     );
-    if (date == null || !mounted) return;
-    final time = await showTimePicker(
-      context: context,
-      initialTime: TimeOfDay.fromDateTime(initial),
-      initialEntryMode: TimePickerEntryMode.input,
-    );
-    if (time == null || !mounted) return;
-    final combined = DateTime(
-      date.year,
-      date.month,
-      date.day,
-      time.hour,
-      time.minute,
-      initial.second,
-    );
+    if (combined == null || !mounted) return;
     setState(() {
       if (isStart) {
         _start = combined;
