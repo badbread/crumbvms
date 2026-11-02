@@ -3178,7 +3178,18 @@ async function testCameraStream(camId, slot) {
     toast('No stream URL to test.', 'warn');
     return;
   }
-  // Managed camera: resolve the canonical restream URL and probe THAT.
+  // Managed camera with an edited, unsaved URL: the restream is only rebuilt
+  // on Save, so probing it would show the OLD stream (#712). Probe what's typed
+  // instead; a password still shown as ******** is resolved server-side from the
+  // stored URL, and only for the same camera address.
+  const field = slot === 'sub' ? $('ce-src-sub') : $('ce-src');
+  const typed = ((field && field.value) || '').trim();
+  const saved = ((slot === 'sub' ? c.source_sub_url : c.source_url) || '').trim();
+  if (typed && typed !== saved) {
+    testStream(typed, camId, { camera_id: camId, slot, label: 'Testing your unsaved URL, directly against the camera' });
+    return;
+  }
+  // Saved (or unchanged) URL: resolve the canonical restream URL and probe THAT.
   let restream = slot === 'sub' ? (c.sub_url || null) : (c.main_url || null);
   try {
     const s = await api(`/cameras/${encodeURIComponent(camId)}/streams`);
@@ -3187,19 +3198,23 @@ async function testCameraStream(camId, slot) {
       if (u) restream = u;
     }
   } catch { /* fall back to the stored restream URL below */ }
-  if (restream) { testStream(restream, camId); return; }
+  if (restream) { testStream(restream, camId, { label: "Testing the saved stream, through Crumb's restream" }); return; }
   toast(slot === 'sub'
     ? 'This camera has no sub-stream restream to test.'
     : 'No restream available yet, save the camera first, then test.', 'warn');
 }
 
 /* ── Stream test (preserved) ── */
-let stestActive = false, stestUrl = '', stestObjUrl = null, stestCamId = null;
-function testStream(url, camId) {
+let stestActive = false, stestUrl = '', stestObjUrl = null, stestCamId = null, stestExtra = {};
+/* opts: { camera_id, slot } let the server resolve a ******** password from the
+   stored URL (#712); opts.label says what is being tested. */
+function testStream(url, camId, opts) {
   url = (url || '').trim();
   if (!url) { toast('Enter a stream URL first.', 'warn'); return; }
+  const o = opts || {};
   stestUrl = url; stestActive = true; stestCamId = camId || null;
-  $('stest-url').textContent = redact(url);
+  stestExtra = o.camera_id ? { camera_id: o.camera_id, slot: o.slot || 'main' } : {};
+  $('stest-url').textContent = (o.label ? o.label + ': ' : '') + redact(url);
   $('stest-stats').innerHTML = '<div class="stat-chip" style="color:var(--dim)">Probing…</div>';
   setMsg('stest-err', '');
   $('stest-frame').removeAttribute('src');
@@ -3208,7 +3223,7 @@ function testStream(url, camId) {
   const sw = $('stest-wait'); if (sw) { sw.style.display = ''; sw.textContent = 'Connecting to stream… the first frame can take a few seconds.'; }
   const sn = $('stest-note'); if (sn) { sn.style.display = 'none'; sn.textContent = ''; }
   $('stest-modal').classList.remove('hidden');
-  api('/config/test-stream', { method: 'POST', body: JSON.stringify({ url }) })
+  api('/config/test-stream', { method: 'POST', body: JSON.stringify({ url, ...stestExtra }) })
     .then(r => {
       if (!stestActive) return;
       if (r.ok) {
@@ -3251,7 +3266,7 @@ async function stestFrameLoop() {
       const res = await fetch('/config/test-frame', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + TOKEN },
-        body: JSON.stringify({ url: stestUrl }),
+        body: JSON.stringify({ url: stestUrl, ...stestExtra }),
       });
       if (!stestActive) break;
       if (res.ok) {
