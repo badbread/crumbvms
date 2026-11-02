@@ -426,8 +426,9 @@ pub struct CreateCameraRequest {
     /// ONVIF password — **write-only**. Never returned in responses.
     pub onvif_password: Option<String>,
     /// Whether this camera exposes PTZ controls (migration 0061). Omitted/`null`
-    /// defaults to `true` (an ONVIF camera shows PTZ unless turned off).
-    #[serde(default = "default_true")]
+    /// defaults to `false`, matching the column default since migration 0063:
+    /// most cameras are fixed, so PTZ is opted into, not out of (#710).
+    #[serde(default)]
     pub ptz_control_enabled: bool,
 }
 
@@ -1754,4 +1755,23 @@ pub struct UpdateCheckResponse {
     /// `GitHub` (not merely requested) — an older timestamp during an outage
     /// is the intentional stale-while-error signal.
     pub checked_at: Option<DateTime<Utc>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CreateCameraRequest;
+
+    #[test]
+    fn create_camera_ptz_defaults_off() {
+        // The Add cameras wizard omits the field; a fixed camera must not come
+        // in with the PTZ joystick turned on (#710).
+        let req: CreateCameraRequest =
+            serde_json::from_str(r#"{"name":"Front","source_url":"rtsp://198.51.100.7/s"}"#)
+                .unwrap();
+        assert!(!req.ptz_control_enabled);
+
+        let req: CreateCameraRequest =
+            serde_json::from_str(r#"{"name":"Gate","ptz_control_enabled":true}"#).unwrap();
+        assert!(req.ptz_control_enabled);
+    }
 }
