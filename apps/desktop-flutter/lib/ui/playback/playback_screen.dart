@@ -51,6 +51,7 @@ import 'playback_prefs.dart';
 import 'playback_tick_text.dart';
 import 'no_footage_message.dart';
 import 'playback_timeline_controller.dart';
+import '../date_time_picker_dialog.dart';
 
 class PlaybackScreen extends StatefulWidget {
   const PlaybackScreen({
@@ -1474,33 +1475,20 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   }
 
   /// Pick an exact date + time to jump to (replaces the old free-text
-  /// HH:MM:SS field). Seeds both pickers from the current playhead so refining
+  /// HH:MM:SS field). Seeds the dialog from the current playhead so refining
   /// while reviewing a past day stays on that day.
   Future<void> _pickGotoDateTime() async {
     final base = _timeline.playhead.toLocal();
     final now = DateTime.now();
-    final date = await showDatePicker(
-      context: context,
-      initialDate: base.isAfter(now) ? now : base,
+    final picked = await showDateTimePickerDialog(
+      context,
+      initial: base.isAfter(now) ? now : base,
       firstDate: now.subtract(const Duration(days: 3650)),
       lastDate: now,
-      initialEntryMode: DatePickerEntryMode.input,
+      confirmLabel: 'Go',
     );
-    if (date == null || !mounted) return;
-    final time = await showTimePicker(
-      context: context,
-      initialTime: TimeOfDay.fromDateTime(base),
-      initialEntryMode: TimePickerEntryMode.input,
-    );
-    if (time == null || !mounted) return;
-    final target = DateTime(
-      date.year,
-      date.month,
-      date.day,
-      time.hour,
-      time.minute,
-    ).toUtc();
-    await _jumpTo(target);
+    if (picked == null || !mounted) return;
+    await _jumpTo(picked.toUtc());
   }
 
   static const List<String> _monthAbbr = [

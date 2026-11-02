@@ -57,6 +57,7 @@ import 'package:crumb_desktop/ui/plates/plate_desk_logic.dart';
 import 'package:crumb_desktop/ui/plates/plate_name_dialog.dart';
 import 'package:crumb_desktop/ui/plates/plate_report_dialog.dart';
 import 'package:crumb_desktop/ui/plates/plates_prefs.dart';
+import '../date_time_picker_dialog.dart';
 
 part 'plate_contact_sheet.dart';
 part 'plates_filter_bar.dart';
@@ -1288,21 +1289,16 @@ class _PlatesScreenState extends State<PlatesScreen> {
   Future<void> _pickWhen() async {
     final now = DateTime.now();
     final base = _anchorEnd ?? now;
-    final date = await showDatePicker(
-      context: context,
-      initialDate: base,
+    final picked = await showDateTimePickerDialog(
+      context,
+      initial: base,
       firstDate: DateTime(now.year - 5),
       lastDate: now,
+      title: 'Show results up to',
     );
-    if (date == null || !mounted) return;
-    final time = await showTimePicker(
-      context: context,
-      initialTime: TimeOfDay.fromDateTime(base),
-    );
-    if (time == null || !mounted) return;
+    if (picked == null || !mounted) return;
     setState(() {
-      _anchorEnd =
-          DateTime(date.year, date.month, date.day, time.hour, time.minute);
+      _anchorEnd = picked;
     });
     _load();
   }
