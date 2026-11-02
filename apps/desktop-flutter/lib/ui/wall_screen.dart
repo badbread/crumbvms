@@ -1698,6 +1698,10 @@ class _WallTileState extends State<_WallTile>
           // join can otherwise flash before the first clean frame.
           ['vd-lavc-show-all', 'no'],
           ['mute', 'yes'],
+          // No audio track while muted: a camera that advertises audio but
+          // sends none freezes mpv's clock and the stall watchdog would
+          // reconnect it forever (#706). Unmuting selects the track.
+          ['aid', 'no'],
         ]) {
           try {
             await p.setProperty(kv[0], kv[1]);
@@ -1807,7 +1811,11 @@ class _WallTileState extends State<_WallTile>
     // Register as an audio pane (muted until it becomes the audible pane).
     widget.audio?.registerPane(
       _paneId,
-      AudioPane.forPlayer(player, hasAudio: () => mounted),
+      AudioPane.forPlayer(
+        player,
+        hasAudio: () => mounted,
+        liveAudioTrack: true,
+      ),
     );
     if (SnapshotRegistry.instance.activePaneId.value == null) {
       SnapshotRegistry.instance.setActive(_paneId);
@@ -2984,6 +2992,8 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
           ['vd-lavc-show-all', 'no'],
           // Muted by default — the global audio button unmutes the active pane.
           ['mute', 'yes'],
+          // And no audio track while muted (#706), see _WallTile.
+          ['aid', 'no'],
         ]) {
           try {
             await p.setProperty(kv[0], kv[1]);
@@ -3018,7 +3028,11 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
       SnapshotRegistry.instance.setActive('maximized');
       widget.audio?.registerPane(
         'max:${widget.camera.id}',
-        AudioPane.forPlayer(player, hasAudio: () => mounted),
+        AudioPane.forPlayer(
+          player,
+          hasAudio: () => mounted,
+          liveAudioTrack: true,
+        ),
       );
       _watchdog =
           PaneWatchdog(

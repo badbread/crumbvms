@@ -46,13 +46,35 @@ class AudioPane {
   /// native mpv `mute` property when available (matches the property set
   /// already applied on pane creation in wall_screen.dart's `_WallTile`),
   /// falling back to `Player.setVolume` on platforms without a NativePlayer.
-  factory AudioPane.forPlayer(Player player, {required bool Function() hasAudio}) {
+  ///
+  /// [liveAudioTrack]: the pane is a LIVE pane opened with `aid=no` (no audio
+  /// track while muted). Unmuting selects the audio track and muting drops it
+  /// again. A camera that advertises audio but sends none freezes mpv's clock
+  /// while the track is selected, and the stall watchdog then reconnects the
+  /// pane forever (seen on a camera whose audio encoder died mid-day, #706).
+  /// So after an unmute, if the picture stops advancing, the track is dropped
+  /// again: a silent pane beats a frozen one.
+  factory AudioPane.forPlayer(
+    Player player, {
+    required bool Function() hasAudio,
+    bool liveAudioTrack = false,
+  }) {
+    var generation = 0;
     return AudioPane(
       hasAudio: hasAudio,
       setMuted: (muted) async {
+        final call = ++generation;
         final platform = player.platform;
         if (platform is NativePlayer) {
+          if (liveAudioTrack) {
+            await platform.setProperty('aid', muted ? 'no' : 'auto');
+          }
           await platform.setProperty('mute', muted ? 'yes' : 'no');
+          if (liveAudioTrack && !muted) {
+            unawaited(
+              _dropAudioIfFrozen(player, platform, () => call == generation),
+            );
+          }
         } else {
           await player.setVolume(muted ? 0.0 : 100.0);
         }
@@ -60,6 +82,38 @@ class AudioPane {
     );
   }
 }
+
+/// How long an unmuted live pane gets to keep its picture moving with the
+/// audio track selected before the track is dropped again.
+@visibleForTesting
+const Duration kSilentAudioCheck = Duration(seconds: 4);
+
+/// After an unmute: if the playback clock barely moved over
+/// [kSilentAudioCheck] (and nothing re-muted the pane meanwhile, per
+/// [stillCurrent]), the camera is not delivering audio, so deselect the track
+/// before the stall watchdog reads the frozen clock as a dead stream.
+Future<void> _dropAudioIfFrozen(
+  Player player,
+  NativePlayer platform,
+  bool Function() stillCurrent,
+) async {
+  final before = player.state.position;
+  await Future<void>.delayed(kSilentAudioCheck);
+  if (!stillCurrent()) return;
+  if (audioLooksFrozen(before, player.state.position)) {
+    try {
+      await platform.setProperty('aid', 'no');
+    } catch (_) {
+      /* pane torn down meanwhile */
+    }
+  }
+}
+
+/// True when the clock advanced less than a quarter of [kSilentAudioCheck]:
+/// a live pane that is actually playing advances by about the full window.
+@visibleForTesting
+bool audioLooksFrozen(Duration before, Duration after) =>
+    (after - before) < kSilentAudioCheck ~/ 4;
 
 /// Serialized, single-audible-pane state machine. Own one instance per live
 /// wall (e.g. as a field on the `WallScreen` state), register/unregister
