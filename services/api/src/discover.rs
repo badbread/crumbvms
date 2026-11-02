@@ -253,6 +253,24 @@ const BRAND_TABLE: &[BrandPaths] = &[
         paths: &[("/stream1", Some("/stream2"))],
     },
     BrandPaths {
+        key: "avigilon",
+        label: "Avigilon",
+        paths: &[
+            // Current H5A firmware serves under an `/rtsp/` prefix and answers
+            // "404 Profile Not Found" to the unprefixed form (#709); the camera's
+            // own Compression page lists this exact URI.
+            (
+                "/rtsp/defaultPrimary?streamType=u",
+                Some("/rtsp/defaultSecondary?streamType=u"),
+            ),
+            // The widely documented form, for older firmware.
+            (
+                "/defaultPrimary?streamType=u",
+                Some("/defaultSecondary?streamType=u"),
+            ),
+        ],
+    },
+    BrandPaths {
         key: "generic",
         label: "Generic / ONVIF only",
         // No brand-specific guesses — rely entirely on ONVIF `GetStreamUri`.
@@ -1617,6 +1635,23 @@ mod tests {
         assert_eq!(
             brand_paths(Some("tplink")),
             &[("/stream1", Some("/stream2"))]
+        );
+    }
+
+    #[test]
+    fn avigilon_tries_the_rtsp_prefixed_paths_first() {
+        assert_eq!(
+            brand_paths(Some("avigilon")),
+            &[
+                (
+                    "/rtsp/defaultPrimary?streamType=u",
+                    Some("/rtsp/defaultSecondary?streamType=u"),
+                ),
+                (
+                    "/defaultPrimary?streamType=u",
+                    Some("/defaultSecondary?streamType=u"),
+                ),
+            ]
         );
     }
 
