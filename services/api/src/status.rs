@@ -26,6 +26,11 @@
 //! `HEALTH_STALENESS_SECS` of the current time.  We use a conservative 12 s
 //! (2 × the 6 s maximum `SEGMENT_SECONDS` value).
 //!
+//! Each enabled camera also carries `liveness` (`live` / `starting` / `silent`),
+//! the admin console's recording badge. It reuses the `camera_offline` alert's
+//! signal, threshold and creation grace (`alerts::camera_liveness_age`,
+//! `alerts::classify_liveness`), so it is motion-aware where `recording` is not.
+//!
 //! ## Recorder heartbeat
 //!
 //! The recorder does not yet write a heartbeat to Postgres.  Returns `None`
@@ -48,6 +53,7 @@ use crumb_common::{
 };
 
 use crate::{
+    alerts,
     auth_mw::AuthUser,
     dto::{CameraStatusEntry, StorageStatusEntry, SystemStatusResponse},
     error::ApiError,
@@ -187,6 +193,16 @@ async fn system_status(
     // Query each camera's last segment CONCURRENTLY (was a sequential loop — N
     // round-trips serialized into a multi-second /status hang at scale). Spawn one
     // task per camera; results carry their index so the response order is stable.
+    // Shadow mode is one global flag; read it once for every camera's liveness.
+    // A failed read means "off", the same fallback the camera_offline alert uses.
+    let shadow_mode = match db::read_motion_cache_status(pool).await {
+        Ok(status) => status.is_some_and(|s| s.shadow_mode),
+        Err(e) => {
+            warn!(error = %e, "failed to read motion_cache_status");
+            false
+        }
+    };
+    let create_grace_secs = alerts::default_camera_create_grace_secs();
     let mut set: JoinSet<(usize, CameraStatusEntry)> = JoinSet::new();
     for (i, camera) in cameras.iter().enumerate() {
         let pool = pool.clone();
@@ -194,7 +210,28 @@ async fn system_status(
         let name = camera.name.clone();
         let enabled = camera.enabled;
         let mode = camera.policy.mode;
+        let secs_since_created = (now - camera.created_at).num_seconds();
         set.spawn(async move {
+            // The admin console's per-camera badge (#711): the same signal and
+            // threshold as the camera_offline alert, so "Recording" means
+            // footage is actually arriving, not just that the camera is enabled.
+            let liveness = if enabled {
+                let use_cache = alerts::uses_cache_heartbeat(mode, shadow_mode);
+                match alerts::camera_liveness_age(&pool, id, use_cache, now).await {
+                    Ok((age, _)) => Some(alerts::classify_liveness(
+                        age,
+                        alerts::CAMERA_LIVENESS_DEFAULT_SECS,
+                        secs_since_created,
+                        create_grace_secs,
+                    )),
+                    Err(e) => {
+                        warn!(camera_id = %id, error = %e, "failed to query camera liveness");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let last_seg = db::camera_last_segment(&pool, id)
                 .await
                 .unwrap_or_else(|e| {
@@ -240,6 +277,7 @@ async fn system_status(
                     recording,
                     recent_motion,
                     last_segment_end,
+                    liveness,
                 },
             )
         });

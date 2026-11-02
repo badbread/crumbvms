@@ -634,6 +634,82 @@ fn camera_create_grace_secs(threshold_secs: i64, boot_grace_secs: i64) -> i64 {
     threshold_secs.max(boot_grace_secs)
 }
 
+/// Default threshold for `camera_offline`, also what the admin console's per-camera
+/// status badge treats as "silent" (`GET /status`, #711).
+pub(crate) const CAMERA_LIVENESS_DEFAULT_SECS: i64 = DEFAULT_CAMERA_OFFLINE_SECS;
+
+/// Age in seconds of a camera's liveness signal, and the signal's name for log
+/// and alert text. `use_cache_heartbeat` picks the motion-cache heartbeat (idle
+/// Motion-mode cameras) over the newest segment (everything else); see
+/// [`check_camera_offline`] for why the two modes need different signals.
+/// `None` age means the camera has never reported that signal.
+pub(crate) async fn camera_liveness_age(
+    pool: &Pool,
+    camera_id: Uuid,
+    use_cache_heartbeat: bool,
+    now: chrono::DateTime<Utc>,
+) -> anyhow::Result<(Option<i64>, &'static str)> {
+    if use_cache_heartbeat {
+        let ts = db::camera_motion_cache_status_updated_at(pool, camera_id).await?;
+        Ok((
+            ts.map(|ts| (now - ts).num_seconds()),
+            "motion-cache heartbeat",
+        ))
+    } else {
+        let last = db::camera_last_segment(pool, camera_id).await?;
+        Ok((
+            last.as_ref().map(|s| (now - s.start_ts).num_seconds()),
+            "segment",
+        ))
+    }
+}
+
+/// Whether a camera's liveness is judged by the motion-cache heartbeat rather
+/// than segment age: Motion-mode cameras, except while the global shadow mode
+/// makes them persist every segment like Continuous.
+pub(crate) fn uses_cache_heartbeat(mode: RecordingMode, shadow_mode: bool) -> bool {
+    mode == RecordingMode::Motion && !shadow_mode
+}
+
+/// An enabled camera's recording state as the admin console shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum CameraLiveness {
+    /// The liveness signal is fresh: footage (or the idle motion worker) is flowing.
+    Live,
+    /// Added moments ago and has not reported yet; not a fault yet.
+    Starting,
+    /// No fresh signal past the threshold: the recorder is not getting the stream.
+    Silent,
+}
+
+/// Pure classification shared with the `camera_offline` decision: the same
+/// threshold boundary ([`offline_from_age`]) and creation grace
+/// ([`within_camera_create_grace`]), so the badge and the alert cannot disagree.
+pub(crate) fn classify_liveness(
+    age_secs: Option<i64>,
+    threshold_secs: i64,
+    secs_since_created: i64,
+    create_grace_secs: i64,
+) -> CameraLiveness {
+    if !offline_from_age(age_secs, threshold_secs) {
+        CameraLiveness::Live
+    } else if within_camera_create_grace(age_secs, secs_since_created, create_grace_secs) {
+        CameraLiveness::Starting
+    } else {
+        CameraLiveness::Silent
+    }
+}
+
+/// Creation grace for [`classify_liveness`] at the default threshold, honouring
+/// the same `CAMERA_OFFLINE_BOOT_GRACE_SECS` knob as the alert.
+pub(crate) fn default_camera_create_grace_secs() -> i64 {
+    camera_create_grace_secs(
+        CAMERA_LIVENESS_DEFAULT_SECS,
+        camera_offline_boot_grace_secs(),
+    )
+}
+
 /// `camera_offline` — for every enabled camera, checks a liveness signal and
 /// fires once per camera per offline→online cycle when it exceeds the
 /// configured threshold.
@@ -745,40 +821,23 @@ async fn check_camera_offline(
 
     let now = Utc::now();
     for cam in &cameras {
-        let use_cache_heartbeat = cam.policy.mode == RecordingMode::Motion && !shadow_mode;
+        let use_cache_heartbeat = uses_cache_heartbeat(cam.policy.mode, shadow_mode);
 
         // `signal` names which liveness check produced `age`, purely for the
         // alert detail message — the offline/online decision itself is the
         // same `offline_from_age` regardless of which column fed it.
-        let (age, signal) = if use_cache_heartbeat {
-            let cache_updated_at =
-                match db::camera_motion_cache_status_updated_at(pool, cam.id).await {
-                    Ok(ts) => ts,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            camera_id = %cam.id,
-                            "system-health: camera_motion_cache_status_updated_at failed"
-                        );
-                        continue;
-                    }
-                };
-            (
-                cache_updated_at.map(|ts| (now - ts).num_seconds()),
-                "motion-cache heartbeat",
-            )
-        } else {
-            let last = match db::camera_last_segment(pool, cam.id).await {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::warn!(error = %e, camera_id = %cam.id, "system-health: camera_last_segment failed");
-                    continue;
-                }
-            };
-            (
-                last.as_ref().map(|s| (now - s.start_ts).num_seconds()),
-                "segment",
-            )
+        let (age, signal) = match camera_liveness_age(pool, cam.id, use_cache_heartbeat, now).await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    camera_id = %cam.id,
+                    use_cache_heartbeat,
+                    "system-health: camera liveness query failed"
+                );
+                continue;
+            }
         };
         let offline = offline_from_age(age, threshold);
         let was = was_offline.get(&cam.id).copied().unwrap_or(false);
@@ -1201,6 +1260,49 @@ mod tests {
     //
     // Shared by both liveness signals (segment age for Continuous, motion-cache
     // heartbeat age for idle Motion) — one boundary rule for both.
+
+    #[test]
+    fn liveness_fresh_signal_is_live() {
+        assert_eq!(
+            classify_liveness(Some(5), 120, 9_999, 180),
+            CameraLiveness::Live
+        );
+        // The threshold boundary matches offline_from_age (strict >).
+        assert_eq!(
+            classify_liveness(Some(120), 120, 9_999, 180),
+            CameraLiveness::Live
+        );
+    }
+
+    #[test]
+    fn liveness_new_camera_that_never_reported_is_starting() {
+        assert_eq!(
+            classify_liveness(None, 120, 30, 180),
+            CameraLiveness::Starting
+        );
+    }
+
+    #[test]
+    fn liveness_silent_after_the_grace_or_once_it_has_reported() {
+        // Never reported, and the creation grace is over (#711: the camera
+        // with a wrong stream path that still showed "Recording").
+        assert_eq!(
+            classify_liveness(None, 120, 600, 180),
+            CameraLiveness::Silent
+        );
+        // Reported once, then went quiet: silent even inside the grace window.
+        assert_eq!(
+            classify_liveness(Some(121), 120, 30, 180),
+            CameraLiveness::Silent
+        );
+    }
+
+    #[test]
+    fn liveness_uses_the_cache_heartbeat_only_for_non_shadow_motion() {
+        assert!(uses_cache_heartbeat(RecordingMode::Motion, false));
+        assert!(!uses_cache_heartbeat(RecordingMode::Motion, true));
+        assert!(!uses_cache_heartbeat(RecordingMode::Continuous, false));
+    }
 
     #[test]
     fn offline_from_age_no_signal_is_offline() {

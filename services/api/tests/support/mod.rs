@@ -45,6 +45,8 @@
 #![allow(dead_code)] // not every helper is used by every test file
 
 // ── real source modules, recompiled into this test binary ──────────────────
+#[path = "../../src/alerts.rs"]
+pub mod alerts;
 #[path = "../../src/auth.rs"]
 pub mod auth;
 #[path = "../../src/auth_mw.rs"]

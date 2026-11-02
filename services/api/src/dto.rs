@@ -1674,6 +1674,11 @@ pub struct CameraStatusEntry {
     pub recent_motion: bool,
     /// `end_ts` of the most recent segment, or `None` if no segments exist.
     pub last_segment_end: Option<DateTime<Utc>>,
+    /// Whether footage is actually arriving: `"live"`, `"starting"` (added moments
+    /// ago, not reported yet) or `"silent"` (enabled but the recorder is getting
+    /// nothing). Same signal as the `camera_offline` alert. `None` for a disabled
+    /// camera or when the query failed (#711).
+    pub liveness: Option<crate::alerts::CameraLiveness>,
 }
 
 // ─── filmstrip ────────────────────────────────────────────────────────────────
