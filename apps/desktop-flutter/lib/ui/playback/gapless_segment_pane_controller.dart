@@ -93,6 +93,7 @@ import '../../api/crumb_api.dart';
 import '../../api/models.dart';
 import '../../api/playback_api.dart';
 import '../../services/diagnostics_service.dart';
+import 'package:crumb_desktop/state/hardware_decode.dart';
 
 /// How long before a segment's end to kick off the prefetch of the next one.
 /// Mirrors app.js's `seg.segEndMs - 1000` check in `pbTick`.
@@ -264,9 +265,9 @@ class GaplessSegmentPaneController extends ChangeNotifier {
   Future<void> _configurePlayer() async {
     final p = _player.platform;
     if (p is! NativePlayer) return;
-    for (final kv in const [
+    for (final kv in [
       ['rtsp-transport', 'tcp'],
-      ['hwdec', 'auto'],
+      ['hwdec', hwdecMode()],
       ['cache', 'yes'],
       ['demuxer-readahead-secs', '2.0'],
       ['demuxer-max-bytes', '32MiB'],

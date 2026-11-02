@@ -30,6 +30,7 @@ import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../ui/motion/motion_tokens.dart';
+import 'hardware_decode.dart';
 
 /// What a click on a live/maximized PTZ-capable tile does.
 /// Mirrors `options.ptzClickMode` ('center' | 'pan' | 'off').
@@ -112,6 +113,8 @@ const String _kOpenClipsInHd = 'crumb.openClipsInHd';
 const String _kSeamlessTileSwitch = 'crumb.seamlessTileSwitch';
 // In-app "Reduce motion" (the OS setting is honoured regardless).
 const String _kReduceMotion = 'crumb.reduceMotion';
+// Hardware video decoding (#713): mpv hwdec auto vs no. Default ON.
+const String _kHardwareDecoding = 'crumb.hardwareDecoding';
 // Adaptive live-wall quality (issue #382) — client-local, both default ON.
 const String _kAdaptiveWallGuardrail = 'crumb.adaptiveWallGuardrail';
 const String _kAdaptiveWallBackpressure = 'crumb.adaptiveWallBackpressure';
@@ -147,6 +150,7 @@ class ClientOptionsStore extends ChangeNotifier {
     required bool adaptiveWallBackpressure,
     required bool adaptiveWallGuardrailDontWarn,
     required bool reduceMotion,
+    required bool hardwareDecoding,
   }) : _showInfoBar = showInfoBar,
        _infoBarOverlay = infoBarOverlay,
        _showAllCamerasView = showAllCamerasView,
@@ -162,7 +166,8 @@ class ClientOptionsStore extends ChangeNotifier {
        _adaptiveWallGuardrail = adaptiveWallGuardrail,
        _adaptiveWallBackpressure = adaptiveWallBackpressure,
        _adaptiveWallGuardrailDontWarn = adaptiveWallGuardrailDontWarn,
-       _reduceMotion = reduceMotion;
+       _reduceMotion = reduceMotion,
+       _hardwareDecoding = hardwareDecoding;
 
   final SharedPreferences? _prefs;
 
@@ -182,6 +187,7 @@ class ClientOptionsStore extends ChangeNotifier {
   bool _adaptiveWallBackpressure;
   bool _adaptiveWallGuardrailDontWarn;
   bool _reduceMotion;
+  bool _hardwareDecoding;
 
   static Future<ClientOptionsStore> load() async {
     SharedPreferences? prefs;
@@ -191,6 +197,8 @@ class ClientOptionsStore extends ChangeNotifier {
       prefs = null; // package not wired up yet — in-memory only, per-session
     }
     MotionPrefs.reduceMotion.value = prefs?.getBool(_kReduceMotion) ?? false;
+    final hardwareDecoding = prefs?.getBool(_kHardwareDecoding) ?? true;
+    HardwareDecode.enabled.value = hardwareDecoding;
     return ClientOptionsStore._(
       prefs,
       showInfoBar: prefs?.getBool(_kShowInfoBar) ?? true,
@@ -213,6 +221,7 @@ class ClientOptionsStore extends ChangeNotifier {
       adaptiveWallGuardrailDontWarn:
           prefs?.getBool(_kAdaptiveWallGuardrailDontWarn) ?? false,
       reduceMotion: prefs?.getBool(_kReduceMotion) ?? false,
+      hardwareDecoding: hardwareDecoding,
     );
   }
 
@@ -336,6 +345,18 @@ class ClientOptionsStore extends ChangeNotifier {
     _reduceMotion = v;
     MotionPrefs.reduceMotion.value = v;
     unawaited(_prefs?.setBool(_kReduceMotion, v));
+    notifyListeners();
+  }
+
+  // ── Hardware video decoding (#713): mpv hwdec=auto when ON, hwdec=no when
+  //    OFF. Mirrored into HardwareDecode so every pane reads it at creation;
+  //    already-open panes keep their decoder until reopened. ──
+  bool get hardwareDecoding => _hardwareDecoding;
+  set hardwareDecoding(bool v) {
+    if (v == _hardwareDecoding) return;
+    _hardwareDecoding = v;
+    HardwareDecode.enabled.value = v;
+    unawaited(_prefs?.setBool(_kHardwareDecoding, v));
     notifyListeners();
   }
 

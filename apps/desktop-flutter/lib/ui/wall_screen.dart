@@ -57,6 +57,7 @@ import 'package:crumb_desktop/ui/motion/maximize_transition.dart';
 import 'package:crumb_desktop/ui/motion/maximize_widgets.dart';
 import 'package:crumb_desktop/ui/motion/motion_tokens.dart';
 import 'package:crumb_desktop/ui/motion/live_motion.dart';
+import 'package:crumb_desktop/state/hardware_decode.dart';
 
 /// Tear down an mpv-backed [Player] without blocking the caller.
 ///
@@ -1684,9 +1685,9 @@ class _WallTileState extends State<_WallTile>
       );
       final p = player.platform;
       if (p is NativePlayer) {
-        for (final kv in const [
+        for (final kv in [
           ['rtsp-transport', 'tcp'],
-          ['hwdec', 'auto'],
+          ['hwdec', hwdecMode()],
           ['cache', 'yes'],
           ['demuxer-readahead-secs', '2.0'],
           ['demuxer-max-bytes', '32MiB'],
@@ -2977,9 +2978,9 @@ class _MaximizedPaneState extends State<_MaximizedPane> {
       spawned = player;
       final p = player.platform;
       if (p is NativePlayer) {
-        for (final kv in const [
+        for (final kv in [
           ['rtsp-transport', 'tcp'],
-          ['hwdec', 'auto'],
+          ['hwdec', hwdecMode()],
           ['cache', 'yes'],
           ['demuxer-readahead-secs', '2.0'],
           ['demuxer-max-bytes', '32MiB'],
