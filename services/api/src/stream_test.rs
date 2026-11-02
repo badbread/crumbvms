@@ -470,9 +470,18 @@ mod tests {
     #[test]
     fn same_authority_rejects_a_different_host_port_or_scheme() {
         // The stored password must never be replayed to a new address (#712).
-        assert!(!same_authority("rtsp://u:********@198.51.100.12/a", "rtsp://u:p@198.51.100.11/a"));
-        assert!(!same_authority("rtsp://u:********@198.51.100.11:8554/a", "rtsp://u:p@198.51.100.11/a"));
-        assert!(!same_authority("http://u:********@198.51.100.11:554/a", "rtsp://u:p@198.51.100.11/a"));
+        assert!(!same_authority(
+            "rtsp://u:********@198.51.100.12/a",
+            "rtsp://u:p@198.51.100.11/a"
+        ));
+        assert!(!same_authority(
+            "rtsp://u:********@198.51.100.11:8554/a",
+            "rtsp://u:p@198.51.100.11/a"
+        ));
+        assert!(!same_authority(
+            "http://u:********@198.51.100.11:554/a",
+            "rtsp://u:p@198.51.100.11/a"
+        ));
         assert!(!same_authority("not a url", "rtsp://u:p@198.51.100.11/a"));
     }
 
