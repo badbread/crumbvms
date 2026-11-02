@@ -2888,7 +2888,7 @@ function wizardCommitItems() {
 async function wizardCreateCamera(it) {
   const payload = { name: it.name, source_url: it.main, source_sub_url: it.sub || null };
   if (it.onvif_host) { payload.onvif_host = it.onvif_host; if (it.onvif_port) payload.onvif_port = it.onvif_port; if (it.onvif_user) payload.onvif_user = it.onvif_user; if (it.onvif_password) payload.onvif_password = it.onvif_password; }
-  if (it.ptz) payload.camera_type = 'ptz';
+  if (it.ptz) { payload.camera_type = 'ptz'; payload.ptz_control_enabled = true; }
   const res = await fetch('/config/cameras', { method: 'POST', headers: { 'Content-Type': 'application/json', ...(TOKEN ? { Authorization: 'Bearer ' + TOKEN } : {}) }, body: JSON.stringify(payload) });
   if (res.ok) { let body = null; try { body = await res.json(); } catch (_) {} return { ok: true, id: body && body.id }; }
   // A session that expires mid-bulk-add rendered a row of bare "✗ Unauthorized"
