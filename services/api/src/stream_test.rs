@@ -171,7 +171,7 @@ struct TestStreamResult {
 
 async fn test_stream(
     _admin: AdminUser,
-    State(state): State<AppState>,
+    State(app): State<AppState>,
     Json(req): Json<TestRequest>,
 ) -> Json<TestStreamResult> {
     if req.url.trim().is_empty() {
@@ -180,7 +180,7 @@ async fn test_stream(
             ..Default::default()
         });
     }
-    let url = match resolve_test_url(&state, &req).await {
+    let url = match resolve_test_url(&app, &req).await {
         Ok(u) => u,
         Err(e) => {
             return Json(TestStreamResult {
@@ -212,13 +212,13 @@ async fn test_stream(
 
 async fn test_frame(
     _admin: AdminUser,
-    State(state): State<AppState>,
+    State(app): State<AppState>,
     Json(req): Json<TestRequest>,
 ) -> Result<Response, ApiError> {
     if req.url.trim().is_empty() {
         return Err(ApiError::BadRequest("No URL provided.".to_owned()));
     }
-    let url = resolve_test_url(&state, &req)
+    let url = resolve_test_url(&app, &req)
         .await
         .map_err(ApiError::BadRequest)?;
     if !is_supported_scheme(&url) {
