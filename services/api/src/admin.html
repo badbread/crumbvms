@@ -4232,7 +4232,8 @@ async function resetCamOrder() {
 }
 
 function renderCamerasRoot() {
-  const total = CAMS.length, rec = CAMS.filter(c => c.enabled).length;
+  const total = CAMS.length, rec = camRecordingCount();
+  refreshCamLiveness();
   const groupCount = (GROUPS||[]).length;
   const ungrouped = CAMS.filter(c => !groupOfCamera(c.id)).length;
   const reordering = CAM_REORDER !== null;
@@ -4242,7 +4243,7 @@ function renderCamerasRoot() {
     const pol = profileById(c.policy_id);
     const model = (c.model || c.make) ? esc(c.model || c.make) : '<span style="color:var(--dim2)">—</span>';
     const type = esc(c.camera_type || 'other');
-    const status = c.enabled ? '<span class="pill ok">Recording</span>' : '<span class="pill">Disabled</span>';
+    const status = camStatusPill(c);
     const nameCell = `<div class="lt-name"><span class="lt-ico">${icon(camIcon(c),18)}</span><div><div class="lt-main">${esc(c.name)}</div><div class="lt-sub">${type}</div></div></div>`;
     if (reordering) {
       return `<tr data-reorder-row="${i}" draggable="true" ondragstart="camDragStart(event,${i})" ondragover="camDragOver(event,this)" ondrop="camDrop(event,${i})" ondragend="CAM_DRAG=null;this.classList.remove('drag-over')">
@@ -4287,7 +4288,7 @@ function renderCamerasRoot() {
     </div>
     <div class="stat-tiles">
       ${tile('cameras','Cameras',total)}
-      ${tile('profiles','Recording',`${rec}<small> / ${total}</small>`)}
+      ${tile('profiles','Recording',`<span data-cam-rec-count>${rec}</span><small> / ${total}</small>`)}
       ${tile('profiles','Policies',(allProfiles()||[]).length)}
     </div>
     <div class="card" style="padding:0">
@@ -4967,12 +4968,59 @@ async function delCamera(id) {
   }
 }
 
+/* ── Per-camera recording state (#711) ──
+   The badge used to mirror c.enabled, so a camera whose stream never connected
+   still read "Recording". GET /status now reports each camera's liveness from
+   the same signal as the camera_offline alert: live | starting | silent (null
+   for a disabled camera, or on a server too old to report it). */
+let CAM_LIVENESS = null;           // null = not fetched yet; else { [id]: liveness|null }
+let _camLivenessAt = 0, _camLivenessTimer = null;
+function camStatusPill(c) {
+  if (!c.enabled) return `<span class="pill" data-cam-badge="${esc(c.id)}">Disabled</span>`;
+  const l = CAM_LIVENESS ? CAM_LIVENESS[c.id] : undefined;
+  const attr = `data-cam-badge="${esc(c.id)}"`;
+  if (l === 'live') return `<span class="pill ok" ${attr}>Recording</span>`;
+  if (l === 'starting') return `<span class="pill warn" ${attr} title="Just added. Waiting for the first footage from this camera.">Starting</span>`;
+  if (l === 'silent') return `<span class="pill danger" ${attr} title="Enabled, but no footage is arriving. Check the stream URL, the camera's login, and that the camera is online.">Not recording</span>`;
+  // Not fetched yet, or a server that doesn't report liveness: claim nothing.
+  return `<span class="pill" ${attr}>Enabled</span>`;
+}
+/* Cameras counted as recording: live ones once liveness is known, else enabled. */
+function camRecordingCount() {
+  if (!CAM_LIVENESS) return CAMS.filter(c => c.enabled).length;
+  return CAMS.filter(c => c.enabled && CAM_LIVENESS[c.id] === 'live').length;
+}
+/* Fetch /status (throttled) and repaint any badges on screen in place, so a
+   re-render isn't needed and an in-progress edit or drag is never disturbed.
+   Keeps polling every 15 s while a badge is visible. */
+async function refreshCamLiveness() {
+  if (!_camLivenessTimer) _camLivenessTimer = setInterval(() => {
+    if (document.hidden || !document.querySelector('[data-cam-badge]')) return;
+    refreshCamLiveness();
+  }, 15000);
+  if (Date.now() - _camLivenessAt < 5000) return;
+  _camLivenessAt = Date.now();
+  let st;
+  try { st = await api('/status'); } catch (_) { return; }
+  if (!st || !Array.isArray(st.cameras)) return;
+  // An older server omits the field entirely: stay on the neutral pill.
+  if (!st.cameras.some(e => 'liveness' in e)) return;
+  CAM_LIVENESS = {};
+  for (const e of st.cameras) CAM_LIVENESS[e.id] = e.liveness ?? null;
+  document.querySelectorAll('[data-cam-badge]').forEach(el => {
+    const c = CAMS.find(x => x.id === el.getAttribute('data-cam-badge'));
+    if (c) el.outerHTML = camStatusPill(c);
+  });
+  document.querySelectorAll('[data-cam-rec-count]').forEach(el => { el.textContent = camRecordingCount(); });
+}
+
 /* ── Camera detail shell: header + tab strip + tab body ── */
 function renderCamera(id) {
   const c = CAMS.find(x => x.id === id); if (!c) { renderWelcome(); return; }
   selKind = 'camera'; selId = id;
   const grp = groupOfCamera(c.id);
-  const statusBadge = c.enabled ? '<span class="pill ok">Recording</span>' : '<span class="pill">Disabled</span>';
+  const statusBadge = camStatusPill(c);
+  refreshCamLiveness();
   const sub = grp ? `${esc(grp.name)} group` : 'Ungrouped';
   // Persisted tab may be unavailable in this context (embed hides Motion), coerce.
   if (!camTabsAvailable().includes(activeCamTab)) activeCamTab = 'info';
