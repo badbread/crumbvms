@@ -607,7 +607,7 @@ All wizard steps have API equivalents. Do them in order:
    If a candidate's ONVIF `GetStreamUri` came back empty (or the camera isn't
    ONVIF at all), `POST /config/discover/probe` `{ip, username?, password?,
    brand?, port?}` re-tries that ONE IP with brand-aware RTSP path guesses
-   (Reolink/Hikvision/Dahua/Uniview/Axis/TP-Link conventions, see
+   (Reolink/Hikvision/Dahua/Uniview/Axis/TP-Link/Avigilon conventions, see
    `GET /config/camera-brands` for the list) validated with a real ffprobe,
    stopping at the first path that yields a video stream.
 5. **Validate BEFORE adding.** For each candidate, `POST /config/test-stream`

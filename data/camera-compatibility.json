@@ -165,6 +165,59 @@
       "references": [
         "https://github.com/badbread/crumbvms/issues/182"
       ]
+    },
+    {
+      "make": "Avigilon",
+      "model": "8.0C-H5A-BO1-IR",
+      "aka": ["Avigilon 4K (8 MP) H5A WDR bullet"],
+      "category": "Fixed bullet",
+      "match": {
+        "make": "avigilon",
+        "make_aliases": ["avigilon"],
+        "models": ["8.0c-h5a-bo1-ir"],
+        "model_globs": []
+      },
+      "streams": {
+        "main": {
+          "codec": "H265",
+          "notes": "3840x2160 at 30 fps with the camera's default compression settings."
+        },
+        "sub": {
+          "codec": "H265",
+          "notes": "1280x720 at 30 fps."
+        }
+      },
+      "support": {
+        "recording": "yes",
+        "desktop_live": "unknown",
+        "web_live": "unknown",
+        "android_live": "unknown",
+        "ios_live": "unknown",
+        "playback": "unknown",
+        "onvif": "partial"
+      },
+      "quirks": [
+        {
+          "summary": "The RTSP path needs an /rtsp/ prefix",
+          "affects": ["server"],
+          "detail": "The commonly documented Avigilon paths (defaultPrimary and defaultSecondary at the root) are rejected with 404 Profile Not Found on this firmware. The camera's own Setup page, under Compression and Image Rate, lists the working RTSP Stream URI, which includes /rtsp/.",
+          "fix": "Pick Avigilon as the brand in Add cameras, or enter the paths /rtsp/defaultPrimary?streamType=u (main) and /rtsp/defaultSecondary?streamType=u (sub)."
+        },
+        {
+          "summary": "ONVIF did not accept the camera's web users",
+          "affects": ["server"],
+          "detail": "ONVIF requests with the same users that work for RTSP and the web page were refused (NotAuthorized), so ONVIF discovery and Identify could not read stream URLs or make and model. RTSP streaming works without ONVIF.",
+          "fix": "Add the camera by brand or by RTSP URL. Check the camera's ONVIF compatibility setting if you need ONVIF."
+        }
+      ],
+      "tested": {
+        "by": "badbread",
+        "date": "2026-11-02",
+        "method": "Home install: both streams probed with ffprobe and recorded continuously by the recorder (GitHub issue #709)."
+      },
+      "references": [
+        "https://github.com/badbread/crumbvms/issues/709"
+      ]
     }
   ]
 }
