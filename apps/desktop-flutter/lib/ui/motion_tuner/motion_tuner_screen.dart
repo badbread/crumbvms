@@ -43,6 +43,7 @@ import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/api/motion_tuner_api.dart';
 import 'package:crumb_desktop/api/server_dashboard_api.dart';
 import 'package:crumb_desktop/api/server_dashboard_models.dart';
+import 'package:crumb_desktop/state/hardware_decode.dart';
 
 /// Authoring-grid resolutions the operator can pick for painting exclusion
 /// zones — mirrors the old client's `VALID_GRIDS` (app.js `mtOpen`).
@@ -358,8 +359,8 @@ class _MotionTunerBodyState extends State<_MotionTunerBody> {
     final controller = VideoController(player);
     final p = player.platform;
     if (p is NativePlayer) {
-      for (final kv in const [
-        ['hwdec', 'auto'],
+      for (final kv in [
+        ['hwdec', hwdecMode()],
         ['cache', 'yes'],
         ['demuxer-readahead-secs', '2.0'],
         ['demuxer-max-bytes', '32MiB'],

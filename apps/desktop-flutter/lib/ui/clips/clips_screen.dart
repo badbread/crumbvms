@@ -40,6 +40,7 @@ import 'package:crumb_desktop/ui/fullscreen/native_picker_guard.dart';
 import 'package:crumb_desktop/ui/hotkeys/global_hotkeys_listener.dart';
 import 'package:crumb_desktop/ui/motion/live_motion.dart';
 import '../date_time_picker_dialog.dart';
+import 'package:crumb_desktop/state/hardware_decode.dart';
 
 enum ClipsDensity { compact, normal, large }
 
@@ -944,9 +945,9 @@ class _ClipPlayerState extends State<_ClipPlayer> {
       player = Player();
       final p = player.platform;
       if (p is NativePlayer) {
-        for (final kv in const [
+        for (final kv in [
           ['rtsp-transport', 'tcp'],
-          ['hwdec', 'auto'],
+          ['hwdec', hwdecMode()],
           ['cache', 'yes'],
           ['demuxer-readahead-secs', '2.0'],
           ['demuxer-max-bytes', '32MiB'],

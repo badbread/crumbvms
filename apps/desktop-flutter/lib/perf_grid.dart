@@ -18,6 +18,7 @@ import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
 import 'package:crumb_desktop/src/rust/api/host.dart';
+import 'package:crumb_desktop/state/hardware_decode.dart';
 
 class PerfGridApp extends StatelessWidget {
   const PerfGridApp({super.key, required this.count, required this.url});
@@ -95,9 +96,9 @@ class _PerfGridState extends State<PerfGrid> {
     // raw mpv property API.
     final p = player.platform;
     if (p is NativePlayer) {
-      for (final kv in const [
+      for (final kv in [
         ['rtsp-transport', 'tcp'],
-        ['hwdec', 'auto'],
+        ['hwdec', hwdecMode()],
         ['cache', 'yes'],
         ['demuxer-readahead-secs', '2.0'],
         ['demuxer-max-bytes', '32MiB'],

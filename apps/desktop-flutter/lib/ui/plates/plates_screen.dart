@@ -58,6 +58,7 @@ import 'package:crumb_desktop/ui/plates/plate_name_dialog.dart';
 import 'package:crumb_desktop/ui/plates/plate_report_dialog.dart';
 import 'package:crumb_desktop/ui/plates/plates_prefs.dart';
 import '../date_time_picker_dialog.dart';
+import 'package:crumb_desktop/state/hardware_decode.dart';
 
 part 'plate_contact_sheet.dart';
 part 'plates_filter_bar.dart';
@@ -2925,8 +2926,8 @@ class _PlateClipPlayerState extends State<_PlateClipPlayer> {
       player = Player();
       final p = player.platform;
       if (p is NativePlayer) {
-        for (final kv in const [
-          ['hwdec', 'auto'],
+        for (final kv in [
+          ['hwdec', hwdecMode()],
           ['cache', 'yes'],
           ['demuxer-readahead-secs', '2.0'],
           ['demuxer-max-bytes', '32MiB'],

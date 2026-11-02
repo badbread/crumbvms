@@ -20,6 +20,7 @@ import 'package:media_kit_video/media_kit_video.dart';
 
 import 'package:window_manager/window_manager.dart';
 import 'package:crumb_desktop/state/window_state.dart';
+import 'package:crumb_desktop/state/session_marker.dart';
 
 import 'package:crumb_desktop/api/boot_api.dart';
 import 'package:crumb_desktop/api/clips_api.dart' show ClipDescriptor;
@@ -156,6 +157,12 @@ Future<void> main() async {
   await windowManager.ensureInitialized();
   // Reopen at the last size/position (and maximized if it was).
   if (kGrid == 0 && !kSpike) await WindowStateStore.instance.restoreAndAttach();
+  // Unexpected-exit detection (#713): arm the "session running" marker now,
+  // clear it on a clean window close.
+  if (kGrid == 0 && !kSpike) {
+    await SessionMarker.instance.begin();
+    await SessionMarker.instance.attachCloseHandler();
+  }
   runApp(
     kGrid > 0
         ? PerfGridApp(count: kGrid, url: kStreamUrl)
@@ -199,6 +206,8 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
   AdaptiveWallController? _adaptive;
   HotkeyConfigStore? _hotkeys;
   KeyboardShortcutsStore? _shortcuts;
+  final GlobalKey<ScaffoldMessengerState> _messengerKey =
+      GlobalKey<ScaffoldMessengerState>();
 
   @override
   void initState() {
@@ -248,7 +257,47 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
         _hotkeys = hotkeys;
         _shortcuts = shortcuts;
       });
+      _maybeShowUnexpectedExitNotice(options);
     }
+  }
+
+  /// If the last run ended without a clean close and hardware decoding is on,
+  /// offer to turn it off (#713). The marker is re-armed at startup, so this
+  /// fires once per unexpected exit.
+  void _maybeShowUnexpectedExitNotice(ClientOptionsStore options) {
+    final marker = SessionMarker.instance.previousExitUnexpected;
+    if (!shouldShowUnexpectedExitNotice(
+      previousExitUnexpected: marker.value,
+      hardwareDecoding: options.hardwareDecoding,
+    )) {
+      return;
+    }
+    marker.value = false; // once per launch, whatever the user does
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final messenger = _messengerKey.currentState;
+      if (!mounted || messenger == null) return;
+      messenger.showMaterialBanner(
+        MaterialBanner(
+          content: const Text(
+            'Crumb closed unexpectedly last time. If this keeps happening, '
+            'turning off hardware video decoding may help.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                options.hardwareDecoding = false;
+                messenger.hideCurrentMaterialBanner();
+              },
+              child: const Text('Turn off hardware decoding'),
+            ),
+            TextButton(
+              onPressed: messenger.hideCurrentMaterialBanner,
+              child: const Text('Dismiss'),
+            ),
+          ],
+        ),
+      );
+    });
   }
 
   /// Try to resume a DPAPI-persisted session so the user isn't asked to log in
@@ -518,6 +567,7 @@ class _CrumbClientAppState extends State<CrumbClientApp> {
     }
     return MaterialApp(
       title: 'Crumb',
+      scaffoldMessengerKey: _messengerKey,
       debugShowCheckedModeBanner: false,
       theme: _desktopTheme(),
       // Folds the in-app "Reduce motion" option into MediaQuery so it and the
