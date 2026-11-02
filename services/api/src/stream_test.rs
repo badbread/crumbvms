@@ -18,18 +18,26 @@
 //! Admin-only — the same capability as configuring camera URLs. The URL is read
 //! from the request BODY (never a query string) so credentials in
 //! `rtsp://user:pass@host` aren't logged.
+//!
+//! Body: `{ "url": "...", "camera_id"?: "<uuid>", "slot"?: "main" | "sub" }`. A
+//! password sent as the `********` mask is replaced by that camera's stored one
+//! for the slot, only if the URL keeps the stored scheme, host and port;
+//! otherwise the request fails asking for the password (#712).
 
 use std::process::Stdio;
 use std::time::Duration;
 
 use axum::{
+    extract::State,
     http::header,
     response::{IntoResponse, Response},
     routing::post,
     Json, Router,
 };
+use crumb_common::{db, redact};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
+use uuid::Uuid;
 
 use crate::{
     auth_mw::AdminUser,
@@ -56,6 +64,86 @@ pub fn routes() -> Router<AppState> {
 #[derive(Deserialize)]
 struct TestRequest {
     url: String,
+    /// The camera being edited, when testing an unsaved URL on its Connection
+    /// tab. Lets a URL whose password is still the `********` mask be resolved
+    /// against the stored one (#712).
+    #[serde(default)]
+    camera_id: Option<Uuid>,
+    /// `"sub"` for the sub-stream field, anything else means main.
+    #[serde(default)]
+    slot: Option<String>,
+}
+
+/// The URL to actually probe. A password left as [`redact::CREDENTIAL_MASK`]
+/// means "the stored one": it is spliced back in from the camera's saved source
+/// URL for that slot, but only when the typed URL still points at the same host
+/// and port, so a test can never send the stored password somewhere new.
+async fn resolve_test_url(state: &AppState, req: &TestRequest) -> Result<String, String> {
+    let url = req.url.trim().to_owned();
+    if !redact::url_password_is_masked(&url) {
+        return Ok(url);
+    }
+    const RETYPE: &str = "Retype the camera password to test this URL (the saved password is \
+                          only reused for the same camera address).";
+    let Some(camera_id) = req.camera_id else {
+        return Err(RETYPE.to_owned());
+    };
+    let camera = db::get_camera(state.pool(), camera_id)
+        .await
+        .map_err(|e| format!("Could not load the camera: {e}"))?
+        .ok_or_else(|| RETYPE.to_owned())?;
+    let stored = if req.slot.as_deref() == Some("sub") {
+        camera.source_sub_url
+    } else {
+        camera.source_url
+    };
+    match stored {
+        Some(stored) if same_authority(&url, &stored) => {
+            Ok(redact::unmask_url_password(&url, Some(&stored)))
+        }
+        _ => Err(RETYPE.to_owned()),
+    }
+}
+
+/// `true` when both URLs name the same scheme, host and port (userinfo
+/// ignored, scheme default port filled in, host compared case-insensitively).
+fn same_authority(a: &str, b: &str) -> bool {
+    match (authority(a), authority(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn authority(url: &str) -> Option<(String, String, u16)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let hostport = rest[..end].rsplit('@').next()?;
+    // `[v6]:port` keeps its colons inside the brackets; otherwise the last `:`
+    // separates the port.
+    let (host, port) = if let Some(close) = hostport.strip_prefix('[').and_then(|h| h.find(']')) {
+        let (h, tail) = hostport.split_at(close + 2);
+        (h, tail.strip_prefix(':'))
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (hostport, None),
+        }
+    };
+    let port = match port {
+        Some(p) => p.parse().ok()?,
+        None => match scheme.as_str() {
+            "rtsp" => 554,
+            "rtsps" => 322,
+            "http" => 80,
+            "https" => 443,
+            _ => return None,
+        },
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((scheme, host.to_ascii_lowercase(), port))
 }
 
 /// Stream probe result. Always returned with HTTP 200 (even on failure) so the
@@ -81,14 +169,26 @@ struct TestStreamResult {
 
 // ─── POST /config/test-stream ──────────────────────────────────────────────────
 
-async fn test_stream(_admin: AdminUser, Json(req): Json<TestRequest>) -> Json<TestStreamResult> {
-    let url = req.url.trim().to_owned();
-    if url.is_empty() {
+async fn test_stream(
+    _admin: AdminUser,
+    State(app): State<AppState>,
+    Json(req): Json<TestRequest>,
+) -> Json<TestStreamResult> {
+    if req.url.trim().is_empty() {
         return Json(TestStreamResult {
             error: Some("No URL provided.".to_owned()),
             ..Default::default()
         });
     }
+    let url = match resolve_test_url(&app, &req).await {
+        Ok(u) => u,
+        Err(e) => {
+            return Json(TestStreamResult {
+                error: Some(e),
+                ..Default::default()
+            })
+        }
+    };
 
     match ffprobe::probe_video(&url, Duration::from_secs(TEST_TIMEOUT_SECS)).await {
         Err(e) => Json(TestStreamResult {
@@ -110,11 +210,17 @@ async fn test_stream(_admin: AdminUser, Json(req): Json<TestRequest>) -> Json<Te
 
 // ─── POST /config/test-frame ───────────────────────────────────────────────────
 
-async fn test_frame(_admin: AdminUser, Json(req): Json<TestRequest>) -> Result<Response, ApiError> {
-    let url = req.url.trim().to_owned();
-    if url.is_empty() {
+async fn test_frame(
+    _admin: AdminUser,
+    State(app): State<AppState>,
+    Json(req): Json<TestRequest>,
+) -> Result<Response, ApiError> {
+    if req.url.trim().is_empty() {
         return Err(ApiError::BadRequest("No URL provided.".to_owned()));
     }
+    let url = resolve_test_url(&app, &req)
+        .await
+        .map_err(ApiError::BadRequest)?;
     if !is_supported_scheme(&url) {
         return Err(ApiError::BadRequest(
             "Unsupported URL — use rtsp:// or http(s)://.".to_owned(),
@@ -343,7 +449,41 @@ fn find_marker(haystack: &[u8], marker: [u8; 2]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::last_complete_jpeg;
+    use super::{last_complete_jpeg, same_authority};
+
+    #[test]
+    fn same_authority_ignores_userinfo_path_and_default_port() {
+        assert!(same_authority(
+            "rtsp://cctv:********@198.51.100.11/rtsp/defaultPrimary?streamType=u",
+            "rtsp://cctv:secret@198.51.100.11:554/defaultPrimary?streamType=u",
+        ));
+        assert!(same_authority(
+            "rtsp://u:********@Cam.Example:8554/a",
+            "rtsp://u:p@cam.example:8554/b"
+        ));
+        assert!(same_authority(
+            "rtsp://u:********@[2001:db8::7]/a",
+            "rtsp://u:p@[2001:db8::7]:554/b"
+        ));
+    }
+
+    #[test]
+    fn same_authority_rejects_a_different_host_port_or_scheme() {
+        // The stored password must never be replayed to a new address (#712).
+        assert!(!same_authority(
+            "rtsp://u:********@198.51.100.12/a",
+            "rtsp://u:p@198.51.100.11/a"
+        ));
+        assert!(!same_authority(
+            "rtsp://u:********@198.51.100.11:8554/a",
+            "rtsp://u:p@198.51.100.11/a"
+        ));
+        assert!(!same_authority(
+            "http://u:********@198.51.100.11:554/a",
+            "rtsp://u:p@198.51.100.11/a"
+        ));
+        assert!(!same_authority("not a url", "rtsp://u:p@198.51.100.11/a"));
+    }
 
     /// Builds a minimal-but-valid-looking JPEG: SOI, some payload bytes that
     /// deliberately do NOT contain a stray `FF D9`, then EOI.
