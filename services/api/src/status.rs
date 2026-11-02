@@ -26,6 +26,11 @@
 //! `HEALTH_STALENESS_SECS` of the current time.  We use a conservative 12 s
 //! (2 × the 6 s maximum `SEGMENT_SECONDS` value).
 //!
+//! Each enabled camera also carries `liveness` (`live` / `starting` / `silent`),
+//! the admin console's recording badge. It reuses the `camera_offline` alert's
+//! signal, threshold and creation grace (`alerts::camera_liveness_age`,
+//! `alerts::classify_liveness`), so it is motion-aware where `recording` is not.
+//!
 //! ## Recorder heartbeat
 //!
 //! The recorder does not yet write a heartbeat to Postgres.  Returns `None`
