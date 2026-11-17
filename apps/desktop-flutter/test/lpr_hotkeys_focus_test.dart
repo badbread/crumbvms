@@ -187,7 +187,7 @@ void main() {
   });
 
   group('PlatesScreen keyboard (list / grid + profile)', () {
-    Future<void> pumpPlates(WidgetTester tester) async {
+    Future<void> pumpPlates(WidgetTester tester, {PlatesMemory? memory}) async {
       await tester.binding.setSurfaceSize(const Size(1500, 900));
       addTearDown(() => tester.binding.setSurfaceSize(null));
       // The plates/watchlist calls use a module-level TimeoutClient, which
@@ -209,6 +209,7 @@ void main() {
               ),
             ],
             onViewFootage: (_, _) {},
+            memory: memory,
           ),
         ),
       );
@@ -249,6 +250,24 @@ void main() {
       await tester.sendKeyEvent(LogicalKeyboardKey.escape);
       await tester.pump(const Duration(milliseconds: 100));
       expect(profile, findsNothing);
+    });
+
+    testWidgets('a tab switch comes back to the same plate profile', (
+      tester,
+    ) async {
+      // The shell rebuilds this screen on every tab switch; the memory it
+      // owns is what keeps the plate under review open.
+      final memory = PlatesMemory();
+      await pumpPlates(tester, memory: memory);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyJ);
+      await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(profile, findsOneWidget);
+      // Leave the tab (dispose), then come back with the same memory.
+      await tester.pumpWidget(_appRoot(const SizedBox()));
+      expect(memory.profile, isNotNull);
+      await pumpPlates(tester, memory: memory);
+      expect(profile, findsOneWidget);
     });
 
     testWidgets('typing in the search box does not drive the list', (

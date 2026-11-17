@@ -87,7 +87,7 @@ class ClipsScreen extends StatefulWidget {
     required this.session,
     required this.cameras,
     this.initialCameraId,
-    this.initialClip,
+    this.memory,
     this.hotkeys,
     this.clientOptions,
     this.shortcuts,
@@ -102,10 +102,9 @@ class ClipsScreen extends StatefulWidget {
   /// Start the list filtered to this camera (e.g. a number-key hotkey).
   final String? initialCameraId;
 
-  /// Open with this clip's player already up — set when returning from a
-  /// clip-originated Playback review, so the user lands back in the clip box
-  /// that launched it rather than on the bare grid.
-  final ClipDescriptor? initialClip;
+  /// Where the operator left this tab (filters + the open clip), owned by the
+  /// shell so a trip to another tab comes back to the same place.
+  final ClipsMemory? memory;
 
   /// Number-key hotkeys filter the list to the assigned camera.
   final HotkeyConfigStore? hotkeys;
@@ -130,6 +129,15 @@ class ClipsScreen extends StatefulWidget {
 
   @override
   State<ClipsScreen> createState() => _ClipsScreenState();
+}
+
+/// Session-only memory of the Clips tab, restored on re-entry. The range and
+/// density are persisted prefs and not kept here.
+class ClipsMemory {
+  String? cameraId;
+  String type = 'all';
+  DateTime? anchorEnd;
+  ClipDescriptor? playing;
 }
 
 class _ClipsScreenState extends State<ClipsScreen> {
@@ -157,12 +165,27 @@ class _ClipsScreenState extends State<ClipsScreen> {
   @override
   void initState() {
     super.initState();
-    _cameraId = widget.initialCameraId;
-    // Returning from a clip-originated Playback review: reopen the clip box
-    // that launched it (already marked viewed on the first open).
-    _playing = widget.initialClip;
+    // Back from another tab: same filters, and the clip box that was open
+    // (already marked viewed on the first open).
+    final m = widget.memory;
+    _cameraId = widget.initialCameraId ?? m?.cameraId;
+    if (m != null) {
+      _type = m.type;
+      _anchorEnd = m.anchorEnd;
+      _playing = m.playing;
+    }
     _restorePrefs();
     _load();
+  }
+
+  @override
+  void dispose() {
+    widget.memory
+      ?..cameraId = _cameraId
+      ..type = _type
+      ..anchorEnd = _anchorEnd
+      ..playing = _playing;
+    super.dispose();
   }
 
   Future<void> _restorePrefs() async {
@@ -338,11 +361,8 @@ class _ClipsScreenState extends State<ClipsScreen> {
               onClose: () => setState(() => _playing = null),
               onViewOnTimeline: widget.onViewOnTimeline == null
                   ? null
-                  : () {
-                      final c = _playing!;
-                      setState(() => _playing = null);
-                      widget.onViewOnTimeline!(c);
-                    },
+                  // The clip stays open: coming back to this tab returns to it.
+                  : () => widget.onViewOnTimeline!(_playing!),
             ),
         ],
       ),
