@@ -93,6 +93,7 @@ class PlatesScreen extends StatefulWidget {
     required this.session,
     required this.cameras,
     required this.onViewFootage,
+    this.memory,
     this.canManageWatchlist = false,
     this.canNamePlates = false,
   });
@@ -106,6 +107,11 @@ class PlatesScreen extends StatefulWidget {
   /// directly from the row). Wired in main.dart to the same one-shot seek/focus
   /// hand-off the Clips "View on timeline" uses.
   final void Function(String cameraId, DateTime ts) onViewFootage;
+
+  /// Where the operator left this tab (search, filters, the open plate
+  /// profile), owned by the shell so a trip to another tab comes back to the
+  /// same place.
+  final PlatesMemory? memory;
 
   /// Whether this account may add/remove watchlist entries (admin-only on the
   /// server). Reading the watchlist is allowed for any `view_plates` account,
@@ -125,6 +131,16 @@ class PlatesScreen extends StatefulWidget {
 
   @override
   State<PlatesScreen> createState() => _PlatesScreenState();
+}
+
+/// Session-only memory of the Plates tab, restored on re-entry.
+class PlatesMemory {
+  String query = '';
+  String match = 'contains';
+  int hours = 24;
+  DateTime? anchorEnd;
+  Set<String>? selectedCameraIds;
+  PlateRead? profile;
 }
 
 class _PlatesScreenState extends State<PlatesScreen> {
@@ -227,6 +243,19 @@ class _PlatesScreenState extends State<PlatesScreen> {
     _stats = PlateStatsCache(
       (plates) => widget.api.getPlateStats(widget.session, plates),
     )..addListener(_onStatsChanged);
+    // Back from another tab: same search and filters, same plate profile.
+    final m = widget.memory;
+    if (m != null) {
+      _query = m.query;
+      _searchController.text = m.query;
+      _match = m.match;
+      _hours = m.hours;
+      _anchorEnd = m.anchorEnd;
+      final kept = m.selectedCameraIds?.intersection(_selectedCameraIds);
+      if (kept != null && kept.isNotEmpty) _selectedCameraIds = kept;
+      _profile = m.profile;
+      if (_profile != null) _stats.want([_profile!.plate]);
+    }
     plateCorrections.addListener(_onPlateCorrected);
     _listScroll.addListener(_hideLoupe);
     HardwareKeyboard.instance.addHandler(_onListKey);
@@ -673,10 +702,8 @@ class _PlatesScreenState extends State<PlatesScreen> {
       canName: widget.canNamePlates,
       onClose: _closeProfile,
       onPlay: _openRead,
-      onTimeline: (r) {
-        setState(() => _profile = null);
-        widget.onViewFootage(r.cameraId, r.ts);
-      },
+      // The profile stays open: coming back to this tab returns to it.
+      onTimeline: (r) => widget.onViewFootage(r.cameraId, r.ts),
       onName: () =>
           _namePlate(focus.plate, _nameFor(focus.plate, focus.displayName)),
       onWatch: () => _addReadToWatchlist(focus),
@@ -1050,6 +1077,13 @@ class _PlatesScreenState extends State<PlatesScreen> {
 
   @override
   void dispose() {
+    widget.memory
+      ?..query = _query
+      ..match = _match
+      ..hours = _hours
+      ..anchorEnd = _anchorEnd
+      ..selectedCameraIds = _selectedCameraIds
+      ..profile = _profile;
     plateCorrections.removeListener(_onPlateCorrected);
     HardwareKeyboard.instance.removeHandler(_onListKey);
     _hideLoupe();

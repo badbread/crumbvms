@@ -22,7 +22,6 @@ import 'package:window_manager/window_manager.dart';
 import 'package:crumb_desktop/state/window_state.dart';
 
 import 'package:crumb_desktop/api/boot_api.dart';
-import 'package:crumb_desktop/api/clips_api.dart' show ClipDescriptor;
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/media_token_cache.dart';
 import 'package:crumb_desktop/api/models.dart';
@@ -677,12 +676,23 @@ class _MainShellState extends State<MainShell> with WindowListener {
   /// in the bottom status bar on the Live tab instead of a floating overlay.
   final ValueNotifier<String?> _wallStats = ValueNotifier<String?>(null);
 
-  /// The clip whose "View on timeline" opened the current Playback focus.
-  /// Leaving that focus view (double-click / Esc) returns to the Clips tab
-  /// with this clip's player reopened — back to the box that opened it, since
-  /// the clip's camera may not even be in the current live view. Cleared on
-  /// manual tab nav like the other one-shot hand-offs.
-  ClipDescriptor? _originClip;
+  /// The camera a single-camera Playback focus was widened from (double-click
+  /// / Esc out of a "View on timeline" or bookmark jump). Playback then shows
+  /// the full view at the same moment with this camera selected, instead of
+  /// dropping to the live wall and losing the place. Cleared on manual tab nav
+  /// and by the next hand-off.
+  String? _playbackWidenedFrom;
+
+  /// Reads the active Playback's playhead, so widening a focus keeps the
+  /// moment under review.
+  final PlayheadProbe _playhead = PlayheadProbe();
+
+  /// Where the operator left the Clips and Plates tabs (filters, the open
+  /// clip, the open plate profile). Those screens are rebuilt on every tab
+  /// switch; this is what lets a trip to Playback and back land on the same
+  /// clip or plate. Session-only.
+  final ClipsMemory _clipsMemory = ClipsMemory();
+  final PlatesMemory _platesMemory = PlatesMemory();
 
   /// Play-on-focus audio: exactly one pane (maximized else selected) is
   /// audible when audio is on. Owned here, driven by the global audio button
@@ -835,9 +845,9 @@ class _MainShellState extends State<MainShell> with WindowListener {
     }
   }
 
-  /// Esc while Playback is showing a clip-originated single-camera focus:
-  /// go back to the clip box that opened it. Consumes only the Esc it acts
-  /// on; everything else falls through untouched.
+  /// Esc while Playback is showing a single-camera focus: widen to the full
+  /// view at the same moment. Consumes only the Esc it acts on; everything
+  /// else falls through untouched.
   bool _playbackFocusEscHandler(KeyEvent event) {
     if (event is! KeyDownEvent) return false;
     if (event.logicalKey != LogicalKeyboardKey.escape) return false;
@@ -852,7 +862,7 @@ class _MainShellState extends State<MainShell> with WindowListener {
     // A pushed route on top (dialog, goto picker, dropdown) owns its own Esc.
     if (Navigator.of(context).canPop()) return false;
     // Old-client priority: Esc leaves OS fullscreen first; the next Esc
-    // returns to Clips. (isFullscreen flips synchronously, so the focus-chain
+    // leaves the focus. (isFullscreen flips synchronously, so the focus-chain
     // FullscreenEscHandler sees false and won't double-handle this press.)
     if (widget.fullscreen.isFullscreen) {
       widget.fullscreen.setFullscreen(false);
@@ -862,17 +872,17 @@ class _MainShellState extends State<MainShell> with WindowListener {
     return true;
   }
 
-  /// Leave a single-camera Playback focus. If it was clip-originated
-  /// ([_originClip] set) return to the Clips tab and reopen that clip's box;
-  /// otherwise (e.g. a bookmark jump) return to the live wall. Clears the
-  /// one-shot focus/seek state so a later manual Playback entry starts clean
-  /// (keeps [_originClip] so the remounted Clips screen can reopen the box).
+  /// Leave a single-camera Playback focus (double-click / Esc) WITHOUT losing
+  /// the place: stay in Playback at the moment under the playhead, widened to
+  /// the current view's cameras with the focused camera selected. The Clips or
+  /// Plates tab it came from still holds the clip / plate that opened it.
   void _exitPlaybackFocus() {
+    final at = _playhead.playhead;
     setState(() {
+      _playbackWidenedFrom = _playbackFocusCameraId;
       _playbackFocusCameraId = null;
-      _playbackSeekTo = null;
+      if (at != null) _playbackSeekTo = at;
       _playbackAutoPlay = false;
-      _index = _originClip != null ? _clipsIndex : _liveIndex;
     });
   }
 
@@ -1152,7 +1162,7 @@ class _MainShellState extends State<MainShell> with WindowListener {
         _playbackSeekTo = null;
         _playbackFocusCameraId = null;
         _playbackAutoPlay = false;
-        _originClip = null;
+        _playbackWidenedFrom = null;
         _index = i;
       }),
     );
@@ -1248,10 +1258,9 @@ class _MainShellState extends State<MainShell> with WindowListener {
             onJumpToPlayback: (cameraId, ts) {
               Navigator.of(ctx).pop();
               // Open Playback focused on the bookmarked camera AT the bookmark
-              // moment (was just switching tabs at the default time). No clip
-              // origin → Esc/double-click returns to the live wall.
+              // moment (was just switching tabs at the default time).
               setState(() {
-                _originClip = null;
+                _playbackWidenedFrom = null;
                 _playbackFocusCameraId = cameraId;
                 _playbackSeekTo = ts;
                 _playbackAutoPlay = false;
@@ -1411,13 +1420,18 @@ class _MainShellState extends State<MainShell> with WindowListener {
               ? t
               : null,
           autoPlay: _playbackAutoPlay,
-          // Carry a maximized live pane (or the Clips focus) into Playback.
-          initialMaximizedCameraId:
-              _playbackFocusCameraId ?? _liveMaximizedId,
+          // Carry a maximized live pane (or the focus camera) into Playback. A
+          // focus that was just widened opens on the grid instead, with the
+          // camera that was under review selected.
+          initialMaximizedCameraId: _playbackWidenedFrom != null
+              ? null
+              : _playbackFocusCameraId ?? _liveMaximizedId,
+          initialSelectedCameraId: _playbackWidenedFrom,
+          playheadProbe: _playhead,
           onClose: () => setState(() => _index = _liveIndex),
-          // A clip-originated focus has no grid to restore to — double-click
-          // (and Esc, via the handler above) goes back to the Clips box that
-          // opened it, not to a live view the camera may not even be in.
+          // A single-camera focus has no grid behind it: double-click (and
+          // Esc, via the handler above) widens to the full view at the same
+          // moment, see [_exitPlaybackFocus].
           onExitFocus:
               _playbackFocusCameraId == null ? null : _exitPlaybackFocus,
           // Report the motion controller so the bottom status bar can host the
@@ -1472,11 +1486,11 @@ class _MainShellState extends State<MainShell> with WindowListener {
           clientOptions: widget.clientOptions,
           // Esc priority: leave OS fullscreen before closing an open clip.
           fullscreen: widget.fullscreen,
-          // Returning from a clip-originated Playback → reopen that clip.
-          initialClip: _originClip,
+          // Back from another tab: same filters, same open clip.
+          memory: _clipsMemory,
           // "View on timeline" → open Playback single-window on that camera.
           onViewOnTimeline: (clip) => setState(() {
-            _originClip = clip;
+            _playbackWidenedFrom = null;
             _playbackSeekTo = clip.startTs;
             _playbackFocusCameraId = clip.cameraId;
             _playbackAutoPlay = false;
@@ -1509,11 +1523,11 @@ class _MainShellState extends State<MainShell> with WindowListener {
           // of the plate, not an alert-list membership.
           canNamePlates: _isAdmin,
           // Row click → jump to Playback at that read's moment on that camera.
-          // Same one-shot seek/focus hand-off the Clips "View on timeline" uses
-          // (no origin clip → Esc/double-click returns to the live wall, since
-          // the plate's camera may not be in the current view).
+          // Same one-shot seek/focus hand-off the Clips "View on timeline" uses.
+          // Back from another tab: same search, same open plate profile.
+          memory: _platesMemory,
           onViewFootage: (cameraId, ts) => setState(() {
-            _originClip = null;
+            _playbackWidenedFrom = null;
             _playbackSeekTo = ts;
             _playbackFocusCameraId = cameraId;
             // The plate pop-up's "View on timeline" asks for playback at the

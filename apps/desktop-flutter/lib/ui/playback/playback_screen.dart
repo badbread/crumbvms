@@ -53,6 +53,15 @@ import 'no_footage_message.dart';
 import 'playback_timeline_controller.dart';
 import '../date_time_picker_dialog.dart';
 
+/// A handle the host passes to [PlaybackScreen] to read its playhead. The
+/// screen attaches a reader while mounted; [playhead] is null when no Playback
+/// is showing or it has not finished opening.
+class PlayheadProbe {
+  DateTime? Function()? _read;
+
+  DateTime? get playhead => _read?.call();
+}
+
 class PlaybackScreen extends StatefulWidget {
   const PlaybackScreen({
     super.key,
@@ -68,6 +77,8 @@ class PlaybackScreen extends StatefulWidget {
     this.initialTime,
     this.autoPlay = false,
     this.initialMaximizedCameraId,
+    this.initialSelectedCameraId,
+    this.playheadProbe,
     this.onExitFocus,
     this.onMotionController,
     this.audio,
@@ -90,6 +101,15 @@ class PlaybackScreen extends StatefulWidget {
   /// Open with this camera already maximized (carried over from a maximized
   /// live pane when the operator switches to Playback).
   final String? initialMaximizedCameraId;
+
+  /// Open with this camera selected in the grid (not maximized). Set when a
+  /// single-camera focus is widened to the full view, so the camera under
+  /// review stays the selected one.
+  final String? initialSelectedCameraId;
+
+  /// Lets the host read the current playhead on demand, so leaving a
+  /// single-camera focus can reopen Playback at the same moment.
+  final PlayheadProbe? playheadProbe;
 
   final VoidCallback onClose;
 
@@ -119,10 +139,10 @@ class PlaybackScreen extends StatefulWidget {
   /// leave it false and open paused as before.
   final bool autoPlay;
 
-  /// Set when this Playback is a clip-originated single-camera focus
-  /// (Clips "View on timeline"): there is no grid behind the maximized pane,
-  /// so the maximize-toggle (double-click / Esc) calls this to hand control
-  /// back to the opener instead of un-maximizing into a 1-up grid.
+  /// Set when this Playback is a single-camera focus ("View on timeline" from
+  /// Clips or Plates, a bookmark jump): there is no grid behind the maximized
+  /// pane, so the maximize-toggle (double-click / Esc) calls this and the host
+  /// widens Playback to the full view at the same moment.
   final VoidCallback? onExitFocus;
 
   /// Reports this screen's motion timeline controller to the host so it can
@@ -282,6 +302,7 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     // Hand our motion controller to the host so it can render the legend +
     // hints in the app's bottom status bar (set here, cleared in dispose).
     widget.onMotionController?.call(_motion, true);
+    widget.playheadProbe?._read = _readPlayhead;
     unawaited(_refreshOldestFootage());
     for (final c in _cameras) {
       final pane = GaplessSegmentPaneController(
@@ -313,6 +334,10 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     if (maxId != null && _cameras.any((c) => c.id == maxId)) {
       _maximizedCameraId = maxId;
       _selectedCameraId = maxId;
+    }
+    final selId = widget.initialSelectedCameraId;
+    if (maxId == null && selId != null && _cameras.any((c) => c.id == selId)) {
+      _selectedCameraId = selId;
     }
     _syncSnapshotTarget();
     // Register panes with the shared audio-follow controller so the active
@@ -432,8 +457,17 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
     await _commitSeek(t);
   }
 
+  /// The playhead for [PlayheadProbe]; null until the opening seek has landed.
+  DateTime? _readPlayhead() => _entering ? null : _timeline.playhead;
+
   @override
   void dispose() {
+    // A keyed remount inits the new screen before this one disposes, so only
+    // detach a reader that is still ours.
+    final probe = widget.playheadProbe;
+    if (probe != null && probe._read == _readPlayhead) {
+      probe._read = null;
+    }
     if (!_entering) widget.onLeave?.call(_timeline.playhead);
     _tickTimer?.cancel();
     _shuttleTimer?.cancel();
@@ -1546,8 +1580,8 @@ class _PlaybackScreenState extends State<PlaybackScreen> {
   }
 
   void _toggleMaximize(String cameraId) {
-    // Clip-originated single-camera focus: "restore" leaves the focus view
-    // entirely (back to the Clips box that opened it) — there's no grid here.
+    // Single-camera focus: there's no grid here, so "restore" asks the host
+    // to widen Playback to the full view at this moment.
     if (widget.onExitFocus != null) {
       widget.onExitFocus!();
       return;
