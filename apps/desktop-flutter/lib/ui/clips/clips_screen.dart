@@ -33,11 +33,13 @@ import 'package:crumb_desktop/api/models.dart';
 import 'package:crumb_desktop/state/client_options.dart';
 import 'package:crumb_desktop/state/hotkey_config.dart';
 import 'package:crumb_desktop/state/keyboard_shortcuts.dart';
+import 'package:crumb_desktop/ui/clips/clip_controls.dart';
 import 'package:crumb_desktop/ui/clips/clip_player_shell.dart';
 import 'package:crumb_desktop/ui/fullscreen/fullscreen_controller.dart'
     show FullscreenController;
 import 'package:crumb_desktop/ui/fullscreen/native_picker_guard.dart';
 import 'package:crumb_desktop/ui/hotkeys/global_hotkeys_listener.dart';
+import 'package:crumb_desktop/ui/hotkeys/hotkey_gate.dart';
 import 'package:crumb_desktop/ui/motion/live_motion.dart';
 import '../date_time_picker_dialog.dart';
 
@@ -851,6 +853,7 @@ class _ClipPlayer extends StatefulWidget {
 class _ClipPlayerState extends State<_ClipPlayer> {
   Player? _player;
   VideoController? _controller;
+  MediaKitClipTransport? _transport;
   late String _quality = widget.openInHd ? 'full' : 'preview';
   int _loadAttempt = 0;
   Timer? _watchdog;
@@ -896,11 +899,21 @@ class _ClipPlayerState extends State<_ClipPlayer> {
     _open(_quality, resetAttempt: true);
   }
 
-  /// Lifetime-of-the-open-clip Esc handler; consumes only the Esc it acts on.
+  /// Lifetime-of-the-open-clip key handler: Esc closes, and the shared clip
+  /// shortcuts (Space, Left / Right, `,` `.`, B) drive the transport. Consumes
+  /// only the keys it acts on.
   bool _onKeyEvent(KeyEvent event) {
-    if (event is! KeyDownEvent) return false;
-    if (event.logicalKey != LogicalKeyboardKey.escape) return false;
     if (!mounted) return false;
+    if (event.logicalKey != LogicalKeyboardKey.escape) {
+      final t = _transport;
+      if (t == null || hotkeyContextBlocked(context)) return false;
+      return handleClipTransportKey(
+        event,
+        t,
+        onBookmark: () => unawaited(_bookmark()),
+      );
+    }
+    if (event is! KeyDownEvent) return false;
     // A focused text field (bookmark dialog) owns its own Esc.
     if (FocusManager.instance.primaryFocus?.context?.widget is EditableText) {
       return false;
@@ -988,9 +1001,11 @@ class _ClipPlayerState extends State<_ClipPlayer> {
         if (h != null && h > 0 && mounted) setState(() {});
       });
       final controller = VideoController(player);
+      final transport = MediaKitClipTransport(player);
       setState(() {
         _player = player;
         _controller = controller;
+        _transport = transport;
       });
     }
     // The property-setting loop above awaits — the overlay can be closed
@@ -1167,7 +1182,10 @@ class _ClipPlayerState extends State<_ClipPlayer> {
     }
   }
 
-  Future<void> _bookmark() async {
+  /// Bookmark the moment under the playhead (or [at], from the controls).
+  Future<void> _bookmark([DateTime? at]) async {
+    final ts = at ??
+        widget.clip.startTs.add(_transport?.position ?? Duration.zero);
     final label = widget.clip.kind == 'motion'
         ? 'Motion'
         : (widget.clip.label.isEmpty ? 'Detection' : widget.clip.label);
@@ -1180,7 +1198,7 @@ class _ClipPlayerState extends State<_ClipPlayer> {
       await widget.api.createBookmark(
         widget.session,
         cameraId: widget.clip.cameraId,
-        ts: widget.clip.startTs,
+        ts: ts,
         description: desc,
       );
       _toast('Bookmark saved');
@@ -1207,6 +1225,7 @@ class _ClipPlayerState extends State<_ClipPlayer> {
     _playingSub?.cancel();
     _widthSub?.cancel();
     _heightSub?.cancel();
+    _transport?.dispose();
     _player?.dispose();
     super.dispose();
   }
@@ -1241,10 +1260,11 @@ class _ClipPlayerState extends State<_ClipPlayer> {
             // the pane then hugs the picture, so the dark space around it is
             // genuine backdrop (tap = close) instead of letterbox inside an
             // oversized pane. Falls back to the full-width pane while the
-            // dimensions are still unknown (loading). 0.78 (not the old 0.82)
-            // leaves room for the actions row now living under the video.
+            // dimensions are still unknown (loading). 0.78 leaves room for the
+            // actions row under the video; the transport controls take their
+            // own height on top of that.
             var paneW = constraints.maxWidth;
-            var paneH = constraints.maxHeight * 0.78;
+            var paneH = constraints.maxHeight * 0.78 - kClipControlsHeight;
             final vw = (_player?.state.width ?? 0).toDouble();
             final vh = (_player?.state.height ?? 0).toDouble();
             if (vw > 0 && vh > 0 && paneW > 0 && paneH > 0) {
@@ -1260,6 +1280,20 @@ class _ClipPlayerState extends State<_ClipPlayer> {
               title: '$label — ${c.cameraName}',
               onClose: widget.onClose,
               video: _buildVideoPane(context),
+              // The shared clip controls (same as the plate player): scrub
+              // bar, play/pause, skip, frame step, speed, loop, mute.
+              transport: (_error == null && _transport != null)
+                  ? Center(
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 900),
+                        child: ClipControls(
+                          transport: _transport!,
+                          wallStart: c.startTs,
+                          onBookmark: (at) => unawaited(_bookmark(at)),
+                        ),
+                      ),
+                    )
+                  : null,
               actions: _buildActions(context),
               overlays: [
                 if (_toastMsg != null)
@@ -1319,7 +1353,7 @@ class _ClipPlayerState extends State<_ClipPlayer> {
         ),
       ),
       TextButton.icon(
-        onPressed: _bookmark,
+        onPressed: () => unawaited(_bookmark()),
         icon: const Icon(Icons.bookmark_add_outlined, color: Colors.white70, size: 16),
         label: const Text(
           'Bookmark',
