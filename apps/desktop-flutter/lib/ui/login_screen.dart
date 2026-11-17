@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 
 import 'package:crumb_desktop/api/crumb_api.dart';
 import 'package:crumb_desktop/api/models.dart';
+import 'package:crumb_desktop/session/last_server_store.dart';
 import 'package:crumb_desktop/ui/discovery/server_discovery_panel.dart';
 
 /// Optional prefill for the server field, e.g.
@@ -32,6 +33,33 @@ class _LoginScreenState extends State<LoginScreen> {
   bool _busy = false;
   String? _error;
 
+  @override
+  void initState() {
+    super.initState();
+    _prefillFromLastLogin();
+  }
+
+  /// Fill the server and username from the last successful sign-in, so a
+  /// sign-out (or an expired session) does not make the operator retype the
+  /// address. Never overwrites something already typed or picked.
+  Future<void> _prefillFromLastLogin() async {
+    final String? server;
+    final String? username;
+    try {
+      server = await LastServerStore.loadServer();
+      username = await LastServerStore.loadUsername();
+    } catch (_) {
+      return; // prefs unavailable: the form just opens empty
+    }
+    if (!mounted) return;
+    if (_server.text.isEmpty && server != null && server.isNotEmpty) {
+      _server.text = server;
+    }
+    if (_user.text.isEmpty && username != null && username.isNotEmpty) {
+      _user.text = username;
+    }
+  }
+
   Future<void> _submit() async {
     if (_busy) return;
     setState(() {
@@ -45,6 +73,16 @@ class _LoginScreenState extends State<LoginScreen> {
         _pass.text,
       );
       final cameras = await widget.api.listCameras(session);
+      // Remember where and who (never the password or the token) so the form
+      // reopens prefilled. Best effort: a prefs failure must not fail sign-in.
+      try {
+        await LastServerStore.save(
+          server: session.base,
+          username: _user.text.trim(),
+        );
+      } catch (_) {
+        /* ignore */
+      }
       if (!mounted) return;
       widget.onLoggedIn(session, cameras);
     } on CrumbApiException catch (e) {
